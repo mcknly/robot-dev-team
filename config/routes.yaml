@@ -1,0 +1,207 @@
+# Robot Dev Team Project
+# File: config/routes.yaml
+# Description: Routing configuration for GitLab webhook events.
+# License: MIT
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 MCKNLY LLC
+
+# Sample routing configuration for webhook event handling.
+# See docs/ROUTES.md for detailed schema and additional examples.
+#
+# IMPORTANT: Replace "your-username" with your GitLab username in each route's
+# author field. For persistent local overrides, copy this file to
+# config/routes.local.yaml, customise it, and set ROUTE_CONFIG_PATH in .env:
+#   ROUTE_CONFIG_PATH=config/routes.local.yaml
+#
+# Access modes:
+#   - readonly: Agent runs in read-only project mount (default). The agent
+#               receives filesystem errors if it attempts to write files.
+#   - readwrite: Agent runs in read-write project mount. Use for routes
+#                that need to modify code (issue #28).
+#
+# Timeout overrides (optional per-route, falls back to global env vars):
+#   max_wall_clock_seconds: Hard upper-bound run duration (default: 7200)
+#   max_inactivity_seconds: Watchdog resets on stdout/stderr output (default: 900)
+routes:
+  - name: issue-triage
+    access: readonly
+    match:
+      event: "Issue Hook"
+      action: "open"
+      author: "your-username"
+    agents:
+      - agent: "claude"
+        task: "issue_review"
+        prompt: "issue_review.txt"
+        options:
+          command: "claude"
+          args: ["--model", "${CLAUDE_MODEL}", "--dangerously-skip-permissions", "-p"]
+      - agent: "gemini"
+        task: "issue_review"
+        prompt: "issue_review.txt"
+        options:
+          command: "gemini"
+          args: ["--model", "${GEMINI_MODEL}", "--yolo", "-p", ""]
+      - agent: "codex"
+        task: "issue_review"
+        prompt: "issue_review.txt"
+        options:
+          command: "codex"
+          args: ["--model", "${CODEX_MODEL}", "exec", "--yolo", "--skip-git-repo-check"]
+  - name: default-merge-request
+    access: readonly
+    match:
+      event: "Merge Request Hook"
+      action: "open"
+    agents:
+      - agent: "claude"
+        task: "merge_request_review"
+        prompt: "merge_request_review.txt"
+        options:
+          command: "claude"
+          args: ["--model", "${CLAUDE_MODEL}", "--dangerously-skip-permissions", "-p"]
+      - agent: "gemini"
+        task: "merge_request_review"
+        prompt: "merge_request_review.txt"
+        options:
+          command: "gemini"
+          args: ["--model", "${GEMINI_MODEL}", "--yolo", "-p", ""]
+      - agent: "codex"
+        task: "merge_request_review"
+        prompt: "merge_request_review.txt"
+        options:
+          command: "codex"
+          args: ["--model", "${CODEX_MODEL}", "exec", "--yolo", "--skip-git-repo-check"]
+  # Assignment routes - triggered when an agent is assigned to an issue or MR.
+  # GitLab's /assign quick action sends an Issue/MR Hook with action=update,
+  # NOT a Note Hook. These routes detect agent usernames in the assignees list
+  # and grant read-write access for the agent to perform work.
+  # Must be placed BEFORE issue-update fallback routes to take precedence.
+  - name: assign-issue-claude
+    access: readwrite
+    match:
+      event: "Issue Hook"
+      action: "update"
+      author: "your-username"
+      assignees: ["claude"]
+    agents:
+      - agent: "claude"
+        task: "assign_work"
+        prompt: "assign_work.txt"
+        options:
+          command: "claude"
+          args: ["--model", "${CLAUDE_MODEL}", "--dangerously-skip-permissions", "-p"]
+  - name: assign-issue-gemini
+    access: readwrite
+    match:
+      event: "Issue Hook"
+      action: "update"
+      author: "your-username"
+      assignees: ["gemini"]
+    agents:
+      - agent: "gemini"
+        task: "assign_work"
+        prompt: "assign_work.txt"
+        options:
+          command: "gemini"
+          args: ["--model", "${GEMINI_MODEL}", "--yolo", "-p", ""]
+  - name: assign-issue-codex
+    access: readwrite
+    match:
+      event: "Issue Hook"
+      action: "update"
+      author: "your-username"
+      assignees: ["codex"]
+    agents:
+      - agent: "codex"
+        task: "assign_work"
+        prompt: "assign_work.txt"
+        options:
+          command: "codex"
+          args: ["--model", "${CODEX_MODEL}", "exec", "--yolo", "--skip-git-repo-check"]
+  # MR assignment routes - same as issue assignments but for merge requests.
+  - name: assign-mr-claude
+    access: readwrite
+    match:
+      event: "Merge Request Hook"
+      action: "update"
+      author: "your-username"
+      assignees: ["claude"]
+    agents:
+      - agent: "claude"
+        task: "assign_work"
+        prompt: "assign_work.txt"
+        options:
+          command: "claude"
+          args: ["--model", "${CLAUDE_MODEL}", "--dangerously-skip-permissions", "-p"]
+  - name: assign-mr-gemini
+    access: readwrite
+    match:
+      event: "Merge Request Hook"
+      action: "update"
+      author: "your-username"
+      assignees: ["gemini"]
+    agents:
+      - agent: "gemini"
+        task: "assign_work"
+        prompt: "assign_work.txt"
+        options:
+          command: "gemini"
+          args: ["--model", "${GEMINI_MODEL}", "--yolo", "-p", ""]
+  - name: assign-mr-codex
+    access: readwrite
+    match:
+      event: "Merge Request Hook"
+      action: "update"
+      author: "your-username"
+      assignees: ["codex"]
+    agents:
+      - agent: "codex"
+        task: "assign_work"
+        prompt: "assign_work.txt"
+        options:
+          command: "codex"
+          args: ["--model", "${CODEX_MODEL}", "exec", "--yolo", "--skip-git-repo-check"]
+  # Regular mention routes - triggered by @agent mentions without /assign.
+  - name: mention-claude
+    access: readonly
+    match:
+      event: "Note Hook"
+      action: "create"
+      author: "your-username"
+      mentions: ["claude"]
+    agents:
+      - agent: "claude"
+        task: "note_followup"
+        prompt: "note_followup.txt"
+        options:
+          command: "claude"
+          args: ["--model", "${CLAUDE_MODEL}", "--dangerously-skip-permissions", "-p"]
+  - name: mention-gemini
+    access: readonly
+    match:
+      event: "Note Hook"
+      action: "create"
+      author: "your-username"
+      mentions: ["gemini"]
+    agents:
+      - agent: "gemini"
+        task: "note_followup"
+        prompt: "note_followup.txt"
+        options:
+          command: "gemini"
+          args: ["--model", "${GEMINI_MODEL}", "--yolo", "-p", ""]
+  - name: mention-codex
+    access: readonly
+    match:
+      event: "Note Hook"
+      action: "create"
+      author: "your-username"
+      mentions: ["codex"]
+    agents:
+      - agent: "codex"
+        task: "note_followup"
+        prompt: "note_followup.txt"
+        options:
+          command: "codex"
+          args: ["--model", "${CODEX_MODEL}", "exec", "--yolo", "--skip-git-repo-check"]

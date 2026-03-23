@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# Robot Dev Team Project
+# File: glab-usr
+# Description: Switch GitLab CLI credentials for the active agent.
+# License: MIT
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 MCKNLY LLC
+
+set -euo pipefail
+
+HOST="${GLAB_HOST:-gitlab.example.com}"
+
+BASE_USER="${SUDO_USER:-${USER:-}}"
+if [[ -z "$BASE_USER" ]]; then
+  BASE_USER=$(id -un 2>/dev/null || printf 'root')
+fi
+BASE_HOME=$(eval echo "~$BASE_USER" 2>/dev/null || echo "${HOME:-/root}")
+CONFIG_FILE="$BASE_HOME/.config/glab-cli/config.yml"
+
+timestamp() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+current_glab_user() {
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  awk -v host="$HOST" '
+    $1 == "hosts:" { in_hosts = 1; next }
+    in_hosts && $1 ~ /^[^:]+:$/ {
+      current = $1
+      sub(/:$/, "", current)
+      in_target = (current == host)
+      next
+    }
+    in_target && $1 == "user:" { print $2; exit }
+  ' "$CONFIG_FILE"
+}
+
+resolve_agent_name() {
+  if [[ -n "${CURRENT_AGENT:-}" ]]; then
+    printf '%s' "$CURRENT_AGENT"
+    return
+  fi
+  if [[ -n "${ROBOT_AGENT_NAME:-}" ]]; then
+    printf '%s' "$ROBOT_AGENT_NAME"
+    return
+  fi
+  if [[ -n "${CURRENT_GLAB_USER:-}" ]]; then
+    printf '%s' "$CURRENT_GLAB_USER"
+  else
+    printf 'unknown'
+  fi
+}
+
+log_tool_call() {
+  local command="$1"
+  printf '%s | INFO | tool-call | tool=glab-usr agent=%s command=%s\n' \
+    "$(timestamp)" "$(resolve_agent_name)" "$command" >&2
+}
+
+read_token() {
+  local env_value="$1"
+  local file_path="$2"
+
+  if [[ -n "$env_value" ]]; then
+    printf '%s' "$env_value"
+    return
+  fi
+
+  if [[ -r "$file_path" ]]; then
+    tr -d '\r\n' < "$file_path"
+    return
+  fi
+
+  printf ''
+}
+
+run_as_base() {
+  if [[ -n "${SUDO_USER:-}" ]]; then
+    sudo -u "$SUDO_USER" "$@"
+  else
+    "$@"
+  fi
+}
+
+is_writable_dir() {
+  local dir="$1"
+  [[ -d "$dir" && -w "$dir" ]]
+}
+
+ensure_safe_directory() {
+  local repo_root="$1"
+  if ! run_as_base git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$repo_root"; then
+    run_as_base git config --global --add safe.directory "$repo_root" 2>/dev/null || true
+  fi
+}
+
+update_git_credentials() {
+  local username="$1"
+  local token="$2"
+  local repo_root cred_file cred_scope
+
+  # First, try to detect the repo root using the current directory
+  local potential_root
+  potential_root=$(pwd)
+  while [[ "$potential_root" != "/" ]]; do
+    if [[ -d "$potential_root/.git" ]]; then
+      ensure_safe_directory "$potential_root"
+      break
+    fi
+    potential_root=$(dirname "$potential_root")
+  done
+
+  if repo_root=$(run_as_base git rev-parse --show-toplevel 2>/dev/null); then
+    if is_writable_dir "$repo_root/.git"; then
+      cred_file="$repo_root/.git/credentials"
+      cred_scope="repository"
+    fi
+  fi
+
+  if [[ -z "${cred_file:-}" ]]; then
+    cred_file="$BASE_HOME/.git-credentials"
+    cred_scope="global"
+  fi
+
+  run_as_base env HOST="$HOST" USERNAME="$username" TOKEN="$token" CRED_FILE="$cred_file" python3 - <<'PY'
+import os
+import pathlib
+
+cred_file = pathlib.Path(os.environ["CRED_FILE"]).expanduser()
+cred_file.parent.mkdir(parents=True, exist_ok=True)
+
+with cred_file.open("w", encoding="utf-8") as fh:
+    fh.write(f"https://{os.environ['USERNAME']}:{os.environ['TOKEN']}@{os.environ['HOST']}\n")
+
+os.chmod(cred_file, 0o600)
+PY
+  if [[ $? -ne 0 ]]; then
+    echo "[glab-usr] WARN: failed to write $cred_scope credential store" >&2
+    return
+  fi
+
+  if [[ "$cred_scope" == "repository" ]]; then
+    run_as_base git -C "$repo_root" config credential.helper "store --file $cred_file" >/dev/null 2>&1 || \
+      echo "[glab-usr] WARN: failed to configure repository credential helper" >&2
+  else
+    run_as_base git config --global credential.helper "store --file $cred_file" >/dev/null 2>&1 || \
+      echo "[glab-usr] WARN: failed to configure global credential helper" >&2
+  fi
+  echo "[glab-usr] INFO: configured $cred_scope credential store at $cred_file" >&2
+}
+
+set_git_identity_local() {
+  local repo_root="$1"
+  local name="$2"
+  local email="$3"
+  run_as_base git -C "$repo_root" config user.name "$name" >/dev/null 2>&1 || \
+    echo "[glab-usr] WARN: failed to set repository user.name" >&2
+  run_as_base git -C "$repo_root" config user.email "$email" >/dev/null 2>&1 || \
+    echo "[glab-usr] WARN: failed to set repository user.email" >&2
+}
+
+set_git_identity_global() {
+  local name="$1"
+  local email="$2"
+  run_as_base git config --global user.name "$name" >/dev/null 2>&1 || \
+    echo "[glab-usr] WARN: failed to set global user.name" >&2
+  run_as_base git config --global user.email "$email" >/dev/null 2>&1 || \
+    echo "[glab-usr] WARN: failed to set global user.email" >&2
+}
+
+configure_git_identity() {
+  local agent="$1"
+  local name email config_scope
+
+  # Convention-based identity resolution: derive env var names from the
+  # agent name.  E.g. agent "qwen-code" -> QWEN_CODE_AGENT_GIT_NAME /
+  # QWEN_CODE_AGENT_GIT_EMAIL.  Defaults use a capitalised agent name.
+  local agent_upper
+  agent_upper="$(printf '%s' "$agent" | tr '[:lower:]-' '[:upper:]_')"
+  local name_var="${agent_upper}_AGENT_GIT_NAME"
+  local email_var="${agent_upper}_AGENT_GIT_EMAIL"
+
+  # Title-case the default display name (capitalise each hyphen-separated word)
+  local default_name
+  default_name="$(printf '%s' "$agent" | sed 's/\b./\U&/g; s/-/ /g') Agent"
+  name="${!name_var:-$default_name}"
+  email="${!email_var:-${agent}@example.com}"
+
+  if ! command -v git >/dev/null 2>&1; then
+    echo "[glab-usr] WARN: git not available; skipping identity configuration" >&2
+    return
+  fi
+
+  # Ensure safe.directory is set for current repo
+  local potential_root
+  potential_root=$(pwd)
+  while [[ "$potential_root" != "/" ]]; do
+    if [[ -d "$potential_root/.git" ]]; then
+      ensure_safe_directory "$potential_root"
+      break
+    fi
+    potential_root=$(dirname "$potential_root")
+  done
+
+  local repo_root
+  if repo_root=$(run_as_base git rev-parse --show-toplevel 2>/dev/null) && is_writable_dir "$repo_root/.git"; then
+    set_git_identity_local "$repo_root" "$name" "$email"
+    config_scope="repository"
+  else
+    set_git_identity_global "$name" "$email"
+    config_scope="global"
+  fi
+  echo "[glab-usr] INFO: configured $config_scope git identity ($name <$email>)" >&2
+}
+
+if [[ $# -ne 1 ]]; then
+  echo "usage: $(basename "$0") <username>" >&2
+  exit 1
+fi
+
+target_user="$1"
+
+# Convention-based token resolution: derive env var and token file path
+# from the agent name.  E.g. agent "qwen-code" resolves to env var
+# QWEN_CODE_AGENT_GITLAB_TOKEN and token file ~/.qwen-code/glab-token.
+# The token file directory always uses the lowercase-hyphenated form of
+# the agent name (matching docker-entrypoint.sh normalisation).
+token_env_var="$(printf '%s' "$target_user" | tr '[:lower:]-' '[:upper:]_')_AGENT_GITLAB_TOKEN"
+token_dir="$(printf '%s' "$target_user" | tr '[:upper:]_' '[:lower:]-')"
+token=$(read_token "${!token_env_var:-}" "$BASE_HOME/.$token_dir/glab-token")
+
+if [[ -z "$token" ]]; then
+  echo "missing token for user $target_user" >&2
+  exit 1
+fi
+
+CURRENT_GLAB_USER="$(current_glab_user)"
+current_user="$CURRENT_GLAB_USER"
+
+if [[ "$current_user" == "$target_user" ]]; then
+  log_tool_call "noop (already authenticated as $target_user)"
+  update_git_credentials "$target_user" "$token"
+  configure_git_identity "$target_user"
+  echo "user already logged in"
+  exit 0
+fi
+
+echo "Switching authentication to $target_user on $HOST" >&2
+log_tool_call "glab auth login --hostname $(printf '%q' "$HOST") --token ***redacted***"
+if [[ -n "${SUDO_USER:-}" ]]; then
+  sudo -u "$SUDO_USER" env GLAB_NO_PROMPT=1 glab auth login --hostname "$HOST" --token "$token"
+else
+  GLAB_NO_PROMPT=1 glab auth login --hostname "$HOST" --token "$token"
+fi
+status=$?
+
+if [[ $status -eq 0 ]]; then
+  echo "authenticated as $target_user"
+  update_git_credentials "$target_user" "$token"
+  configure_git_identity "$target_user"
+else
+  echo "failed to authenticate as $target_user" >&2
+fi
+
+exit $status

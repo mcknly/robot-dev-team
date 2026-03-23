@@ -1,0 +1,61 @@
+# Robot Dev Team Project
+# File: gitlab/docker-compose.gitlab.yml
+# Description: Example Docker Compose for GitLab CE with File Hook support.
+# License: MIT
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 MCKNLY LLC
+#
+# This is a reference compose file for running GitLab CE with the
+# add_webhooks.rb File Hook mounted for automatic webhook provisioning.
+#
+# Usage:
+#   1. Run from the gitlab/ directory (file_hooks/ is included alongside this file).
+#   2. Start GitLab for the first time:
+#        docker compose -f docker-compose.gitlab.yml up -d
+#   3. Create an admin Personal Access Token (api scope) in the GitLab web UI.
+#   4. Set GITLAB_ADMIN_TOKEN below to the new PAT value, then restart:
+#        docker compose -f docker-compose.gitlab.yml up -d
+#
+# See readme-gitlab.md in this directory for upgrade guidance.
+
+services:
+  gitlab:
+    image: gitlab/gitlab-ce:latest
+    hostname: gitlab.example.com
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "2222:22"
+    volumes:
+      - gitlab_config:/etc/gitlab
+      - gitlab_logs:/var/log/gitlab
+      - gitlab_data:/var/opt/gitlab
+      # Mount the File Hooks directory so scripts persist across
+      # container restarts and GitLab upgrades.
+      - ./file_hooks:/opt/gitlab/embedded/service/gitlab-rails/file_hooks
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        # Uncomment and edit the external_url to match your domain:
+        # external_url 'https://gitlab.example.com'
+
+        # Pass environment variables to the Rails application so
+        # the add_webhooks.rb File Hook can read them at runtime.
+        gitlab_rails['env'] = {
+          # NOTE: This token cannot be set until after GitLab is running.
+          # On first boot, leave this as the placeholder, then:
+          #   1. Start GitLab with docker compose up -d
+          #   2. Create an admin PAT (api scope) in the GitLab UI
+          #   3. Replace the placeholder value below
+          #   4. Restart the container for the File Hook to pick it up
+          'GITLAB_ADMIN_TOKEN'    => 'glpat-xxxxxxxxxxxxxxxxxxxx',
+          'ROBOT_WEBHOOK_URL'     => 'https://your-robot-dev-team-host/webhooks/gitlab',
+          'GITLAB_WEBHOOK_SECRET' => 'replace-with-shared-secret',
+          'GITLAB_WEBHOOK_SSL_VERIFY' => 'true'
+        }
+    shm_size: "256m"
+
+volumes:
+  gitlab_config:
+  gitlab_logs:
+  gitlab_data:

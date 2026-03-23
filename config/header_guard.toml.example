@@ -1,0 +1,16 @@
+# Robot Dev Team Project
+# File: config/header_guard.toml.example
+# Description: Example configuration for header_guard file discovery overrides.
+# License: MIT
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 MCKNLY LLC
+
+[sources]
+# Add extra suffixes (e.g., [".proto", ".cfg"]) to include more file types.
+extra_suffixes = []
+# Add specific filenames (without suffixes) that should always be checked.
+extra_filenames = []
+
+[exclusions]
+# Add path prefixes to skip during validation (e.g., ["build/", "dist/"]).
+prefixes = []

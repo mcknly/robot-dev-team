@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Robot Dev Team Project
+# File: launch-uvicorn-dev
+# Description: Launch the FastAPI app via uvicorn using the local virtualenv.
+# License: MIT
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 MCKNLY LLC
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$REPO_ROOT"
+
+VENV_BIN=".venv/bin"
+PYTHON="$VENV_BIN/python"
+UVICORN="$VENV_BIN/uvicorn"
+
+if [[ ! -x "$PYTHON" ]]; then
+  echo "[launch-uvicorn-dev] Missing virtual environment (.venv). Create it with 'python -m venv .venv' and install dependencies before retrying." >&2
+  exit 1
+fi
+
+if [[ ! -x "$UVICORN" ]]; then
+  echo "[launch-uvicorn-dev] Uvicorn is not installed in .venv. Run '.venv/bin/pip install -e .[dev]' first." >&2
+  exit 1
+fi
+
+if [[ -f ".env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source ".env"
+  set +a
+fi
+
+readarray -t compose_exports < <("$PYTHON" - <<'PY'
+import os
+import re
+from pathlib import Path
+
+try:
+    import yaml  # type: ignore
+except Exception as exc:  # pragma: no cover - best effort
+    raise SystemExit(f"[launch-uvicorn-dev] PyYAML is required: {exc}")
+
+compose_path = Path("docker-compose.yml")
+if not compose_path.exists():
+    raise SystemExit()
+
+data = yaml.safe_load(compose_path.read_text(encoding="utf-8")) or {}
+services = data.get("services") or {}
+app = services.get("app") or {}
+environment = app.get("environment") or {}
+
+pattern = re.compile(r"\$\{([^}:]+)(?::-(.*?))?\}")
+
+def resolve(value: str) -> str:
+    if value is None:
+        return ""
+    def repl(match: re.Match[str]) -> str:
+        var = match.group(1)
+        default = match.group(2) or ""
+        return os.environ.get(var, default)
+    return pattern.sub(repl, value)
+
+for key, raw in environment.items():
+    if key in os.environ:
+        continue
+    resolved = resolve("" if raw is None else str(raw))
+    print(f"{key}={resolved}")
+PY
+)
+
+for entry in "${compose_exports[@]}"; do
+  [[ -z "$entry" ]] && continue
+  IFS="=" read -r key value <<<"$entry"
+  export "$key=$value"
+done
+
+export LIVE_DASHBOARD_ENABLED="${LIVE_DASHBOARD_ENABLED:-true}"
+
+APP_HOST="${APP_HOST:-127.0.0.1}"
+APP_PORT="${APP_PORT:-8080}"
+
+cleanup() {
+  if [[ -n "${UVICORN_PID:-}" ]]; then
+    pkill -TERM -P "$UVICORN_PID" 2>/dev/null || true
+    kill "$UVICORN_PID" 2>/dev/null || true
+    wait "$UVICORN_PID" 2>/dev/null || true
+    UVICORN_PID=""
+  fi
+}
+
+terminate() {
+  cleanup
+  exit 130
+}
+
+termterminate() {
+  cleanup
+  exit 143
+}
+
+trap cleanup EXIT
+trap terminate INT
+trap termterminate TERM
+
+set +e
+"$UVICORN" app.main:app --host "$APP_HOST" --port "$APP_PORT" --reload "$@" &
+UVICORN_PID=$!
+wait "$UVICORN_PID"
+status=$?
+set -e
+UVICORN_PID=""
+exit $status

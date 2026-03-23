@@ -1,0 +1,33 @@
+# Robot Dev Team Project
+# File: docker-compose.yml
+# Description: Docker Compose stack wiring for the webhook automation service.
+# License: MIT
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 MCKNLY LLC
+
+services:
+  app:
+    container_name: robot-dev-team
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    env_file:
+      - .env
+    environment:
+      LOCAL_UID: ${LOCAL_UID:-1000}
+      LOCAL_GID: ${LOCAL_GID:-1000}
+    volumes:
+      - ./prompts:/work/prompts:ro
+      - ./config:/work/config:ro
+      - ./run-logs:/work/run-logs
+      - ./npm-cache:/work/.npm-cache
+      - ${CLAUDE_CONFIG_PATH:-$HOME/.claude}:/home/appuser/.claude
+      - ${GEMINI_CONFIG_PATH:-$HOME/.gemini}:/home/appuser/.gemini
+      - ${CODEX_CONFIG_PATH:-$HOME/.codex}:/home/appuser/.codex
+      # Parent mount for project repositories (auto-discovery + on-demand cloning)
+      # Edit these paths to match your local projects directory structure
+      # Read-write mount for work routes
+      - ./projects:/work/projects
+      # Read-only mount for analysis/review routes
+      - ./projects:/work/projects-ro:ro

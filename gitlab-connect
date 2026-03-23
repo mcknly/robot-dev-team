@@ -1,0 +1,870 @@
+#!/usr/bin/env bash
+# Robot Dev Team Project
+# File: gitlab-connect
+# Description: GitLab CLI wrapper for agent-aware workflows.
+# License: MIT
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 MCKNLY LLC
+
+set -euo pipefail
+
+HOST="${GLAB_HOST:-gitlab.example.com}"
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/glab-cli/config.yml"
+SCRIPT_NAME="$(basename "$0")"
+
+timestamp() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+current_glab_user() {
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  awk -v host="$HOST" '
+    $1 == "hosts:" { in_hosts = 1; next }
+    in_hosts && $1 ~ /^[^:]+:$/ {
+      current = $1
+      sub(/:$/, "", current)
+      in_target = (current == host)
+      next
+    }
+    in_target && $1 == "user:" { print $2; exit }
+  ' "$CONFIG_FILE"
+}
+
+resolve_agent_name() {
+  if [[ -n "${CURRENT_AGENT:-}" ]]; then
+    printf '%s' "$CURRENT_AGENT"
+    return
+  fi
+  if [[ -n "${ROBOT_AGENT_NAME:-}" ]]; then
+    printf '%s' "$ROBOT_AGENT_NAME"
+    return
+  fi
+  local glab_user
+  glab_user=$(current_glab_user)
+  if [[ -n "$glab_user" ]]; then
+    printf '%s' "$glab_user"
+  else
+    printf 'unknown'
+  fi
+}
+
+log_tool_call() {
+  local command="$1"
+  printf '%s | INFO | tool-call | tool=gitlab-connect agent=%s command=%s\n' \
+    "$(timestamp)" "$(resolve_agent_name)" "$command" >&2
+}
+
+format_args() {
+  local result=""
+  local arg
+  for arg in "$@"; do
+    result+=" $(printf '%q' "$arg")"
+  done
+  printf '%s' "$result"
+}
+
+die() {
+  printf 'Error: %s\n' "$1" >&2
+  exit 1
+}
+
+# --- read-only repo detection and --repo injection ---
+
+REPO_FLAG=()
+READONLY_REPO=0
+
+detect_readonly_repo() {
+  local repo_root
+  repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
+  if [[ -e "$repo_root/.git" ]] && ! test -w "$repo_root/.git"; then
+    return 0
+  fi
+  return 1
+}
+
+extract_repo_path() {
+  local url
+  url=$(git remote get-url origin 2>/dev/null) || {
+    echo "[gitlab-connect] WARN: could not resolve origin remote URL" >&2
+    return 1
+  }
+  local repo_path="$url"
+
+  if [[ "$repo_path" =~ ^[a-zA-Z0-9_.-]+@ ]]; then
+    # SSH scp-style: git@host:ns/proj.git -> host/ns/proj.git
+    repo_path="${repo_path#*@}"
+    repo_path="${repo_path/://}"
+  elif [[ "$repo_path" == ssh://* ]]; then
+    # SSH protocol: ssh://[user@]host[:port]/ns/proj.git
+    # Strip non-standard port since glab --repo expects host/ns/proj
+    repo_path="${repo_path#*://}"
+    repo_path="${repo_path#*@}"
+    local hostport="${repo_path%%/*}"
+    local path_remainder="${repo_path#*/}"
+    if [[ "$hostport" =~ ^.+:[0-9]+$ ]]; then
+      hostport="${hostport%:*}"
+    fi
+    repo_path="$hostport/$path_remainder"
+  else
+    # HTTPS or other protocol: strip scheme and userinfo, preserve port
+    repo_path="${repo_path#*://}"
+    repo_path="${repo_path#*@}"
+  fi
+
+  # Strip .git suffix
+  repo_path="${repo_path%.git}"
+
+  if [[ -z "$repo_path" || "$repo_path" == "$url" ]]; then
+    echo "[gitlab-connect] WARN: could not parse repo path from origin URL: $url" >&2
+    return 1
+  fi
+  printf '%s' "$repo_path"
+}
+
+resolve_repo_context() {
+  if ! detect_readonly_repo; then
+    return
+  fi
+  READONLY_REPO=1
+  echo "[gitlab-connect] INFO: read-only repo detected, resolving repo context for glab" >&2
+  local repo_path
+  if repo_path=$(extract_repo_path); then
+    REPO_FLAG=("--repo" "$repo_path")
+    echo "[gitlab-connect] INFO: using --repo $repo_path for glab commands" >&2
+  else
+    echo "[gitlab-connect] WARN: falling back to glab auto-detection (may fail in RO mount)" >&2
+  fi
+}
+
+print_main_usage() {
+  cat <<'USAGE'
+Usage: gitlab-connect [--agent NAME] [--no-auth] <command> [<args>]
+
+Commands:
+  auth                Authenticate the GitLab CLI as the specified agent
+  issue               Create, edit, comment on, or view issues
+  mr                  Create, edit, comment on, or view merge requests
+  help                Show this help text
+
+Global options:
+  -a, --agent NAME    Agent account to operate as (any configured agent name); defaults to $CURRENT_AGENT or $ROBOT_AGENT_NAME when unset
+      --no-auth       Skip automatic authentication (advanced)
+  -h, --help          Show this help text
+
+Examples:
+  gitlab-connect issue create --title "Bug" --file body.md
+  gitlab-connect issue view 42
+  gitlab-connect issue comment 42 --file reply.md
+  gitlab-connect mr comment 17 --file note.md
+  gitlab-connect auth --agent claude
+
+Authentication:
+  Tokens follow a naming convention: for agent "foo", set FOO_AGENT_GITLAB_TOKEN.
+  The container entrypoint mirrors each token into ~/.<agent>/glab-token (mode 0600).
+  gitlab-connect invokes glab-usr under the hood, which reads the env var or token
+  file and runs `glab auth login` before executing the requested command.
+  See docs/ADDING_AN_AGENT.md for details on onboarding custom agents.
+USAGE
+}
+
+print_issue_usage() {
+  cat <<'USAGE'
+Usage: gitlab-connect issue <action> [ID] [options] [-- GLAB_ARGS...]
+
+Actions:
+  create              Create a new issue (requires --title and --file)
+  edit                Update an issue description (requires ID and --file)
+  comment             Add a note to an issue (requires ID and --file)
+  view                Display an issue with comments (requires ID)
+
+Options:
+  -f, --file PATH     Markdown file for create/edit/comment
+  -t, --title TITLE   Title for create/edit
+  -h, --help          Show this help text
+
+Additional flags for the underlying `glab issue` command can be passed after `--`.
+USAGE
+}
+
+print_mr_usage() {
+  cat <<'USAGE'
+Usage: gitlab-connect mr <action> [ID] [options] [-- GLAB_ARGS...]
+
+Actions:
+  create              Create a new merge request (requires --title and --file)
+  edit                Update an MR description (requires ID and --file)
+  comment             Add a note to an MR (requires ID and --file)
+  view                Display an MR with comments (requires ID)
+
+Options:
+  -f, --file PATH     Markdown file for create/edit/comment
+  -t, --title TITLE   Title for create/edit
+  -h, --help          Show this help text
+
+Additional flags for the underlying `glab mr` command can be passed after `--`.
+USAGE
+}
+
+normalize_issue_action() {
+  case "$1" in
+    create|edit|comment|view) printf '%s' "$1" ;;
+    show|get) printf 'view' ;;
+    *) die "Invalid issue action: $1" ;;
+  esac
+}
+
+normalize_mr_action() {
+  case "$1" in
+    create|edit|comment|view) printf '%s' "$1" ;;
+    show|get) printf 'view' ;;
+    *) die "Invalid merge request action: $1" ;;
+  esac
+}
+
+read_file_contents() {
+  local path="$1"
+  [[ -f "$path" ]] || die "File not found: $path"
+  [[ -r "$path" ]] || die "File is not readable: $path"
+  cat "$path"
+}
+
+authenticate_agent() {
+  local agent="$1"
+  [[ -n "$agent" ]] || die "No agent specified; set CURRENT_AGENT or pass --agent"
+  log_tool_call "glab-usr $(printf '%q' "$agent")"
+  glab-usr "$agent"
+}
+
+issue_create() {
+  local title=""
+  local body_file=""
+  local extra=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -t|--title)
+        [[ $# -ge 2 ]] || die "Missing value for $1"
+        title="$2"
+        shift 2
+        ;;
+      -f|--file)
+        [[ $# -ge 2 ]] || die "Missing value for $1"
+        body_file="$2"
+        shift 2
+        ;;
+      -h|--help)
+        print_issue_usage
+        exit 0
+        ;;
+      --)
+        shift
+        extra+=("$@")
+        break
+        ;;
+      -*)
+        die "Unknown option for issue create: $1"
+        ;;
+      *)
+        die "Unexpected argument: $1"
+        ;;
+    esac
+  done
+
+  [[ -n "$title" ]] || die "--title is required for issue create"
+  [[ -n "$body_file" ]] || die "--file is required for issue create"
+  local body_contents
+  body_contents="$(read_file_contents "$body_file")"
+  local -a cmd=(glab issue create --title "$title" --description "$body_contents")
+  [[ ${#REPO_FLAG[@]} -gt 0 ]] && cmd+=("${REPO_FLAG[@]}")
+  if [[ ${#extra[@]} -gt 0 ]]; then
+    cmd+=("${extra[@]}")
+  fi
+  local display="glab issue create --title $(printf '%q' "$title") --description @${body_file}"
+  if [[ ${#extra[@]} -gt 0 ]]; then
+    display+="$(format_args "${extra[@]}")"
+  fi
+  log_tool_call "$display"
+  "${cmd[@]}"
+}
+
+issue_edit() {
+  local issue_id=""
+  local title=""
+  local body_file=""
+  local extra=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -t|--title)
+        [[ $# -ge 2 ]] || die "Missing value for $1"
+        title="$2"
+        shift 2
+        ;;
+      -f|--file)
+        [[ $# -ge 2 ]] || die "Missing value for $1"
+        body_file="$2"
+        shift 2
+        ;;
+      -h|--help)
+        print_issue_usage
+        exit 0
+        ;;
+      --)
+        shift
+        extra+=("$@")
+        break
+        ;;
+      -*)
+        die "Unknown option for issue edit: $1"
+        ;;
+      *)
+        if [[ -z "$issue_id" ]]; then
+          issue_id="$1"
+          shift
+        else
+          extra+=("$1")
+          shift
+        fi
+        ;;
+    esac
+  done
+
+  [[ -n "$issue_id" ]] || die "Issue ID is required for issue edit"
+  [[ -n "$body_file" ]] || die "--file is required for issue edit"
+  local body_contents
+  body_contents="$(read_file_contents "$body_file")"
+  local -a cmd=(glab issue update "$issue_id" --description "$body_contents")
+  [[ ${#REPO_FLAG[@]} -gt 0 ]] && cmd+=("${REPO_FLAG[@]}")
+  local display="glab issue update $(printf '%q' "$issue_id") --description @${body_file}"
+  if [[ -n "$title" ]]; then
+    cmd+=(--title "$title")
+    display+=" --title $(printf '%q' "$title")"
+  fi
+  if [[ ${#extra[@]} -gt 0 ]]; then
+    cmd+=("${extra[@]}")
+    display+="$(format_args "${extra[@]}")"
+  fi
+  log_tool_call "$display"
+  "${cmd[@]}"
+}
+
+issue_comment() {
+  local issue_id=""
+  local body_file=""
+  local extra=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--file)
+        [[ $# -ge 2 ]] || die "Missing value for $1"
+        body_file="$2"
+        shift 2
+        ;;
+      -h|--help)
+        print_issue_usage
+        exit 0
+        ;;
+      --)
+        shift
+        extra+=("$@")
+        break
+        ;;
+      -*)
+        die "Unknown option for issue comment: $1"
+        ;;
+      *)
+        if [[ -z "$issue_id" ]]; then
+          issue_id="$1"
+          shift
+        else
+          extra+=("$1")
+          shift
+        fi
+        ;;
+    esac
+  done
+
+  [[ -n "$issue_id" ]] || die "Issue ID is required for issue comment"
+  [[ -n "$body_file" ]] || die "--file is required for issue comment"
+  local body_contents
+  body_contents="$(read_file_contents "$body_file")"
+  local -a cmd=(glab issue note "$issue_id" --message "$body_contents")
+  [[ ${#REPO_FLAG[@]} -gt 0 ]] && cmd+=("${REPO_FLAG[@]}")
+  local display="glab issue note $(printf '%q' "$issue_id") --message @${body_file}"
+  if [[ ${#extra[@]} -gt 0 ]]; then
+    cmd+=("${extra[@]}")
+    display+="$(format_args "${extra[@]}")"
+  fi
+  log_tool_call "$display"
+  "${cmd[@]}"
+}
+
+issue_view() {
+  local issue_id=""
+  local extra=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        print_issue_usage
+        exit 0
+        ;;
+      --)
+        shift
+        extra+=("$@")
+        break
+        ;;
+      -*)
+        extra+=("$1")
+        shift
+        ;;
+      *)
+        if [[ -z "$issue_id" ]]; then
+          issue_id="$1"
+          shift
+        else
+          extra+=("$1")
+          shift
+        fi
+        ;;
+    esac
+  done
+
+  [[ -n "$issue_id" ]] || die "Issue ID is required for issue view"
+  local -a cmd=(glab issue view "$issue_id" --comments --per-page 100)
+  [[ ${#REPO_FLAG[@]} -gt 0 ]] && cmd+=("${REPO_FLAG[@]}")
+  if [[ ${#extra[@]} -gt 0 ]]; then
+    cmd+=("${extra[@]}")
+  fi
+  local display="glab issue view $(printf '%q' "$issue_id") --comments --per-page 100"
+  if [[ ${#extra[@]} -gt 0 ]]; then
+    display+="$(format_args "${extra[@]}")"
+  fi
+  log_tool_call "$display"
+  "${cmd[@]}"
+}
+
+mr_create() {
+  local title=""
+  local body_file=""
+  local extra=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -t|--title)
+        [[ $# -ge 2 ]] || die "Missing value for $1"
+        title="$2"
+        shift 2
+        ;;
+      -f|--file)
+        [[ $# -ge 2 ]] || die "Missing value for $1"
+        body_file="$2"
+        shift 2
+        ;;
+      -h|--help)
+        print_mr_usage
+        exit 0
+        ;;
+      --)
+        shift
+        extra+=("$@")
+        break
+        ;;
+      -*)
+        die "Unknown option for mr create: $1"
+        ;;
+      *)
+        die "Unexpected argument: $1"
+        ;;
+    esac
+  done
+
+  [[ -n "$title" ]] || die "--title is required for mr create"
+  [[ -n "$body_file" ]] || die "--file is required for mr create"
+  local body_contents
+  body_contents="$(read_file_contents "$body_file")"
+  local -a cmd=(glab mr create --title "$title" --description "$body_contents")
+  [[ ${#REPO_FLAG[@]} -gt 0 ]] && cmd+=("${REPO_FLAG[@]}")
+  if [[ ${#extra[@]} -gt 0 ]]; then
+    cmd+=("${extra[@]}")
+  fi
+  local display="glab mr create --title $(printf '%q' "$title") --description @${body_file}"
+  if [[ ${#extra[@]} -gt 0 ]]; then
+    display+="$(format_args "${extra[@]}")"
+  fi
+  log_tool_call "$display"
+  "${cmd[@]}"
+}
+
+mr_edit() {
+  local mr_ref=""
+  local title=""
+  local body_file=""
+  local extra=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -t|--title)
+        [[ $# -ge 2 ]] || die "Missing value for $1"
+        title="$2"
+        shift 2
+        ;;
+      -f|--file)
+        [[ $# -ge 2 ]] || die "Missing value for $1"
+        body_file="$2"
+        shift 2
+        ;;
+      -h|--help)
+        print_mr_usage
+        exit 0
+        ;;
+      --)
+        shift
+        extra+=("$@")
+        break
+        ;;
+      -*)
+        die "Unknown option for mr edit: $1"
+        ;;
+      *)
+        if [[ -z "$mr_ref" ]]; then
+          mr_ref="$1"
+          shift
+        else
+          extra+=("$1")
+          shift
+        fi
+        ;;
+    esac
+  done
+
+  [[ -n "$mr_ref" ]] || die "Merge request ID is required for mr edit"
+  [[ -n "$body_file" ]] || die "--file is required for mr edit"
+  local body_contents
+  body_contents="$(read_file_contents "$body_file")"
+  local -a cmd=(glab mr update "$mr_ref" --description "$body_contents")
+  [[ ${#REPO_FLAG[@]} -gt 0 ]] && cmd+=("${REPO_FLAG[@]}")
+  local display="glab mr update $(printf '%q' "$mr_ref") --description @${body_file}"
+  if [[ -n "$title" ]]; then
+    cmd+=(--title "$title")
+    display+=" --title $(printf '%q' "$title")"
+  fi
+  if [[ ${#extra[@]} -gt 0 ]]; then
+    cmd+=("${extra[@]}")
+    display+="$(format_args "${extra[@]}")"
+  fi
+  log_tool_call "$display"
+  "${cmd[@]}"
+}
+
+mr_comment() {
+  local mr_ref=""
+  local body_file=""
+  local extra=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--file)
+        [[ $# -ge 2 ]] || die "Missing value for $1"
+        body_file="$2"
+        shift 2
+        ;;
+      -h|--help)
+        print_mr_usage
+        exit 0
+        ;;
+      --)
+        shift
+        extra+=("$@")
+        break
+        ;;
+      -*)
+        die "Unknown option for mr comment: $1"
+        ;;
+      *)
+        if [[ -z "$mr_ref" ]]; then
+          mr_ref="$1"
+          shift
+        else
+          extra+=("$1")
+          shift
+        fi
+        ;;
+    esac
+  done
+
+  [[ -n "$mr_ref" ]] || die "Merge request ID is required for mr comment"
+  [[ -n "$body_file" ]] || die "--file is required for mr comment"
+  local body_contents
+  body_contents="$(read_file_contents "$body_file")"
+  local -a cmd=(glab mr note "$mr_ref" --message "$body_contents")
+  [[ ${#REPO_FLAG[@]} -gt 0 ]] && cmd+=("${REPO_FLAG[@]}")
+  local display="glab mr note $(printf '%q' "$mr_ref") --message @${body_file}"
+  if [[ ${#extra[@]} -gt 0 ]]; then
+    cmd+=("${extra[@]}")
+    display+="$(format_args "${extra[@]}")"
+  fi
+  log_tool_call "$display"
+  "${cmd[@]}"
+}
+
+mr_view() {
+  local mr_ref=""
+  local extra=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        print_mr_usage
+        exit 0
+        ;;
+      --)
+        shift
+        extra+=("$@")
+        break
+        ;;
+      -*)
+        extra+=("$1")
+        shift
+        ;;
+      *)
+        if [[ -z "$mr_ref" ]]; then
+          mr_ref="$1"
+          shift
+        else
+          extra+=("$1")
+          shift
+        fi
+        ;;
+    esac
+  done
+
+  [[ -n "$mr_ref" ]] || die "Merge request ID is required for mr view"
+  local -a cmd=(glab mr view "$mr_ref" --comments --per-page 100)
+  [[ ${#REPO_FLAG[@]} -gt 0 ]] && cmd+=("${REPO_FLAG[@]}")
+  if [[ ${#extra[@]} -gt 0 ]]; then
+    cmd+=("${extra[@]}")
+  fi
+  local display="glab mr view $(printf '%q' "$mr_ref") --comments --per-page 100"
+  if [[ ${#extra[@]} -gt 0 ]]; then
+    display+="$(format_args "${extra[@]}")"
+  fi
+  log_tool_call "$display"
+  "${cmd[@]}"
+}
+
+handle_issue() {
+  local action=""
+  local -a rest=()
+
+  if [[ $# -eq 0 ]]; then
+    print_issue_usage >&2
+    exit 1
+  fi
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      create|edit|comment|view|get|show)
+        if [[ -z "$action" ]]; then
+          action="$(normalize_issue_action "$1")"
+        else
+          rest+=("$1")
+        fi
+        shift
+        ;;
+      -m|--mode)
+        [[ $# -ge 2 ]] || die "Missing value for $1"
+        action="$(normalize_issue_action "$2")"
+        shift 2
+        ;;
+      -h|--help)
+        print_issue_usage
+        exit 0
+        ;;
+      *)
+        rest+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$action" ]] || { print_issue_usage >&2; exit 1; }
+  case "$action" in
+    create) issue_create "${rest[@]}" ;;
+    edit) issue_edit "${rest[@]}" ;;
+    comment) issue_comment "${rest[@]}" ;;
+    view) issue_view "${rest[@]}" ;;
+    *) die "Unsupported issue action: $action" ;;
+  esac
+}
+
+handle_mr() {
+  local action=""
+  local -a rest=()
+
+  if [[ $# -eq 0 ]]; then
+    print_mr_usage >&2
+    exit 1
+  fi
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      create|edit|comment|view|get|show)
+        if [[ -z "$action" ]]; then
+          action="$(normalize_mr_action "$1")"
+        else
+          rest+=("$1")
+        fi
+        shift
+        ;;
+      -m|--mode)
+        [[ $# -ge 2 ]] || die "Missing value for $1"
+        action="$(normalize_mr_action "$2")"
+        shift 2
+        ;;
+      -h|--help)
+        print_mr_usage
+        exit 0
+        ;;
+      *)
+        rest+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$action" ]] || { print_mr_usage >&2; exit 1; }
+  case "$action" in
+    create) mr_create "${rest[@]}" ;;
+    edit) mr_edit "${rest[@]}" ;;
+    comment) mr_comment "${rest[@]}" ;;
+    view) mr_view "${rest[@]}" ;;
+    *) die "Unsupported merge request action: $action" ;;
+  esac
+}
+
+handle_auth() {
+  local agent_override="${AGENT_OVERRIDE:-}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -a|--agent)
+        [[ $# -ge 2 ]] || die "Missing value for $1"
+        agent_override="$2"
+        shift 2
+        ;;
+      -h|--help)
+        cat <<'USAGE'
+Usage: gitlab-connect auth [--agent NAME]
+
+Authenticate the GitLab CLI for the requested agent account.
+If no agent is provided, the command falls back to --agent, CURRENT_AGENT, or ROBOT_AGENT_NAME.
+USAGE
+        exit 0
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        if [[ -z "$agent_override" ]]; then
+          agent_override="$1"
+          shift
+        else
+          die "Unexpected argument: $1"
+        fi
+        ;;
+    esac
+  done
+
+  if [[ -z "$agent_override" ]]; then
+    agent_override="$(determine_agent)"
+  fi
+  authenticate_agent "$agent_override"
+}
+
+determine_agent() {
+  if [[ -n "${AGENT_OVERRIDE:-}" ]]; then
+    printf '%s' "$AGENT_OVERRIDE"
+    return
+  fi
+  if [[ -n "${CURRENT_AGENT:-}" ]]; then
+    printf '%s' "$CURRENT_AGENT"
+    return
+  fi
+  if [[ -n "${ROBOT_AGENT_NAME:-}" ]]; then
+    printf '%s' "$ROBOT_AGENT_NAME"
+    return
+  fi
+  printf ''
+}
+
+# --- main ---
+
+AGENT_OVERRIDE=""
+AUTO_AUTH=1
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -a|--agent)
+      [[ $# -ge 2 ]] || die "Missing value for $1"
+      AGENT_OVERRIDE="$2"
+      shift 2
+      ;;
+    --no-auth)
+      AUTO_AUTH=0
+      shift
+      ;;
+    -h|--help)
+      print_main_usage
+      exit 0
+      ;;
+    help)
+      print_main_usage
+      exit 0
+      ;;
+    auth|issue|mr)
+      COMMAND="$1"
+      shift
+      break
+      ;;
+    *)
+      COMMAND="$1"
+      shift
+      break
+      ;;
+  esac
+ done
+
+if [[ -z "${COMMAND:-}" ]]; then
+  print_main_usage >&2
+  exit 1
+fi
+
+case "$COMMAND" in
+  auth)
+    handle_auth "$@"
+    exit $?
+    ;;
+  issue|mr)
+    ;;
+  *)
+    die "Unknown command: $COMMAND"
+    ;;
+esac
+
+# Detect read-only repo and resolve context for glab commands
+resolve_repo_context
+
+# In read-only repos, skip redundant re-authentication to avoid
+# glab-usr attempting writes to .git/config (the router pre-authenticates)
+if [[ "$READONLY_REPO" -eq 1 && "$AUTO_AUTH" -eq 1 && -z "${GITLAB_CONNECT_FORCE_AUTH:-}" ]]; then
+  echo "[gitlab-connect] INFO: skipping re-authentication in read-only repo (pre-auth assumed)" >&2
+  AUTO_AUTH=0
+fi
+
+if [[ "$AUTO_AUTH" -eq 1 ]]; then
+  AGENT_SELECTED="$(determine_agent)"
+  [[ -n "$AGENT_SELECTED" ]] || die "Unable to determine agent; set CURRENT_AGENT or use --agent"
+  authenticate_agent "$AGENT_SELECTED"
+fi
+
+case "$COMMAND" in
+  issue)
+    handle_issue "$@"
+    ;;
+  mr)
+    handle_mr "$@"
+    ;;
+esac

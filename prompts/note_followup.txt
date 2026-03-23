@@ -1,0 +1,32 @@
+You were mentioned in the following comment. Read the full issue thread and craft a helpful reply that:
+1. Addresses any questions or tasks directed at you.
+2. Highlights next actions or blockers.
+3. Suggests relevant follow-up resources or owners if needed.
+
+**READ-ONLY MODE:** The project directory is mounted READ-ONLY at the filesystem level. Any write attempts will fail with "Read-only file system" errors. This is intentional. Focus on analysis and discussion - do NOT attempt to edit project files, create branches, or commit changes.
+
+Project: ${PROJECT}
+Comment URL: ${URL}
+Author: ${AUTHOR}
+
+The full issue or merge request and comments can be accessed interactively via the `gitlab-connect issue view [id]` or `gitlab-connect mr view [id]` command, using the issue or MR ID from the URL.
+
+Here's the message you were sent: ${DESCRIPTION}
+
+## Parent Context (enriched from GitLab API)
+
+The following is the full description and metadata of the parent issue or merge request this comment belongs to, fetched automatically at webhook time. Use this as baseline context for understanding the topic under discussion.
+
+${EXTRA}
+
+If no parent context appears above, use `gitlab-connect issue view [id]` or `gitlab-connect mr view [id]` to fetch the parent description and conversation history.
+
+If any other issues or merge requests were referenced in the message, review those with `gitlab-connect` as necessary.
+
+You are expected to respond to the same message thread via `gitlab-connect issue comment ...` or `gitlab-connect mr comment ...` using the issue or MR ID from the URL. Use `/tmp/` for any temporary files needed for comments (since the project directory is read-only). Write your comment content to a temporary file first, then pass it with `--file /tmp/comment.md`. If your built-in file-writing tool cannot write to `/tmp/`, use a shell command instead (e.g., `printf '%s' 'content' > /tmp/comment.md`). Clean up temporary files after use.
+
+**REMINDER:** The project is READ-ONLY. Any filesystem write errors confirm you are in analysis-only mode - respect these errors and focus on discussion tasks.
+
+## Completion Criteria
+
+Once you have posted your reply comment on the issue or merge request thread, **exit immediately**. Do not wait for further instructions or user input. Your task is finished when your reply has been posted.

@@ -1,0 +1,29 @@
+# Robot Dev Team Project
+# File: ruff.toml
+# Description: Ruff linting configuration for the Robot Dev Team Project.
+# License: MIT
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 MCKNLY LLC
+
+line-length = 100
+fix = true
+
+[lint]
+select = [
+  "E",
+  "F",
+  "W",
+  "B",
+  "C90",
+  "I",
+]
+ignore = [
+  "E203",
+  "E266",
+  "E501",
+]
+
+[lint.isort]
+known-first-party = [
+  "app",
+]
