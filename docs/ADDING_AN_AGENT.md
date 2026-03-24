@@ -161,7 +161,18 @@ volumes:
 ## Step 5: GitLab Account Setup
 
 1. Create a GitLab user for the agent (e.g., `qwen-code`).
-2. Generate a PAT with `api` scope.
+
+   > **Tip (self-managed GitLab):** You do not need to set a password or sign
+   > in as the agent account to generate a PAT. Instead, use admin
+   > impersonation:
+   > 1. Sign in as an admin and go to **Admin Area > Users > (agent user) >
+   >    Impersonate**.
+   > 2. Navigate to **User Settings > Access Tokens** and create a PAT with
+   >    `api` scope.
+   > 3. Copy the token, then click **Stop impersonating** to return to your
+   >    admin session.
+
+2. Generate a PAT with `api` scope (see tip above).
 3. Set the token in `.env` as `QWEN_CODE_AGENT_GITLAB_TOKEN=glpat-...`.
 4. Add the agent user to the GitLab project(s) with at least **Developer**
    role.

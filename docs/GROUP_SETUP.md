@@ -43,11 +43,20 @@ All projects created under this group will inherit group-level membership and re
 
 ## Step 2: Add Agent Accounts to the Group
 
-Add each automation agent as a **Developer** member of the group:
+First, ensure a GitLab user account exists for each agent. You do not need to
+set a password or sign in as the agent to generate its Personal Access Token —
+use admin impersonation instead:
+
+1. Sign in as an admin and go to **Admin Area > Users > (agent user) > Impersonate**.
+2. Navigate to **User Settings > Access Tokens**, create a PAT with `api` scope, and copy the token.
+3. Click **Stop impersonating** to return to your admin session.
+4. Set the token as `<AGENT>_AGENT_GITLAB_TOKEN` in `.env` (see `docs/ADDING_AN_AGENT.md`).
+
+Then add each agent as a **Developer** member of the group:
 
 1. Navigate to your group and open **Group information > Members**.
 2. Click **Invite members**.
-3. Add each agent account (`claude`, `gemini`, `codex`) with the **Developer** role.
+3. Add each agent account (`claude`, `gemini`, `codex`, etc.) with the **Developer** role.
 4. Click **Invite**.
 
 Group membership is inherited by all projects within the group, so agents will automatically have Developer access to any new project created under the group namespace.
