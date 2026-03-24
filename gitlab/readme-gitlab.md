@@ -16,24 +16,42 @@ This directory contains a reference Docker Compose setup for running GitLab CE w
 | File | Purpose |
 |------|---------|
 | `docker-compose.gitlab.yml` | Docker Compose file for GitLab CE with File Hook volume mount |
+| `docker-entrypoint-rdt.sh` | Entrypoint wrapper that performs automatic first-boot setup |
 | `file_hooks/add_webhooks.rb` | File Hook script that auto-creates project webhooks on project creation |
+| `setup-gitlab.sh` | Standalone setup script for bare-metal deployments (Docker: runs automatically) |
 
 ## Quick Start
 
-The `GITLAB_ADMIN_TOKEN` requires a Personal Access Token generated from within the GitLab web UI, so setup is a two-phase process:
+Setup is fully automatic on first boot when using the bundled `docker-compose.gitlab.yml`.
 
-1. Edit `docker-compose.gitlab.yml` and set `ROBOT_WEBHOOK_URL` and `GITLAB_WEBHOOK_SECRET`. Leave `GITLAB_ADMIN_TOKEN` as the placeholder for now.
-2. Start GitLab for the first time:
+1. Copy the example env file and fill in your values:
+   ```bash
+   cp .env.example .env
+   # Edit .env — set ROBOT_WEBHOOK_URL at minimum; see .env.example for all options
+   ```
+2. Start GitLab:
    ```bash
    docker compose -f docker-compose.gitlab.yml up -d
    ```
-3. Wait for GitLab to finish initializing (this may take several minutes on first boot), then sign in to the web UI.
-4. Create an admin Personal Access Token with `api` scope (**Settings > Access Tokens**).
-5. Update `GITLAB_ADMIN_TOKEN` in `docker-compose.gitlab.yml` with the new PAT value, then restart:
+3. Wait for first boot to complete. GitLab typically takes 3–5 minutes to become
+   healthy. Once healthy, `docker-entrypoint-rdt.sh` automatically:
+   - Creates an admin Personal Access Token (`rdt-admin`) using the auto-generated
+     root password from `/etc/gitlab/initial_root_password`.
+   - Enables outbound requests to local/private network addresses (required for the
+     File Hook to register webhooks pointing to `host.docker.internal`).
+   - Writes the token to `/etc/gitlab/rdt.env` for the File Hook to read.
+
+   Follow the logs to watch progress:
    ```bash
-   docker compose -f docker-compose.gitlab.yml up -d
+   docker logs -f gitlab | grep '\[RDT\]'
    ```
-6. See `docs/GROUP_SETUP.md` for full setup instructions including group creation and agent membership.
+4. See `docs/GROUP_SETUP.md` for next steps (create a group, add agent members).
+
+> **Custom root password:** If you set `GITLAB_ROOT_PASSWORD` in your environment,
+> the auto-generated `/etc/gitlab/initial_root_password` file is not created and
+> automatic PAT setup is skipped. In that case, create an admin PAT manually in
+> the web UI, set `GITLAB_ADMIN_TOKEN` in `gitlab/.env`, and restart the container.
+> Run `bash setup-gitlab.sh` to apply the local webhook delivery setting.
 
 ## Image Tag Policy
 

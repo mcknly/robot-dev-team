@@ -10,13 +10,15 @@
 #
 # Usage:
 #   1. Run from the gitlab/ directory (file_hooks/ is included alongside this file).
-#   2. Start GitLab for the first time:
+#   2. Copy the example env file and fill in ROBOT_WEBHOOK_URL at minimum:
+#        cp .env.example .env
+#   3. Start GitLab:
 #        docker compose -f docker-compose.gitlab.yml up -d
-#   3. Create an admin Personal Access Token (api scope) in the GitLab web UI.
-#   4. Set GITLAB_ADMIN_TOKEN in gitlab/.env to the new PAT value, then restart:
-#        docker compose -f docker-compose.gitlab.yml restart
-#   5. Run the one-time setup script to apply required application settings:
-#        bash setup-gitlab.sh
+#
+#   On first boot, docker-entrypoint-rdt.sh automatically:
+#     - Creates an admin PAT using the auto-generated root password.
+#     - Enables outbound requests to local/private network addresses.
+#   No manual token creation or setup-gitlab.sh run is required.
 #
 # See readme-gitlab.md in this directory for upgrade guidance.
 
@@ -26,6 +28,9 @@ services:
     container_name: gitlab
     hostname: localhost
     restart: unless-stopped
+    # Wrap the standard GitLab entrypoint to perform one-time setup on first
+    # boot (PAT creation + local webhook delivery setting).
+    entrypoint: ["/bin/bash", "/rdt-entrypoint.sh"]
     ports:
       - "8929:80"
       # - "4443:443"
@@ -34,6 +39,8 @@ services:
       - gitlab_config:/etc/gitlab
       - gitlab_logs:/var/log/gitlab
       - gitlab_data:/var/opt/gitlab
+      # Entrypoint wrapper — performs first-boot RDT setup automatically.
+      - ./docker-entrypoint-rdt.sh:/rdt-entrypoint.sh:ro
       # Mount the File Hooks directory so scripts persist across
       # container restarts and GitLab upgrades.
       - ./file_hooks:/opt/gitlab/embedded/service/gitlab-rails/file_hooks

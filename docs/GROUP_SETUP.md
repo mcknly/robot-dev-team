@@ -30,7 +30,7 @@ For teams managing multiple projects, this becomes tedious. The group-based appr
 
 - **GitLab Self-Managed** instance (File Hooks are not available on GitLab.com SaaS). The included `gitlab/docker-compose.gitlab.yml` uses the `latest` GitLab CE image.
 - Filesystem access to the GitLab server (or ability to mount volumes into the GitLab container)
-- A GitLab admin or Maintainer-level Personal Access Token with `api` scope
+- A GitLab admin or Maintainer-level Personal Access Token with `api` scope (created automatically on first boot when using `gitlab/docker-compose.gitlab.yml`)
 
 ## Step 1: Create a Project Group
 
@@ -65,28 +65,30 @@ The File Hook script (`gitlab/file_hooks/add_webhooks.rb`) runs automatically wh
    chmod +x gitlab/file_hooks/add_webhooks.rb
    ```
 
-2. The included `gitlab/docker-compose.gitlab.yml` mounts this directory automatically. Copy the example env file and fill in the values:
+2. Copy the example env file and fill in the values (at minimum, set `ROBOT_WEBHOOK_URL`):
    ```bash
    cp gitlab/.env.example gitlab/.env
    # Edit gitlab/.env — see the variable reference in the table below
    ```
-   Start GitLab:
+
+3. Start GitLab:
    ```bash
    docker compose -f gitlab/docker-compose.gitlab.yml up -d
    ```
+
+   On first boot, the bundled `docker-entrypoint-rdt.sh` wrapper runs automatically once GitLab is healthy and performs two setup steps without any manual intervention:
+
+   - **Creates an admin PAT** (`rdt-admin`, `api` scope) by reading the auto-generated root password from `/etc/gitlab/initial_root_password` and running `gitlab-rails runner`. The token is written to `/etc/gitlab/rdt.env` on the `gitlab_config` volume; the File Hook reads it from there.
+   - **Enables local network webhook delivery** — calls `PUT /api/v4/application/settings?allow_local_requests_from_web_hooks_and_services=true`, which cannot be set in `gitlab.rb` and must be applied via the API. This allows the File Hook to register webhooks pointing to `host.docker.internal` (a Docker gateway address in the `172.x.x.x` range that GitLab would otherwise reject with `422 Invalid url given`).
+
+   Follow progress with:
+   ```bash
+   docker logs -f gitlab | grep '\[RDT\]'
+   ```
+
+   > **Custom root password:** If `GITLAB_ROOT_PASSWORD` was set, the auto-generated password file is absent and automatic setup is skipped. Create the PAT manually, add it to `gitlab/.env` as `GITLAB_ADMIN_TOKEN`, and run `bash gitlab/setup-gitlab.sh`.
+
    See `gitlab/readme-gitlab.md` for upgrade guidance.
-
-3. Once GitLab is healthy, create an admin Personal Access Token (`api` scope) in the web UI, add it to `gitlab/.env`, then restart:
-   ```bash
-   docker compose -f gitlab/docker-compose.gitlab.yml restart
-   ```
-
-4. Run the one-time setup script. This applies application settings that cannot be configured in `gitlab.rb`, including allowing the File Hook to register webhooks that point to local/Docker network addresses:
-   ```bash
-   bash gitlab/setup-gitlab.sh
-   ```
-
-   > **Why this step is required:** GitLab blocks outbound requests to private IP ranges by default. The robot-dev-team webhook URL (`http://host.docker.internal:…`) resolves to a Docker gateway address (`172.x.x.x`), which GitLab rejects with `422 Invalid url given` unless this setting is enabled. The script calls `PUT /api/v4/application/settings?allow_local_requests_from_web_hooks_and_services=true`.
 
 **For bare-metal GitLab:**
 
@@ -123,7 +125,7 @@ Run the built-in GitLab rake task to confirm the hook is detected:
 
 ```bash
 # Containerized
-docker exec -it <gitlab-container> gitlab-rake file_hooks:validate
+docker exec -it gitlab gitlab-rake file_hooks:validate
 
 # Bare-metal
 sudo gitlab-rake file_hooks:validate
@@ -133,7 +135,7 @@ sudo gitlab-rake file_hooks:validate
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `GITLAB_ADMIN_TOKEN` | Admin or Maintainer PAT with `api` scope (must be created in the GitLab UI after first boot; see `gitlab/readme-gitlab.md`) | Yes |
+| `GITLAB_ADMIN_TOKEN` | Admin or Maintainer PAT with `api` scope. For Docker deployments using `gitlab/docker-compose.gitlab.yml`, this is created automatically on first boot and written to `/etc/gitlab/rdt.env` — you do not need to set this manually. For bare-metal, create it in the web UI and set it here. | Docker: No / Bare-metal: Yes |
 | `ROBOT_WEBHOOK_URL` | Webhook listener URL (e.g., `https://host/webhooks/gitlab`) | Yes |
 | `GITLAB_WEBHOOK_SECRET` | Shared secret matching `GITLAB_WEBHOOK_SECRET` in the Robot Dev Team `.env` | Recommended |
 | `GITLAB_API_URL` | GitLab API base URL | No (defaults to `http://localhost:80/api/v4`) |

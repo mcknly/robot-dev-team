@@ -31,7 +31,24 @@ require 'logger'
 
 # --- CONFIGURATION (from environment) ---
 GITLAB_API_URL    = ENV.fetch('GITLAB_API_URL', 'http://localhost:80/api/v4')
-PRIVATE_TOKEN     = ENV.fetch('GITLAB_ADMIN_TOKEN') { abort 'GITLAB_ADMIN_TOKEN not set' }
+
+# Resolve the admin token: prefer the env var (set via gitlab_rails['env'] in
+# gitlab.rb / GITLAB_OMNIBUS_CONFIG), then fall back to /etc/gitlab/rdt.env
+# (written by docker-entrypoint-rdt.sh on first boot when the token is
+# auto-created and no GITLAB_ADMIN_TOKEN was present in gitlab/.env).
+PRIVATE_TOKEN = begin
+  token = ENV['GITLAB_ADMIN_TOKEN']
+  # Treat absent, empty, or placeholder values as unset.
+  if token.nil? || token.empty? || token.start_with?('glpat-xxx')
+    rdt_env = '/etc/gitlab/rdt.env'
+    if File.exist?(rdt_env)
+      line = File.readlines(rdt_env).find { |l| l.start_with?('GITLAB_ADMIN_TOKEN=') }
+      token = line&.split('=', 2)&.last&.strip
+    end
+  end
+  token || abort('GITLAB_ADMIN_TOKEN not set and not found in /etc/gitlab/rdt.env')
+end
+
 TARGET_WEBHOOK_URL = ENV.fetch('ROBOT_WEBHOOK_URL') { abort 'ROBOT_WEBHOOK_URL not set' }
 WEBHOOK_SECRET    = ENV.fetch('GITLAB_WEBHOOK_SECRET', nil)
 SSL_VERIFY        = ENV.fetch('GITLAB_WEBHOOK_SSL_VERIFY', 'true').downcase != 'false'
