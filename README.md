@@ -85,7 +85,7 @@ This project has been heavily documented to make it agent-friendly. Clone it, po
 
 ## Quick Start
 
-> **Before you begin:** _This assumes you already have a self-hosted GitLab CE instance. If you need to stand one up, see `gitlab/readme-gitlab.md` and `gitlab/docker-compose.gitlab.yml` for a reference deployment._
+> **Before you begin:** _This assumes you already have a self-hosted GitLab CE instance. If you need to stand one up, see `gitlab/readme-gitlab.md` and `gitlab/docker-compose.gitlab.yml` for a reference deployment — it includes an entrypoint wrapper that automatically creates an admin token and configures webhook delivery on first boot._
 Create GitLab user accounts for each agent you plan to use (`claude`, `gemini`, `codex`, etc.), generate a Personal Access Token (PAT) with `api` scope for each, and invite the agent accounts to your target project(s) with **Developer** role (Project > Members > Invite member).
 For multi-project setups, add agents at the **Group** level so access is inherited automatically -- see `docs/GROUP_SETUP.md`. Agents cannot interact with projects they are not members of, even if webhooks are configured correctly.
 
