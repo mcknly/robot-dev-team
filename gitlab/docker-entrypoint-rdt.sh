@@ -68,17 +68,32 @@ if [[ ! -f "$SETUP_MARKER" ]]; then
     # Create (or retrieve) the admin PAT via Rails runner.
     # find_or_initialize_by makes this idempotent: re-running against an
     # existing 'rdt-admin' token updates it rather than creating a duplicate.
+    # GitLab 17+ requires a non-null expiration date; use 365 days from today.
     # -----------------------------------------------------------------------
     echo "[RDT] Creating admin Personal Access Token..."
-    TOKEN=$(gitlab-rails runner "
+    # Disable set -e for the rails runner call so we can capture and report
+    # any failure rather than silently exiting the background subshell.
+    set +e
+    RUNNER_OUT=$(gitlab-rails runner "
       user = User.find_by_username('root')
       pat = user.personal_access_tokens.find_or_initialize_by(name: 'rdt-admin')
       pat.scopes = ['api']
-      pat.expires_at = nil
+      pat.expires_at = Date.today + 365
       pat.save!
       puts pat.token
-    " 2>/dev/null | tail -n1)
+    " 2>&1)
+    RUNNER_EXIT=$?
+    set -e
 
+    if [[ $RUNNER_EXIT -ne 0 ]]; then
+      echo "[RDT] ERROR: gitlab-rails runner exited with status $RUNNER_EXIT."
+      echo "$RUNNER_OUT" | grep -iE "error|invalid|exception|validation" | head -5
+      echo "[RDT]   File Hook webhook provisioning will be unavailable until a valid"
+      echo "[RDT]   GITLAB_ADMIN_TOKEN is written to $RDT_ENV_FILE or set in gitlab/.env."
+      exit 0
+    fi
+
+    TOKEN=$(echo "$RUNNER_OUT" | tail -n1)
     if [[ -z "$TOKEN" || ! "$TOKEN" =~ ^glpat- ]]; then
       echo "[RDT] WARNING: PAT creation returned unexpected output: '${TOKEN}'."
       echo "[RDT]   File Hook webhook provisioning will be unavailable until a valid"
