@@ -65,27 +65,28 @@ The File Hook script (`gitlab/file_hooks/add_webhooks.rb`) runs automatically wh
    chmod +x gitlab/file_hooks/add_webhooks.rb
    ```
 
-2. The included `gitlab/docker-compose.gitlab.yml` mounts this directory automatically:
-   ```yaml
-   volumes:
-     - ./file_hooks:/opt/gitlab/embedded/service/gitlab-rails/file_hooks
-   ```
-   Run `docker compose -f gitlab/docker-compose.gitlab.yml up -d` from the repository root, or copy the `gitlab/` directory to your deployment location. See `gitlab/readme-gitlab.md` for upgrade guidance.
-
-3. Configure the required environment variables in your GitLab Omnibus config:
-   ```ruby
-   # In /etc/gitlab/gitlab.rb (or via GITLAB_OMNIBUS_CONFIG)
-   gitlab_rails['env'] = {
-     'GITLAB_ADMIN_TOKEN'    => 'glpat-xxxxxxxxxxxxxxxxxxxx',
-     'ROBOT_WEBHOOK_URL'     => 'https://your-host/webhooks/gitlab',
-     'GITLAB_WEBHOOK_SECRET' => 'your-shared-secret'
-   }
-   ```
-
-4. Reconfigure GitLab:
+2. The included `gitlab/docker-compose.gitlab.yml` mounts this directory automatically. Copy the example env file and fill in the values:
    ```bash
-   docker exec -it <gitlab-container> gitlab-ctl reconfigure
+   cp gitlab/.env.example gitlab/.env
+   # Edit gitlab/.env — see the variable reference in the table below
    ```
+   Start GitLab:
+   ```bash
+   docker compose -f gitlab/docker-compose.gitlab.yml up -d
+   ```
+   See `gitlab/readme-gitlab.md` for upgrade guidance.
+
+3. Once GitLab is healthy, create an admin Personal Access Token (`api` scope) in the web UI, add it to `gitlab/.env`, then restart:
+   ```bash
+   docker compose -f gitlab/docker-compose.gitlab.yml restart
+   ```
+
+4. Run the one-time setup script. This applies application settings that cannot be configured in `gitlab.rb`, including allowing the File Hook to register webhooks that point to local/Docker network addresses:
+   ```bash
+   bash gitlab/setup-gitlab.sh
+   ```
+
+   > **Why this step is required:** GitLab blocks outbound requests to private IP ranges by default. The robot-dev-team webhook URL (`http://host.docker.internal:…`) resolves to a Docker gateway address (`172.x.x.x`), which GitLab rejects with `422 Invalid url given` unless this setting is enabled. The script calls `PUT /api/v4/application/settings?allow_local_requests_from_web_hooks_and_services=true`.
 
 **For bare-metal GitLab:**
 
@@ -97,11 +98,23 @@ The File Hook script (`gitlab/file_hooks/add_webhooks.rb`) runs automatically wh
    sudo chown git:git /opt/gitlab/embedded/service/gitlab-rails/file_hooks/add_webhooks.rb
    ```
 
-2. Set the environment variables in `/etc/gitlab/gitlab.rb` as shown above.
+2. Set the environment variables in `/etc/gitlab/gitlab.rb`:
+   ```ruby
+   gitlab_rails['env'] = {
+     'GITLAB_ADMIN_TOKEN'    => 'glpat-xxxxxxxxxxxxxxxxxxxx',
+     'ROBOT_WEBHOOK_URL'     => 'https://your-host/webhooks/gitlab',
+     'GITLAB_WEBHOOK_SECRET' => 'your-shared-secret'
+   }
+   ```
 
 3. Reconfigure:
    ```bash
    sudo gitlab-ctl reconfigure
+   ```
+
+4. Run the setup script (set `GITLAB_URL` and `GITLAB_ADMIN_TOKEN` in the environment if not using `gitlab/.env`):
+   ```bash
+   GITLAB_URL=https://your-host bash gitlab/setup-gitlab.sh
    ```
 
 ### Validation

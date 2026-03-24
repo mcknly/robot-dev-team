@@ -13,20 +13,22 @@
 #   2. Start GitLab for the first time:
 #        docker compose -f docker-compose.gitlab.yml up -d
 #   3. Create an admin Personal Access Token (api scope) in the GitLab web UI.
-#   4. Set GITLAB_ADMIN_TOKEN below to the new PAT value, then restart:
-#        docker compose -f docker-compose.gitlab.yml up -d
+#   4. Set GITLAB_ADMIN_TOKEN in gitlab/.env to the new PAT value, then restart:
+#        docker compose -f docker-compose.gitlab.yml restart
+#   5. Run the one-time setup script to apply required application settings:
+#        bash setup-gitlab.sh
 #
 # See readme-gitlab.md in this directory for upgrade guidance.
 
 services:
   gitlab:
     image: gitlab/gitlab-ce:latest
-    hostname: gitlab.example.com
+    hostname: localhost
     restart: unless-stopped
     ports:
-      - "80:80"
-      - "443:443"
-      - "2222:22"
+      - "8080:80"
+      # - "4443:443"
+      # - "2222:22"
     volumes:
       - gitlab_config:/etc/gitlab
       - gitlab_logs:/var/log/gitlab
@@ -34,6 +36,8 @@ services:
       # Mount the File Hooks directory so scripts persist across
       # container restarts and GitLab upgrades.
       - ./file_hooks:/opt/gitlab/embedded/service/gitlab-rails/file_hooks
+    env_file:
+      - .env
     environment:
       GITLAB_OMNIBUS_CONFIG: |
         # Uncomment and edit the external_url to match your domain:
@@ -41,18 +45,17 @@ services:
 
         # Pass environment variables to the Rails application so
         # the add_webhooks.rb File Hook can read them at runtime.
+        # Values are substituted from gitlab/.env by Docker Compose.
         gitlab_rails['env'] = {
-          # NOTE: This token cannot be set until after GitLab is running.
-          # On first boot, leave this as the placeholder, then:
-          #   1. Start GitLab with docker compose up -d
-          #   2. Create an admin PAT (api scope) in the GitLab UI
-          #   3. Replace the placeholder value below
-          #   4. Restart the container for the File Hook to pick it up
-          'GITLAB_ADMIN_TOKEN'    => 'glpat-xxxxxxxxxxxxxxxxxxxx',
-          'ROBOT_WEBHOOK_URL'     => 'https://your-robot-dev-team-host/webhooks/gitlab',
-          'GITLAB_WEBHOOK_SECRET' => 'replace-with-shared-secret',
-          'GITLAB_WEBHOOK_SSL_VERIFY' => 'true'
+          'GITLAB_ADMIN_TOKEN'          => '${GITLAB_ADMIN_TOKEN}',
+          'ROBOT_WEBHOOK_URL'           => '${ROBOT_WEBHOOK_URL}',
+          'GITLAB_WEBHOOK_SECRET'       => '${GITLAB_WEBHOOK_SECRET}',
+          'GITLAB_WEBHOOK_SSL_VERIFY'   => '${GITLAB_WEBHOOK_SSL_VERIFY}'
         }
+    # Resolve 'host.docker.internal' to the Docker host on Linux.
+    # (Docker Desktop on macOS/Windows provides this automatically.)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     shm_size: "256m"
 
 volumes:
