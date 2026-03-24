@@ -37,7 +37,7 @@ if [[ -z "${GITLAB_ADMIN_TOKEN:-}" || "$GITLAB_ADMIN_TOKEN" == glpat-xxx* ]]; th
   exit 1
 fi
 
-GITLAB_URL="${GITLAB_URL:-http://localhost:8080}"
+GITLAB_URL="${GITLAB_URL:-http://localhost:8929}"
 API="$GITLAB_URL/api/v4"
 AUTH=(-H "PRIVATE-TOKEN: $GITLAB_ADMIN_TOKEN")
 

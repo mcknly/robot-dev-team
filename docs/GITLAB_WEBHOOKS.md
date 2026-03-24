@@ -34,8 +34,8 @@ Follow this guide to connect GitLab projects to the webhook automation service.
 
 ## Local Development Tips
 
-- Use `./launch-uvicorn-dev` to start the FastAPI server at `http://127.0.0.1:8080`.
-- Expose the local port externally using a tunnel service (e.g., `ngrok http 8080`) so GitLab can reach it.
+- Use `./launch-uvicorn-dev` to start the FastAPI server at `http://127.0.0.1:8888`.
+- Expose the local port externally using a tunnel service (e.g., `ngrok http 8888`) so GitLab can reach it.
 - Update the webhook URL to the tunnel address while keeping `X-Gitlab-Token` consistent with `.env`.
 
 ## Troubleshooting

@@ -15,7 +15,7 @@ The live dashboard provides real-time visibility into webhook processing, agent 
 
 1. Set `LIVE_DASHBOARD_ENABLED=true` in `.env`.
 2. Restart the FastAPI service (`./launch-uvicorn-dev` or `docker compose up --build`).
-3. Visit `http://localhost:8080/dashboard` in a browser (adjust host/port as needed).
+3. Visit `http://localhost:8888/dashboard` in a browser (adjust host/port as needed).
 
 The dashboard serves static assets directly from the FastAPI app; no separate build step is required.
 

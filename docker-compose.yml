@@ -11,12 +11,18 @@ services:
     build: .
     restart: unless-stopped
     ports:
-      - "${APP_PORT:-8080}:8080"
+      - "${APP_PORT:-8888}:8080"
     env_file:
       - .env
     environment:
       LOCAL_UID: ${LOCAL_UID:-1000}
       LOCAL_GID: ${LOCAL_GID:-1000}
+    # Allows the container to reach the Docker host (and services mapped to
+    # host ports, such as a locally deployed GitLab instance) using the stable
+    # name 'host.docker.internal'. Required on Linux; Docker Desktop on
+    # macOS/Windows provides this automatically.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./prompts:/work/prompts:ro
       - ./config:/work/config:ro

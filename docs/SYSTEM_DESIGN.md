@@ -122,7 +122,7 @@ It is designed for local or self-hosted GitLab setups. GitHub integrations will 
 ```bash
 # Web server
 APP_HOST=0.0.0.0
-APP_PORT=8080
+APP_PORT=8888
 APP_LOG_LEVEL=INFO
 
 # GitLab Webhook

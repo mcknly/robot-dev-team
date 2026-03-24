@@ -23,10 +23,11 @@
 services:
   gitlab:
     image: gitlab/gitlab-ce:latest
+    container_name: gitlab
     hostname: localhost
     restart: unless-stopped
     ports:
-      - "8080:80"
+      - "8929:80"
       # - "4443:443"
       # - "2222:22"
     volumes:
@@ -40,8 +41,21 @@ services:
       - .env
     environment:
       GITLAB_OMNIBUS_CONFIG: |
-        # Uncomment and edit the external_url to match your domain:
-        # external_url 'https://gitlab.example.com'
+        # The external_url controls the hostname embedded in git clone URLs,
+        # email links, and OAuth redirects that GitLab generates.
+        # For local Docker deployments this must be a URL reachable both from
+        # the host browser (localhost:8080 still works via port mapping) and
+        # from other containers (host.docker.internal resolves to the host via
+        # extra_hosts).  Change to your public domain for production.
+        external_url '${GITLAB_EXTERNAL_URL}'
+
+        # Keep nginx listening on port 80 inside the container regardless of
+        # the port in external_url.  This decouples the clone/link URL port
+        # (host-visible) from the internal listen port, so the port mapping
+        # 8929:80 stays correct even when external_url specifies port 8929.
+        # This is the standard GitLab pattern for reverse-proxy deployments.
+        nginx['listen_port'] = 80
+        nginx['listen_https'] = false
 
         # Pass environment variables to the Rails application so
         # the add_webhooks.rb File Hook can read them at runtime.

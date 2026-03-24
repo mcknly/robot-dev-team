@@ -27,10 +27,12 @@ For container runs, Compose pulls the same `.env` file and binds host credential
 | --- | --- | --- | --- |
 | `APP_NAME` | Display name used in logs. | No | `Robot Dev Team Webhook Listener` |
 | `APP_HOST` | Interface FastAPI binds to. | No | `127.0.0.1` |
-| `APP_PORT` | Exposed port for HTTP traffic. | No | `8080` |
+| `APP_PORT` | Exposed port for HTTP traffic. | No | `8888` |
 | `APP_LOG_LEVEL` | Log verbosity (see level guide below). | No | `INFO` |
 | `GITLAB_WEBHOOK_SECRET` | Shared token validated against `X-Gitlab-Token`. Leave empty to disable verification (not recommended). | Yes | _(none)_ |
-| `GLAB_HOST` | GitLab instance hostname used by `glab-usr` and `gitlab-connect`. | Yes | `gitlab.com` |
+| `GLAB_HOST` | GitLab instance hostname used by `glab-usr` and `gitlab-connect`. Must match the hostname in webhook-provided clone URLs (i.e. the hostname part of `GITLAB_EXTERNAL_URL` in `gitlab/.env`). For local Docker deployments using the bundled `gitlab/docker-compose.gitlab.yml`: set to `gitlab` (the Docker service name). For production: your GitLab domain (e.g. `gitlab.example.com`). | Yes | `gitlab.com` |
+| `GLAB_API_HOST` | Override the API host when it differs from `GLAB_HOST` — e.g. when GitLab runs on a non-standard port and is not reachable via the shared Docker network. When using the `robot-gitlab-net` shared network this is not needed since GitLab's internal port 80 is used directly. | No | _(same as `GLAB_HOST`)_ |
+| `GLAB_PROTOCOL` | Protocol for GitLab API and git operations: `https` (default) or `http`. Set to `http` for local deployments without TLS. Used by `glab-usr` for `glab auth login --api-protocol` and the git credential file scheme. | No | `https` |
 | `GLAB_TOKEN` | GitLab PAT for the app process. Used for enrichment (fetching issue/MR context) and auto-unassign operations. Requires `api` scope when `ENABLE_AUTO_UNASSIGN` is enabled; `read_api` is sufficient if auto-unassign is disabled. | No | _(none)_ |
 | `GLAB_TIMEOUT_SECONDS` | Timeout for GitLab CLI enrichment calls. | No | `30` |
 | `AGENT_MAX_WALL_CLOCK_SECONDS` | Hard upper-bound run duration for each agent CLI invocation. | No | `7200` |
@@ -135,7 +137,7 @@ The GitLab CLI configuration is generated inside the container on startup using 
 
 ```ini
 APP_HOST=0.0.0.0
-APP_PORT=8080
+APP_PORT=8888
 APP_LOG_LEVEL=INFO
 GITLAB_WEBHOOK_SECRET=replace-me
 GLAB_HOST=gitlab.example.com
@@ -313,6 +315,60 @@ When branch switching is enabled, the following substitutions are available in p
 - `${SOURCE_BRANCH}` — MR source branch (if applicable)
 - `${TARGET_BRANCH}` — MR target branch (if applicable)
 - `${CURRENT_BRANCH}` — The actual checked-out branch after resolution (always populated when `working_dir` exists)
+
+### Deployment Profiles
+
+The right network and GitLab host configuration depends on where the two services are running relative to each other. There are three common profiles:
+
+---
+
+**Profile 1: Local Docker (same host, bundled `gitlab/docker-compose.gitlab.yml`)**
+
+Both containers are on the same machine. `robot-dev-team` reaches GitLab via the Docker host using `host.docker.internal`, which resolves to the host gateway from inside any container (provided by `extra_hosts: host.docker.internal:host-gateway` in both compose files, or automatically on Docker Desktop).
+
+The key detail: `external_url` in `GITLAB_OMNIBUS_CONFIG` controls the hostname in generated clone URLs, but setting a non-standard port there would make GitLab's nginx also listen on that port — breaking the `8929:80` mapping. This is resolved by adding `nginx['listen_port'] = 80` to the Omnibus config, which pins the internal listen port to 80 regardless of what `external_url` says (the standard GitLab pattern for reverse-proxy setups).
+
+| Setting | Value |
+|---|---|
+| `GITLAB_EXTERNAL_URL` (in `gitlab/.env`) | `http://host.docker.internal:8929` |
+| `GLAB_HOST` | `host.docker.internal` |
+| `GLAB_API_HOST` | `host.docker.internal:8929` |
+| `GLAB_PROTOCOL` | `http` |
+| `gitlab/docker-compose.gitlab.yml` port mapping | `8929:80` (unchanged; browsers still use `localhost:8929`) |
+| Shared Docker network | Not required |
+
+---
+
+**Profile 2: Production (reverse proxy, real public domain)**
+
+GitLab sits behind a reverse proxy (nginx, Caddy, etc.) with a real domain and TLS. `robot-dev-team` can reach GitLab either via the shared Docker network (if on the same host) or via the public URL. The shared network is optional but still useful to avoid an unnecessary trip through the proxy for clone and API calls.
+
+| Setting | Value |
+|---|---|
+| `GITLAB_EXTERNAL_URL` (in `gitlab/.env`) | `https://gitlab.example.com` |
+| `GLAB_HOST` | `gitlab.example.com` |
+| `GLAB_PROTOCOL` | `https` |
+| `GLAB_API_HOST` | _(not needed)_ |
+| Shared network | Optional — omit `robot-gitlab-net` from `docker-compose.yml` if preferred |
+
+The reverse proxy terminates TLS and forwards to GitLab's internal port 80 as normal. The `robot-gitlab-net` network does not interfere with it.
+
+---
+
+**Profile 3: Containers on different Docker hosts**
+
+Docker bridge networks are host-local and cannot span machines. The shared network approach does not apply here.
+
+| Setting | Value |
+|---|---|
+| `GITLAB_EXTERNAL_URL` (in `gitlab/.env`) | `https://gitlab.example.com` (must be publicly routable) |
+| `GLAB_HOST` | `gitlab.example.com` |
+| `GLAB_PROTOCOL` | `https` |
+| Shared network | **Not applicable** — remove `robot-gitlab-net` from both compose files |
+
+`robot-dev-team` reaches GitLab via the public URL. All clone and API calls go over the network between hosts. Ensure `robot-dev-team`'s host can reach GitLab's domain and that the GitLab instance allows webhook delivery to `robot-dev-team`'s public address.
+
+---
 
 ### Starting the Stack
 
