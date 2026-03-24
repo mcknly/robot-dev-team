@@ -45,13 +45,50 @@ Setup is fully automatic on first boot when using the bundled `docker-compose.gi
    ```bash
    docker logs -f gitlab | grep '\[RDT\]'
    ```
-4. See `docs/GROUP_SETUP.md` for next steps (create a group, add agent members).
+4. Log in to the GitLab web UI — see **First Login** below.
+5. See `docs/GROUP_SETUP.md` for next steps (create a group, add agent members).
 
 > **Custom root password:** If you set `GITLAB_ROOT_PASSWORD` in your environment,
 > the auto-generated `/etc/gitlab/initial_root_password` file is not created and
 > automatic PAT setup is skipped. In that case, create an admin PAT manually in
 > the web UI, set `GITLAB_ADMIN_TOKEN` in `gitlab/.env`, and restart the container.
 > Run `bash setup-gitlab.sh` to apply the local webhook delivery setting.
+
+## First Login
+
+GitLab is available at **http://localhost:8929** once the container is healthy.
+
+### Auto-generated password (default)
+
+On first boot GitLab writes a random root password to `/etc/gitlab/initial_root_password`
+inside the container. Read it with:
+
+```bash
+docker exec gitlab grep 'Password:' /etc/gitlab/initial_root_password
+```
+
+Log in with username `root` and that password. **Change the password immediately**
+after signing in: **User menu (top-right) > Edit profile > Password**.
+
+> The file is deleted automatically by GitLab 24 hours after first boot. Retrieve
+> it before then, or reset the password via `gitlab-rake "gitlab:password:reset"` if
+> you miss the window.
+
+### Known password (optional)
+
+To use a password of your choice from the start, add it to `gitlab/.env` before
+the first `docker compose up`:
+
+```ini
+GITLAB_ROOT_PASSWORD=your-strong-password
+```
+
+GitLab seeds the root account with this value instead of generating one.
+The `initial_root_password` file is not created, and the `docker-entrypoint-rdt.sh`
+auto-setup will skip PAT creation (see the custom root password note above) — so
+also set `GITLAB_ADMIN_TOKEN` in `gitlab/.env` after creating a PAT manually in the
+web UI, or omit `GITLAB_ROOT_PASSWORD` and let the entrypoint handle everything
+automatically.
 
 ## Image Tag Policy
 
