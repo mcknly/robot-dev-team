@@ -103,7 +103,9 @@ if [[ ! -f "$SETUP_MARKER" ]]; then
 
     echo "[RDT] Admin PAT created. Writing to $RDT_ENV_FILE..."
     echo "GITLAB_ADMIN_TOKEN=$TOKEN" > "$RDT_ENV_FILE"
-    chmod 600 "$RDT_ENV_FILE"
+    # Readable by root and the git user (which runs Sidekiq and file hooks).
+    chown root:git "$RDT_ENV_FILE"
+    chmod 640 "$RDT_ENV_FILE"
 
     # -----------------------------------------------------------------------
     # Enable outbound requests to local/private network addresses.
