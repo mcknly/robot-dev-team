@@ -168,15 +168,9 @@ For multi-project setups, add agents at the **Group** level so access is inherit
 GitLab projects can be configured to emit webhook events (merge requests, issues, comments). This service receives those events, optionally enriches them via `glab`, renders prompts from templates, and shells out to one or more agent CLIs configured per event type. Each agent can authenticate to GitLab via the bundled `glab-usr` helper and then post results back through the GitLab API via `gitlab-connect`, a custom helper script for wrapping `glab` and making it more agent-friendly.
 
 ## System Architecture
-```
-┌────────────┐      ┌─────────────┐      ┌────────────────┐      ┌────────────────┐      ┌─────────────┐
-│ GitLab     │ ---> │ Webhook     │ ---> │ Event Router   │ ---> │ Trigger Queue  │ ---> │ Agent Runner│
-│ Webhooks   │ POST │ Listener    │      │  (routes.yaml) │      │   (FIFO, async)│      │             │
-└────────────┘      └─────────────┘      └────────────────┘      └────────────────┘      └─────────────┘
-                                                                                         │
-                                                                                         └───────┬────────────┬────────────┬───────────┐
-                                                                                                 │ Claude CLI │ Gemini CLI │ Codex CLI │ ...
-```
+<div align="center">
+  <img src="assets/rdt-arch.svg" alt="System Architecture" width="100%">
+</div>
 
 - Webhook listener: FastAPI endpoint validates secrets, deduplicates events, and normalizes metadata.
 - Event router: Matches incoming events against YAML rules that specify which agents to invoke and determines whether the payload should fan out per user mention.
