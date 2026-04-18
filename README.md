@@ -19,6 +19,14 @@ No need for separate pay-as-you-go API keys, use the command line agents you alr
 
 ## Rationale
 
+### Why Multiple Agents?
+
+Using more than one agent provider (i.e. Claude, Codex, Gemini...) allows you to pit multiple language models against each other. You can fine-tune roles, get multiple opinions, and have them review each other. _Huge level up for workflows._
+
+This platform follows a **BYOA** philosophy: it is not locked to any specific provider. Go ahead and have Kimi review Codex. Make Qwen handle merge requests. You _could_ also just use a single agent for everything, if you're old fashioned like that.
+
+Here's an [essay](https://open.substack.com/pub/cavinmckinley/p/robot-dev-teams-and-keeping-the-human) espousing the philosophy.
+
 ### Why GitLab?
 
 GitLab is [open source](https://gitlab.com/gitlab-org/gitlab), and can be hosted locally in a [docker container](https://docs.gitlab.com/install/docker/). This provides you with a private, self-managed project repository with all the features you would expect from a modern SCM. But most importantly, GitLab's issue tracking, merge request, and conversation interface provides a rich _infinite context platform_ on which to work with your coding agents.
@@ -28,12 +36,6 @@ You can even allow your agents to @ each other, if you're token-uninhibited.
 ### Why Docker?
 
 Containerizing the webhook server and agent CLI tools provides agent isolation from the host system without the need for the agents to aggresively sandbox themselves. What this means: agents can run in YOLO mode with access to only the tools they need and the codebase. They can get their job done without approval, and without risk.
-
-### Why Multiple Agents?
-
-Using more than one agent provider (i.e. Claude, Codex, Gemini...) allows you to pit multiple language models against each other. You can fine-tune roles, get multiple opinions, and have them review each other. _Huge level up for workflows._
-
-This platform follows a **BYOA** philosophy: it is not locked to any specific provider. Go ahead and have Kimi review Codex. Make Qwen handle merge requests. You _could_ also just use a single agent for everything, if you're old fashioned like that.
 
 ### Why CLI Harnesses?
 
