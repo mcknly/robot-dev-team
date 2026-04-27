@@ -17,6 +17,10 @@ Copyright (c) 2025 MCKNLY LLC
 Ships with adapters for Claude Code, Google Gemini, and OpenAI Codex, but any tool that accepts prompts on stdin can be wired in simply by replacing CLI command strings.
 No need for separate pay-as-you-go API keys, use the command line agents you already have.
 
+<div align="center">
+  <img src=assets/robot-dev-team-highlight.gif alt="robot-dev-team" align=center/>
+</div>
+
 ## Rationale
 
 ### Why Multiple Agents?
@@ -55,7 +59,7 @@ If you're already authenticated in the host CLI, your agents are ready to work, 
 - **Structured run logging** — Every agent execution is captured as a JSON file (prompt, stdout, stderr, return code, branch context) with configurable retention and automatic pruning.
 - **Webhook deduplication and queue management** — UUID-based event tracking with configurable TTL prevents duplicate processing; an in-memory async queue serializes dispatches.
 
-### Demo
+### Full Workflow Demo
 <div align="center">
   <a href="https://youtu.be/VEkyBA1mPms">
     <img src="assets/rdt-gitlab-thumb.png" alt="RDT-BYOA" width="75%">
