@@ -41,7 +41,7 @@ routes:
         prompt: "issue_review.txt"
         options:
           command: "gemini"
-          args: ["--model", "${GEMINI_MODEL}", "--yolo", "-p", ""]
+          args: ["--model", "${GEMINI_MODEL}", "--yolo", "--skip-trust", "-p", ""]
       - agent: "codex"
         task: "issue_review"
         prompt: "issue_review.txt"
@@ -65,7 +65,7 @@ routes:
         prompt: "merge_request_review.txt"
         options:
           command: "gemini"
-          args: ["--model", "${GEMINI_MODEL}", "--yolo", "-p", ""]
+          args: ["--model", "${GEMINI_MODEL}", "--yolo", "--skip-trust", "-p", ""]
       - agent: "codex"
         task: "merge_request_review"
         prompt: "merge_request_review.txt"
@@ -104,7 +104,7 @@ routes:
         prompt: "assign_work.txt"
         options:
           command: "gemini"
-          args: ["--model", "${GEMINI_MODEL}", "--yolo", "-p", ""]
+          args: ["--model", "${GEMINI_MODEL}", "--yolo", "--skip-trust", "-p", ""]
   - name: assign-issue-codex
     access: readwrite
     match:
@@ -147,7 +147,7 @@ routes:
         prompt: "assign_work.txt"
         options:
           command: "gemini"
-          args: ["--model", "${GEMINI_MODEL}", "--yolo", "-p", ""]
+          args: ["--model", "${GEMINI_MODEL}", "--yolo", "--skip-trust", "-p", ""]
   - name: assign-mr-codex
     access: readwrite
     match:
@@ -190,7 +190,7 @@ routes:
         prompt: "note_followup.txt"
         options:
           command: "gemini"
-          args: ["--model", "${GEMINI_MODEL}", "--yolo", "-p", ""]
+          args: ["--model", "${GEMINI_MODEL}", "--yolo", "--skip-trust", "-p", ""]
   - name: mention-codex
     access: readonly
     match:
