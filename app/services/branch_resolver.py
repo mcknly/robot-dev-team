@@ -14,14 +14,37 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.services.git_runtime import GLAB_USR_TIMEOUT_SECONDS, git_auth_lock
 from app.services.glab import _get_glab_env
 
+DirtyState = Literal["clean", "submodule_only", "dirty"]
+
 LOGGER = get_logger(__name__)
+
+
+def _as_optional_str(value: Any) -> Optional[str]:
+    """Narrow an untyped webhook/API value to a str, else None.
+
+    Webhook payloads and glab API responses are typed ``Any``; this boundary
+    guard ensures a malformed ``source_branch`` (missing or non-string) surfaces
+    as ``None`` instead of leaking an untyped value out of the resolver.
+    """
+    return value if isinstance(value, str) else None
+
+
+def _as_optional_int(value: Any) -> Optional[int]:
+    """Narrow an untyped webhook/API value to an int, else None.
+
+    ``bool`` is a subclass of ``int``, so it is rejected explicitly to avoid a
+    JSON ``true`` being read as MR iid ``1``.
+    """
+    if isinstance(value, bool):
+        return None
+    return value if isinstance(value, int) else None
 
 
 @dataclass
@@ -54,6 +77,86 @@ class BranchResult:
         return self.backups[0].reason if self.backups else None
 
 
+async def _determine_target_branch(
+    event: Dict[str, Any],
+    project_path: str,
+    working_dir: str,
+) -> Optional[str]:
+    """Select the target branch for an event, falling back to the default branch.
+
+    MR events use the payload source_branch; note/issue events look up the
+    associated branch; anything else (and any miss) falls back to the remote
+    default branch.
+    """
+    object_kind = event.get("object_kind", "")
+
+    if object_kind == "merge_request":
+        target_branch = _get_branch_from_mr_event(event)
+    elif object_kind == "note":
+        # Note (comment) on MR or issue
+        target_branch = await _get_branch_from_note_event(event, project_path)
+    elif object_kind == "issue":
+        target_branch = await _get_branch_from_issue_event(event, project_path)
+    else:
+        # For unknown events, use default branch
+        target_branch = await _get_default_branch(working_dir)
+
+    if not target_branch:
+        # Fall back to default branch if we couldn't determine target
+        target_branch = await _get_default_branch(working_dir)
+
+    return target_branch
+
+
+async def _backup_dirty_working_tree(
+    working_dir: str,
+    current_branch: Optional[str],
+    dirty_state: DirtyState,
+    agent: str,
+) -> Tuple[List[BackupRecord], Optional[BranchResult]]:
+    """Back up uncommitted changes before checkout when the tree is dirty.
+
+    Returns ``(backups, error_result)``. A non-None ``error_result`` means the
+    backup failed and checkout must not proceed. submodule_only trees are
+    intentionally skipped (capturing a gitlink rollback as a backup is
+    misleading -- see issue #15).
+    """
+    if dirty_state == "submodule_only":
+        sub_status = await _submodule_status(working_dir)
+        LOGGER.warning(
+            "Skipping auto-backup: only dirty paths are submodule gitlinks/contents",
+            extra={
+                "working_dir": working_dir,
+                "submodule_status": sub_status or "unavailable",
+            },
+        )
+        return [], None
+
+    if dirty_state == "dirty":
+        backup_result = await _create_backup_branch(
+            working_dir=working_dir,
+            current_branch=current_branch,
+            agent=agent,
+        )
+        if not backup_result.success:
+            # Cannot continue with dirty working tree if backup failed
+            return [], BranchResult(
+                success=False,
+                error=f"Uncommitted changes present and backup failed: {backup_result.error}",
+            )
+        LOGGER.warning(
+            "Created backup branch for uncommitted changes",
+            extra={
+                "backup_branch": backup_result.backup_branch,
+                "original_branch": current_branch,
+                "working_dir": working_dir,
+            },
+        )
+        return list(backup_result.backups), None
+
+    return [], None
+
+
 async def resolve_branch(
     event: Dict[str, Any],
     project_path: str,
@@ -79,24 +182,7 @@ async def resolve_branch(
     if not settings.enable_branch_switch:
         return BranchResult(success=True, switched=False)
 
-    object_kind = event.get("object_kind", "")
-    target_branch: Optional[str] = None
-
-    # Determine target branch based on event type
-    if object_kind == "merge_request":
-        target_branch = _get_branch_from_mr_event(event)
-    elif object_kind == "note":
-        # Note (comment) on MR or issue
-        target_branch = await _get_branch_from_note_event(event, project_path)
-    elif object_kind == "issue":
-        target_branch = await _get_branch_from_issue_event(event, project_path)
-    else:
-        # For unknown events, use default branch
-        target_branch = await _get_default_branch(working_dir)
-
-    if not target_branch:
-        # Fall back to default branch if we couldn't determine target
-        target_branch = await _get_default_branch(working_dir)
+    target_branch = await _determine_target_branch(event, project_path, working_dir)
 
     if not target_branch:
         return BranchResult(
@@ -117,30 +203,15 @@ async def resolve_branch(
         # changes that were pushed externally
         return await _sync_current_branch(working_dir, target_branch, agent)
 
-    # Check for uncommitted changes
-    is_clean = await _is_working_tree_clean(working_dir)
-
-    if not is_clean:
-        # Create backup branch with uncommitted changes
-        backup_result = await _create_backup_branch(
-            working_dir=working_dir,
-            current_branch=current_branch,
-            agent=agent,
-        )
-        if not backup_result.success:
-            # Cannot continue with dirty working tree if backup failed
-            return BranchResult(
-                success=False,
-                error=f"Uncommitted changes present and backup failed: {backup_result.error}",
-            )
-        LOGGER.warning(
-            "Created backup branch for uncommitted changes",
-            extra={
-                "backup_branch": backup_result.backup_branch,
-                "original_branch": current_branch,
-                "working_dir": working_dir,
-            },
-        )
+    # Classify working-tree state. Submodule-only dirty paths must NOT
+    # trigger auto-backup: capturing a gitlink rollback as a "backup" is
+    # actively misleading (see issue #15).
+    dirty_state = await _classify_dirty_state(working_dir)
+    dirty_backups, backup_error = await _backup_dirty_working_tree(
+        working_dir, current_branch, dirty_state, agent,
+    )
+    if backup_error is not None:
+        return backup_error
 
     # Fetch and checkout target branch
     checkout_result = await _checkout_branch(working_dir, target_branch, agent)
@@ -148,10 +219,7 @@ async def resolve_branch(
     if checkout_result.success:
         # Merge backups from dirty-tree backup and checkout (which may
         # have created its own backup for local commits ahead of origin)
-        all_backups: List[BackupRecord] = []
-        if not is_clean:
-            all_backups.extend(backup_result.backups)
-        all_backups.extend(checkout_result.backups)
+        all_backups: List[BackupRecord] = [*dirty_backups, *checkout_result.backups]
         return BranchResult(
             success=True,
             branch=target_branch,
@@ -160,12 +228,9 @@ async def resolve_branch(
         )
 
     # Checkout failed - preserve any backups created before the failure
-    prior_backups: List[BackupRecord] = []
-    if not is_clean:
-        prior_backups.extend(backup_result.backups)
-    prior_backups.extend(checkout_result.backups)
+    prior_backups: List[BackupRecord] = [*dirty_backups, *checkout_result.backups]
 
-    if is_clean:
+    if dirty_state != "dirty":
         LOGGER.warning(
             "Branch checkout failed for '%s', continuing on current branch '%s': %s",
             target_branch,
@@ -197,7 +262,7 @@ async def resolve_branch(
 def _get_branch_from_mr_event(event: Dict[str, Any]) -> Optional[str]:
     """Extract source_branch from MR webhook payload."""
     obj_attrs = event.get("object_attributes", {})
-    return obj_attrs.get("source_branch")
+    return _as_optional_str(obj_attrs.get("source_branch"))
 
 
 async def _get_branch_from_note_event(
@@ -214,7 +279,7 @@ async def _get_branch_from_note_event(
     if noteable_type == "MergeRequest":
         # Comment on MR - get source branch from merge_request object
         mr = event.get("merge_request", {})
-        return mr.get("source_branch")
+        return _as_optional_str(mr.get("source_branch"))
 
     if noteable_type == "Issue":
         # Comment on issue - look up linked MRs
@@ -322,7 +387,7 @@ async def _lookup_issue_branch(
                     "source_branch": mr.get("source_branch"),
                 },
             )
-            return mr["source_branch"]
+            return _as_optional_str(mr.get("source_branch"))
 
         # Smart selection
         return await _smart_select_branch(
@@ -394,7 +459,7 @@ async def _smart_select_branch(
                 "source_branch": mr["source_branch"],
             },
         )
-        return mr["source_branch"]
+        return _as_optional_str(mr.get("source_branch"))
 
     # Fetch closes_issues for each candidate concurrently
     closes_map = await _fetch_closes_issues_batch(
@@ -407,12 +472,15 @@ async def _smart_select_branch(
     # Note-mentioned MRs are always kept in the pool to allow intentional
     # steering via comments, even when a different MR explicitly closes the issue.
     explicitly_closing = [
-        mr for mr in candidates if closes_map.get(mr.get("iid")) is True
+        mr for mr in candidates
+        if (iid := _as_optional_int(mr.get("iid"))) is not None
+        and closes_map.get(iid) is True
     ]
     if explicitly_closing:
         pool = [
             mr for mr in candidates
-            if closes_map.get(mr.get("iid")) is True
+            if ((iid := _as_optional_int(mr.get("iid"))) is not None
+                and closes_map.get(iid) is True)
             or mr.get("iid") in note_mentioned_iids
         ]
     else:
@@ -442,7 +510,7 @@ async def _smart_select_branch(
         },
     )
 
-    return selected["source_branch"]
+    return _as_optional_str(selected.get("source_branch"))
 
 
 async def _fetch_closes_issues_batch(
@@ -503,8 +571,12 @@ async def _fetch_closes_issues_batch(
             return (mr_iid, None)
 
     # Filter out candidates without a valid integer iid to avoid wasteful
-    # API calls to merge_requests/0/closes_issues on malformed payloads
-    valid = [(mr.get("iid"), mr) for mr in candidates if mr.get("iid")]
+    # API calls to merge_requests/0/closes_issues on malformed payloads.
+    # The walrus narrows iid to int and the truthiness guard excludes 0/None.
+    valid = [
+        (iid, mr) for mr in candidates
+        if (iid := _as_optional_int(mr.get("iid")))
+    ]
     tasks = [_check_one(iid) for iid, _ in valid]
     results = await asyncio.gather(*tasks)
     return dict(results)
@@ -573,13 +645,20 @@ async def _get_current_branch(working_dir: str) -> Optional[str]:
         return None
 
 
-async def _is_working_tree_clean(working_dir: str) -> bool:
-    """Check if the working tree has no uncommitted changes."""
+async def _git_status_porcelain(
+    working_dir: str,
+    ignore_submodules: str,
+) -> Optional[bytes]:
+    """Run `git status --porcelain --ignore-submodules=<value>`.
+
+    Returns stdout bytes on success, or None if git exited non-zero or raised.
+    """
     try:
         proc = await asyncio.create_subprocess_exec(
             "git",
             "status",
             "--porcelain",
+            f"--ignore-submodules={ignore_submodules}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=working_dir,
@@ -588,13 +667,64 @@ async def _is_working_tree_clean(working_dir: str) -> bool:
         stdout, _ = await proc.communicate()
 
         if proc.returncode != 0:
-            return False
-
-        # Empty output means clean working tree
-        return len(stdout.strip()) == 0
+            return None
+        return stdout
 
     except Exception:
-        return False
+        return None
+
+
+async def _classify_dirty_state(working_dir: str) -> DirtyState:
+    """Classify the working-tree state for auto-backup decisions.
+
+    Returns:
+        - "clean": no uncommitted changes at all.
+        - "submodule_only": the only dirty paths are submodule gitlinks/contents.
+          Auto-backup would only capture the submodule ref rollback, which is
+          the footgun this classifier exists to avoid.
+        - "dirty": there is at least one non-submodule change (staged, unstaged,
+          or untracked). Auto-backup proceeds normally.
+
+    Uses two `git status --porcelain` calls and lets git itself decide what
+    counts as a submodule entry, avoiding hand-parsing `.gitmodules`. Treats
+    any git failure as "dirty" so callers err on the side of backing up.
+    """
+    full = await _git_status_porcelain(working_dir, ignore_submodules="none")
+    if full is None:
+        return "dirty"
+    if len(full.strip()) == 0:
+        return "clean"
+
+    files_only = await _git_status_porcelain(working_dir, ignore_submodules="all")
+    if files_only is None:
+        return "dirty"
+    if len(files_only.strip()) == 0:
+        return "submodule_only"
+    return "dirty"
+
+
+async def _submodule_status(working_dir: str) -> Optional[str]:
+    """Return `git submodule status` output (one entry per line, joined).
+
+    Used purely for advisory logging when we skip an auto-backup. Returns
+    None if the command fails.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "submodule",
+            "status",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=working_dir,
+            env=os.environ.copy(),
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode != 0:
+            return None
+        return stdout.decode("utf-8", errors="replace").strip()
+    except Exception:
+        return None
 
 
 async def _create_backup_branch(
@@ -927,10 +1057,19 @@ async def _sync_current_branch(
 
     backups: List[BackupRecord] = []
 
-    # Check for uncommitted changes
-    is_clean = await _is_working_tree_clean(working_dir)
+    # Classify dirty state. Same submodule-only carve-out as resolve_branch.
+    dirty_state = await _classify_dirty_state(working_dir)
 
-    if not is_clean:
+    if dirty_state == "submodule_only":
+        sub_status = await _submodule_status(working_dir)
+        LOGGER.warning(
+            "Skipping auto-backup during sync: only dirty paths are submodule gitlinks/contents",
+            extra={
+                "working_dir": working_dir,
+                "submodule_status": sub_status or "unavailable",
+            },
+        )
+    elif dirty_state == "dirty":
         # Backup uncommitted changes first
         backup_result = await _create_backup_branch(
             working_dir=working_dir,

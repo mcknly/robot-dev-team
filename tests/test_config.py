@@ -12,7 +12,6 @@ import pytest
 
 from app.core.config import Settings
 
-
 ENV_EXAMPLE = Path(__file__).resolve().parent.parent / ".env.example"
 
 # Default agent model env vars documented in .env.example

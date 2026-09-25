@@ -248,12 +248,9 @@ class TestCloneLocking:
 
         resolver = ProjectPathResolver(str(projects_root))
 
-        original_clone_repository = resolver._clone_repository
-
         async def mock_clone_repository(clone_url, target_dir, agent=None):
             nonlocal clone_count
             clone_count += 1
-            current_count = clone_count
 
             start_event = asyncio.Event()
             clone_started_events.append(start_event)

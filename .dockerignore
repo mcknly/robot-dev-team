@@ -1,0 +1,28 @@
+# Robot Dev Team Project
+# File: .dockerignore
+# Description: Exclude development and runtime state from container build contexts.
+# License: MIT
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 MCKNLY LLC
+
+.git
+.gitignore
+.gitlab-ci.yml
+.venv
+.uv-cache
+.mypy_cache
+.pytest_cache
+.ruff_cache
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.env
+.env.*
+!.env.example
+artifacts
+node_modules
+projects
+run-logs/*
+!run-logs/.gitkeep
+sbom

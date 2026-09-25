@@ -9,8 +9,11 @@
 # See docs/ROUTES.md for detailed schema and additional examples.
 #
 # IMPORTANT: Replace "your-username" with your GitLab username in each route's
-# author field. For persistent local overrides, copy this file to
-# config/routes.local.yaml, customise it, and set ROUTE_CONFIG_PATH in .env:
+# author field. The author field accepts either a single string or a list of
+# usernames if you want one route to be triggerable by multiple operators,
+# e.g. author: ["alice", "bob"]. Matching is case-insensitive in both forms.
+# For persistent local overrides, copy this file to config/routes.local.yaml,
+# customise it, and set ROUTE_CONFIG_PATH in .env:
 #   ROUTE_CONFIG_PATH=config/routes.local.yaml
 #
 # Access modes:
@@ -21,10 +24,153 @@
 #
 # Timeout overrides (optional per-route, falls back to global env vars):
 #   max_wall_clock_seconds: Hard upper-bound run duration (default: 7200)
-#   max_inactivity_seconds: Watchdog resets on stdout/stderr output (default: 900)
+#   max_inactivity_seconds: Watchdog resets on stdout output only (default: 900).
+#                           Stderr is tracked for diagnostics but deliberately
+#                           does not stay the timeout, so a retry loop (which
+#                           produces only stderr) cannot hold the queue open.
+#                           Raise this for a harness that goes quiet for long
+#                           stretches, e.g. a local model during a long prefill.
+#
+# Agent dispatch order (optional per-route):
+#   randomize: true   -> shuffle the agents list per matched event so the same
+#                        agent does not always run first. Only meaningful on
+#                        multi-agent routes (e.g. issue-triage). Defaults to
+#                        false. See docs/ROUTES.md for details.
 routes:
+  # Issue-assignment routes - triggered when an agent is assigned to an issue.
+  # GitLab's /assign quick action on an existing issue sends an Issue Hook with
+  # action=update; populating the assignee at issue-creation time sends an Issue
+  # Hook with action=open. Matching both (action: ["open", "update"]) means an
+  # issue created with an agent already assigned dispatches that agent's
+  # read-write assign_work route immediately, instead of first going through
+  # readonly triage/review. These routes detect agent usernames in the assignees
+  # list and grant read-write access for the agent to perform work.
+  #
+  # Placement matters: resolve_match returns the FIRST matching route, so these
+  # must sit ABOVE issue-triage (and any issue-update fallback). Otherwise a
+  # create-with-assignee event would fall through to the readonly issue-triage
+  # review. This is deliberately either/or -- an issue created with an agent
+  # assigned skips triage and goes straight to work.
+  #
+  # Assign-on-creation can be disabled with ENABLE_ASSIGN_ON_ISSUE_CREATION=false
+  # (default true), which reverts creation events to triage. The /assign-on-an-
+  # existing-issue path (action=update) is unaffected by that toggle.
+  - name: assign-issue-claude
+    access: readwrite
+    match:
+      event: "Issue Hook"
+      action: ["open", "update"]
+      author: "your-username"
+      assignees: ["claude"]
+    agents:
+      - agent: "claude"
+        task: "assign_work"
+        prompt: "assign_work.txt"
+        options:
+          command: "claude"
+          args: ["--model", "${CLAUDE_MODEL}", "--dangerously-skip-permissions", "-p"]
+  - name: assign-issue-gemini
+    access: readwrite
+    match:
+      event: "Issue Hook"
+      action: ["open", "update"]
+      author: "your-username"
+      assignees: ["gemini"]
+    agents:
+      - agent: "gemini"
+        task: "assign_work"
+        prompt: "assign_work.txt"
+        options:
+          command: "agy"
+          args: ["--model", "${GEMINI_MODEL}", "--dangerously-skip-permissions", "-p", "${PROMPT}"]
+  - name: assign-issue-codex
+    access: readwrite
+    match:
+      event: "Issue Hook"
+      action: ["open", "update"]
+      author: "your-username"
+      assignees: ["codex"]
+    agents:
+      - agent: "codex"
+        task: "assign_work"
+        prompt: "assign_work.txt"
+        options:
+          command: "codex"
+          args: ["--model", "${CODEX_MODEL}", "exec", "--yolo", "--skip-git-repo-check"]
+# OpenCode issue-assignment route (optional, disabled by default). Read-write
+# like the other assignment routes. Strip the leading `#` (column 0) to enable.
+#  - name: assign-issue-opencode-kimi
+#    access: readwrite
+#    match:
+#      event: "Issue Hook"
+#      action: ["open", "update"]
+#      author: "your-username"
+#      assignees: ["opencode-kimi"]
+#    agents:
+#      - agent: "opencode-kimi"
+#        task: "assign_work"
+#        prompt: "assign_work.txt"
+#        options:
+#          command: "opencode"
+#          args: ["run", "--model", "${OPENCODE_KIMI_MODEL}", "--format", "json", "--auto"]
+# Goose issue-assignment route (optional, disabled by default). Read-write like
+# the other assignment routes. Strip the leading `#` (column 0) to enable.
+#
+# Note the trigger and the agent are deliberately different strings: `assignees`
+# matches the GitLab *username* from the webhook payload (`gemma`), while `agent`
+# is the slug that resolves GOOSE_GEMMA_MODEL + GOOSE_GEMMA_AGENT_* (`goose-gemma`).
+# Same split as the opencode-kimi / `kimi` pair -- the harness prefix stays out of
+# the GitLab account name.
+#
+# A local model can go quiet for a long prefill, so the inactivity watchdog is
+# raised above the 900s default here to keep a run from being killed mid-think.
+#  - name: assign-issue-goose-gemma
+#    access: readwrite
+#    max_inactivity_seconds: 1800
+#    match:
+#      event: "Issue Hook"
+#      action: ["open", "update"]
+#      author: "your-username"
+#      assignees: ["gemma"]
+#    agents:
+#      - agent: "goose-gemma"
+#        task: "assign_work"
+#        prompt: "assign_work.txt"
+#        options:
+#          command: "goose"
+#          args: ["run", "--no-session", "--model", "${GOOSE_GEMMA_MODEL}", "-i", "-"]
+# Grok Build issue-assignment route (optional, disabled by default). Read-write
+# like the other assignment routes. Strip the leading `#` (column 0) to enable.
+#
+# The inactivity watchdog is raised above the 900s default because Grok's plain
+# output format prints the reply in one go at the end of the run: a long stretch
+# of tool calls produces no stdout to reset the timer. Switch the route to
+# `--output-format streaming-json` instead if you would rather have continuous
+# token events (at the cost of JSON-shaped run-logs).
+#  - name: assign-issue-grok
+#    access: readwrite
+#    max_inactivity_seconds: 1800
+#    match:
+#      event: "Issue Hook"
+#      action: ["open", "update"]
+#      author: "your-username"
+#      assignees: ["grok"]
+#    agents:
+#      - agent: "grok"
+#        task: "assign_work"
+#        prompt: "assign_work.txt"
+#        options:
+#          command: "grok"
+#          args: ["--model", "${GROK_MODEL}", "--no-auto-update", "--always-approve", "-p", "${PROMPT}"]
   - name: issue-triage
     access: readonly
+    randomize: true
+# Uncomment together with the goose or grok entries below -- both go quiet for
+# long stretches (a local model during prefill; grok's `plain` format, which
+# prints nothing until the run ends) and the watchdog only resets on stdout.
+# Applies to every agent on this route, which is harmless: it only widens the
+# silence they are allowed before being killed.
+#    max_inactivity_seconds: 1800
     match:
       event: "Issue Hook"
       action: "open"
@@ -40,16 +186,77 @@ routes:
         task: "issue_review"
         prompt: "issue_review.txt"
         options:
-          command: "gemini"
-          args: ["--model", "${GEMINI_MODEL}", "--yolo", "--skip-trust", "-p", ""]
+          command: "agy"
+          args: ["--model", "${GEMINI_MODEL}", "--dangerously-skip-permissions", "-p", "${PROMPT}"]
       - agent: "codex"
         task: "issue_review"
         prompt: "issue_review.txt"
         options:
           command: "codex"
           args: ["--model", "${CODEX_MODEL}", "exec", "--yolo", "--skip-git-repo-check"]
+# OpenCode issue-review entry (optional, disabled by default). The shared
+# `opencode` binary backs each opencode-<model> agent. To enable, strip the
+# leading `#` from the lines below (it sits at column 0 so removing it restores
+# the correct YAML indentation). See docs/ROUTES.md.
+#      - agent: "opencode-kimi"
+#        task: "issue_review"
+#        prompt: "issue_review.txt"
+#        options:
+#          command: "opencode"
+#          args: ["run", "--model", "${OPENCODE_KIMI_MODEL}", "--format", "json", "--auto"]
+# Goose issue-review entry (optional, disabled by default). Strip the leading
+# `#` (column 0) from the lines below to enable. Like OpenCode, the single
+# `goose` binary backs many logical agents, so each is named after its model
+# (`goose-gemma` here) and resolves its own GOOSE_GEMMA_* env vars. Add another
+# by cloning these blocks with a new suffix, e.g. `goose-qwen`.
+#
+# Goose takes the prompt on stdin (`-i -`) and `--no-session` keeps webhook runs
+# from accumulating session state. Provider and extensions come from the host
+# config dir mounted in docker-compose.yml -- do NOT add `--provider` here:
+# routes only substitute ${VAR} in the argument right after `--model`, so any
+# other placeholder would reach the CLI as a literal string.
+# See docs/ADDING_AN_AGENT.md.
+#      - agent: "goose-gemma"
+#        task: "issue_review"
+#        prompt: "issue_review.txt"
+#        options:
+#          command: "goose"
+#          args: ["run", "--no-session", "--model", "${GOOSE_GEMMA_MODEL}", "-i", "-"]
+# Grok Build issue-review entry (optional, disabled by default). Strip the
+# leading `#` (column 0) from the lines below to enable. See docs/ROUTES.md.
+#
+# Grok takes the prompt as an argv value via the ${PROMPT} placeholder, the same
+# way `agy` does -- it does NOT read stdin. Its `--prompt-file` flag accepts
+# /dev/stdin and looks like the stdin answer (it even works under a shell
+# redirect), but the dispatcher hands the child a pipe and closes the write end
+# once the prompt is written; grok then re-opens fd 0 *by path*, and reopening a
+# pipe with no writers left fails with ENXIO. Do not "fix" this back to
+# --prompt-file. Auth comes from the host config dir mounted in
+# docker-compose.yml (~/.grok/auth.json, written by `grok login`).
+#
+# `--no-auto-update` is not about pinning a version -- scripts/install-grok.sh
+# still fetches latest at every container start. It stops the *running agent* from
+# updating itself: grok's updater stages into ~/.grok/downloads and repoints
+# ~/.grok/bin/{grok,agent}, and ~/.grok is bind-mounted from the host, so a
+# container-side update would drop a ~150 MB binary in the operator's home and
+# flip the symlink their host grok resolves through.
+#
+# Uncomment `max_inactivity_seconds` on the route above together with this entry:
+# in the default `plain` format grok emits no stdout until the run ends, and the
+# watchdog only resets on stdout. The route-level value applies to every agent on
+# the route, which is harmless -- it only widens the silence they are allowed.
+#      - agent: "grok"
+#        task: "issue_review"
+#        prompt: "issue_review.txt"
+#        options:
+#          command: "grok"
+#          args: ["--model", "${GROK_MODEL}", "--no-auto-update", "--always-approve", "-p", "${PROMPT}"]
   - name: default-merge-request
     access: readonly
+    randomize: true
+# Uncomment together with the goose or grok entries below; see the note on
+# issue-triage above.
+#    max_inactivity_seconds: 1800
     match:
       event: "Merge Request Hook"
       action: "open"
@@ -64,61 +271,38 @@ routes:
         task: "merge_request_review"
         prompt: "merge_request_review.txt"
         options:
-          command: "gemini"
-          args: ["--model", "${GEMINI_MODEL}", "--yolo", "--skip-trust", "-p", ""]
+          command: "agy"
+          args: ["--model", "${GEMINI_MODEL}", "--dangerously-skip-permissions", "-p", "${PROMPT}"]
       - agent: "codex"
         task: "merge_request_review"
         prompt: "merge_request_review.txt"
         options:
           command: "codex"
           args: ["--model", "${CODEX_MODEL}", "exec", "--yolo", "--skip-git-repo-check"]
-  # Assignment routes - triggered when an agent is assigned to an issue or MR.
-  # GitLab's /assign quick action sends an Issue/MR Hook with action=update,
-  # NOT a Note Hook. These routes detect agent usernames in the assignees list
-  # and grant read-write access for the agent to perform work.
-  # Must be placed BEFORE issue-update fallback routes to take precedence.
-  - name: assign-issue-claude
-    access: readwrite
-    match:
-      event: "Issue Hook"
-      action: "update"
-      author: "your-username"
-      assignees: ["claude"]
-    agents:
-      - agent: "claude"
-        task: "assign_work"
-        prompt: "assign_work.txt"
-        options:
-          command: "claude"
-          args: ["--model", "${CLAUDE_MODEL}", "--dangerously-skip-permissions", "-p"]
-  - name: assign-issue-gemini
-    access: readwrite
-    match:
-      event: "Issue Hook"
-      action: "update"
-      author: "your-username"
-      assignees: ["gemini"]
-    agents:
-      - agent: "gemini"
-        task: "assign_work"
-        prompt: "assign_work.txt"
-        options:
-          command: "gemini"
-          args: ["--model", "${GEMINI_MODEL}", "--yolo", "--skip-trust", "-p", ""]
-  - name: assign-issue-codex
-    access: readwrite
-    match:
-      event: "Issue Hook"
-      action: "update"
-      author: "your-username"
-      assignees: ["codex"]
-    agents:
-      - agent: "codex"
-        task: "assign_work"
-        prompt: "assign_work.txt"
-        options:
-          command: "codex"
-          args: ["--model", "${CODEX_MODEL}", "exec", "--yolo", "--skip-git-repo-check"]
+# OpenCode MR-review entry (optional, disabled by default). Strip the leading
+# `#` (column 0) from the lines below to enable.
+#      - agent: "opencode-kimi"
+#        task: "merge_request_review"
+#        prompt: "merge_request_review.txt"
+#        options:
+#          command: "opencode"
+#          args: ["run", "--model", "${OPENCODE_KIMI_MODEL}", "--format", "json", "--auto"]
+# Goose MR-review entry (optional, disabled by default). Strip the leading `#`
+# (column 0) from the lines below to enable.
+#      - agent: "goose-gemma"
+#        task: "merge_request_review"
+#        prompt: "merge_request_review.txt"
+#        options:
+#          command: "goose"
+#          args: ["run", "--no-session", "--model", "${GOOSE_GEMMA_MODEL}", "-i", "-"]
+# Grok Build MR-review entry (optional, disabled by default). Strip the leading
+# `#` (column 0) from the lines below to enable.
+#      - agent: "grok"
+#        task: "merge_request_review"
+#        prompt: "merge_request_review.txt"
+#        options:
+#          command: "grok"
+#          args: ["--model", "${GROK_MODEL}", "--no-auto-update", "--always-approve", "-p", "${PROMPT}"]
   # MR assignment routes - same as issue assignments but for merge requests.
   - name: assign-mr-claude
     access: readwrite
@@ -146,8 +330,8 @@ routes:
         task: "assign_work"
         prompt: "assign_work.txt"
         options:
-          command: "gemini"
-          args: ["--model", "${GEMINI_MODEL}", "--yolo", "--skip-trust", "-p", ""]
+          command: "agy"
+          args: ["--model", "${GEMINI_MODEL}", "--dangerously-skip-permissions", "-p", "${PROMPT}"]
   - name: assign-mr-codex
     access: readwrite
     match:
@@ -162,6 +346,56 @@ routes:
         options:
           command: "codex"
           args: ["--model", "${CODEX_MODEL}", "exec", "--yolo", "--skip-git-repo-check"]
+# OpenCode MR-assignment route (optional, disabled by default). Strip the
+# leading `#` (column 0) to enable.
+#  - name: assign-mr-opencode-kimi
+#    access: readwrite
+#    match:
+#      event: "Merge Request Hook"
+#      action: "update"
+#      author: "your-username"
+#      assignees: ["opencode-kimi"]
+#    agents:
+#      - agent: "opencode-kimi"
+#        task: "assign_work"
+#        prompt: "assign_work.txt"
+#        options:
+#          command: "opencode"
+#          args: ["run", "--model", "${OPENCODE_KIMI_MODEL}", "--format", "json", "--auto"]
+# Goose MR-assignment route (optional, disabled by default). Strip the leading
+# `#` (column 0) to enable.
+#  - name: assign-mr-goose-gemma
+#    access: readwrite
+#    max_inactivity_seconds: 1800
+#    match:
+#      event: "Merge Request Hook"
+#      action: "update"
+#      author: "your-username"
+#      assignees: ["gemma"]
+#    agents:
+#      - agent: "goose-gemma"
+#        task: "assign_work"
+#        prompt: "assign_work.txt"
+#        options:
+#          command: "goose"
+#          args: ["run", "--no-session", "--model", "${GOOSE_GEMMA_MODEL}", "-i", "-"]
+# Grok Build MR-assignment route (optional, disabled by default). Strip the
+# leading `#` (column 0) to enable.
+#  - name: assign-mr-grok
+#    access: readwrite
+#    max_inactivity_seconds: 1800
+#    match:
+#      event: "Merge Request Hook"
+#      action: "update"
+#      author: "your-username"
+#      assignees: ["grok"]
+#    agents:
+#      - agent: "grok"
+#        task: "assign_work"
+#        prompt: "assign_work.txt"
+#        options:
+#          command: "grok"
+#          args: ["--model", "${GROK_MODEL}", "--no-auto-update", "--always-approve", "-p", "${PROMPT}"]
   # Regular mention routes - triggered by @agent mentions without /assign.
   - name: mention-claude
     access: readonly
@@ -189,8 +423,8 @@ routes:
         task: "note_followup"
         prompt: "note_followup.txt"
         options:
-          command: "gemini"
-          args: ["--model", "${GEMINI_MODEL}", "--yolo", "--skip-trust", "-p", ""]
+          command: "agy"
+          args: ["--model", "${GEMINI_MODEL}", "--dangerously-skip-permissions", "-p", "${PROMPT}"]
   - name: mention-codex
     access: readonly
     match:
@@ -205,3 +439,90 @@ routes:
         options:
           command: "codex"
           args: ["--model", "${CODEX_MODEL}", "exec", "--yolo", "--skip-git-repo-check"]
+# OpenCode mention route (optional, disabled by default). Read-only like the
+# other mention routes. Strip the leading `#` (column 0) to enable.
+#  - name: mention-opencode-kimi
+#    access: readonly
+#    match:
+#      event: "Note Hook"
+#      action: "create"
+#      author: "your-username"
+#      mentions: ["opencode-kimi"]
+#    agents:
+#      - agent: "opencode-kimi"
+#        task: "note_followup"
+#        prompt: "note_followup.txt"
+#        options:
+#          command: "opencode"
+#          args: ["run", "--model", "${OPENCODE_KIMI_MODEL}", "--format", "json", "--auto"]
+# Goose mention route (optional, disabled by default). Read-only like the other
+# mention routes. Strip the leading `#` (column 0) to enable.
+#  - name: mention-goose-gemma
+#    access: readonly
+#    max_inactivity_seconds: 1800
+#    match:
+#      event: "Note Hook"
+#      action: "create"
+#      author: "your-username"
+#      mentions: ["gemma"]
+#    agents:
+#      - agent: "goose-gemma"
+#        task: "note_followup"
+#        prompt: "note_followup.txt"
+#        options:
+#          command: "goose"
+#          args: ["run", "--no-session", "--model", "${GOOSE_GEMMA_MODEL}", "-i", "-"]
+# Grok Build mention route (optional, disabled by default). Read-only like the
+# other mention routes. Strip the leading `#` (column 0) to enable.
+#
+# Unlike opencode-* and goose-*, one `grok` binary backs exactly one logical
+# agent, so the GitLab username and the agent slug are the same string (`grok`)
+# and the env vars are the plain GROK_AGENT_* / GROK_MODEL forms.
+#  - name: mention-grok
+#    access: readonly
+#    max_inactivity_seconds: 1800
+#    match:
+#      event: "Note Hook"
+#      action: "create"
+#      author: "your-username"
+#      mentions: ["grok"]
+#    agents:
+#      - agent: "grok"
+#        task: "note_followup"
+#        prompt: "note_followup.txt"
+#        options:
+#          command: "grok"
+#          args: ["--model", "${GROK_MODEL}", "--no-auto-update", "--always-approve", "-p", "${PROMPT}"]
+# Pi mention route (optional, disabled by default). Read-only like the other
+# mention routes. Strip the leading `#` (column 0) to enable.
+#
+# Like goose-*, the GitLab username and the agent slug are deliberately different:
+# `mentions` matches the GitLab *username* from the webhook payload (`nemotron`),
+# while `agent` is the slug that resolves PI_NEMOTRON_MODEL + PI_NEMOTRON_AGENT_*
+# (`pi-nemotron`). The harness prefix stays out of the GitLab account name.
+#
+# Pi takes the prompt on stdin: there is no ${PROMPT} token in args, so the
+# dispatcher pipes the rendered prompt to the child (print mode `-p` merges piped
+# stdin into the initial prompt). `--no-session` keeps webhook runs from writing
+# session state into the bind-mounted ~/.pi/agent, and `--no-approve` stops an
+# untrusted repo/branch from opting itself into executable Pi extensions. Provider
+# auth (the OpenRouter key) comes from the host config dir mounted in
+# docker-compose.yml (~/.pi/agent/auth.json), not from an env key. Only the arg
+# right after `--model` is substituted, so keep ${PI_NEMOTRON_MODEL} in that slot.
+# A 550B model can prefill silently, so the inactivity watchdog is raised above the
+# 900s default (the watchdog resets on stdout only).
+#  - name: mention-pi-nemotron
+#    access: readonly
+#    max_inactivity_seconds: 1800
+#    match:
+#      event: "Note Hook"
+#      action: "create"
+#      author: "your-username"
+#      mentions: ["nemotron"]
+#    agents:
+#      - agent: "pi-nemotron"
+#        task: "note_followup"
+#        prompt: "note_followup.txt"
+#        options:
+#          command: "pi"
+#          args: ["-p", "--no-session", "--no-approve", "--model", "${PI_NEMOTRON_MODEL}"]

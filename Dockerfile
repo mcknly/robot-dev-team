@@ -5,56 +5,77 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 MCKNLY LLC
 
-ARG PYTHON_IMAGE=python:3.12.11-slim-bookworm
+ARG PYTHON_IMAGE=python:3.14.7-slim-trixie@sha256:656d12e70054d5fda18a045e2494c96701e9792dd1445f95b3d038df954f57e9
 FROM ${PYTHON_IMAGE}
 
-ARG PIP_VERSION=26.0.1
-ARG UV_VERSION=0.10.10
-ARG GLAB_VERSION=1.89.0
-ARG NODE_VERSION=20.20.1
-ARG DEBIAN_SNAPSHOT=20260315T000000Z
-ARG SYFT_VERSION=1.42.2
+ARG PIP_VERSION=26.2
+ARG UV_VERSION=0.12.1
+ARG GLAB_VERSION=1.111.0
+ARG DEBIAN_SNAPSHOT=20260915T194013Z
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    UV_PROJECT_ENVIRONMENT=/opt/venv
 
-# OS dependencies pinned via Debian snapshot
+# OS dependencies pinned via Debian snapshot. The base image ships its own deb822 source
+# pointing at the live mirrors, so it is cleared first: APT reads sources.list.d/ as well as
+# sources.list, and loading both leaves the snapshot governing nothing. The check after
+# `update` enforces the property -- every active index is under the snapshot -- rather than
+# the filename, so a future base-image layout change cannot quietly reintroduce a live mirror.
+# The upgrade step covers the debs the base image ships preinstalled, which `install` alone
+# never touches; the snapshot is frozen, so it resolves to the same versions on every rebuild.
+# `util-linux` supplies setpriv, which docker-entrypoint.sh uses for the privilege drop. It is a
+# Required-priority package and is already present, so apt reports 0 newly installed -- naming it
+# is what binds it to the snapshot and stops a base-image change from silently dropping setpriv.
+# It replaced `gosu`, whose bookworm build is statically linked against an EOL Go 1.19.8
+# toolchain that no snapshot bump could move, because Debian would not rebuild it (see #58).
+# Trixie does ship a gosu rebuilt on a current toolchain, but setpriv stays: it carries no Go
+# runtime and therefore no Go-stdlib CVE surface at all, which is the stronger property and
+# the one that does not decay as the new toolchain ages. `scripts/ci-smoke-image.sh` asserts
+# gosu is absent, so reintroducing it on trixie is a regression rather than an alternative.
 RUN set -eux; \
-    echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm main" > /etc/apt/sources.list; \
-    echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm-updates main" >> /etc/apt/sources.list; \
-    echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ bookworm-security main" >> /etc/apt/sources.list; \
+    rm -rf /etc/apt/sources.list.d/*; \
+    echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie main" > /etc/apt/sources.list; \
+    echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie-updates main" >> /etc/apt/sources.list; \
+    echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ trixie-security main" >> /etc/apt/sources.list; \
     printf 'Acquire::Check-Valid-Until "false";\nAcquire::Retries "5";\n' > /etc/apt/apt.conf.d/99snapshot; \
     apt-get update; \
-    apt-get install -y --no-install-recommends \
+    apt-get indextargets --no-release-info 'Created-By: Packages' \
+      | awk '/^URI:/ { print $2 }' | sort -u > /tmp/apt-sources.txt; \
+    test -s /tmp/apt-sources.txt; \
+    if grep -v '^http://snapshot\.debian\.org/' /tmp/apt-sources.txt; then \
+      echo "ERROR: the APT sources listed above are outside the pinned snapshot" >&2; \
+      exit 1; \
+    fi; \
+    DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
+      -o Dpkg::Options::=--force-confold; \
+    upgrade_plan="$(LC_ALL=C apt-get -s upgrade)"; \
+    held="$(printf '%s\n' "${upgrade_plan}" | sed -n 's/^.* \([0-9][0-9]*\) not upgraded\.$/\1/p')"; \
+    case "${held}" in \
+      '' | *[!0-9]*) \
+        echo "ERROR: could not read a held-back count from the apt-get upgrade" >&2; \
+        echo "simulation below; refusing to assume nothing was held back" >&2; \
+        printf '%s\n' "${upgrade_plan}" >&2; \
+        exit 1; \
+        ;; \
+    esac; \
+    if [ "${held}" -ne 0 ]; then \
+      echo "ERROR: apt-get upgrade held back ${held} package(s); it never installs new" >&2; \
+      echo "packages, so a fix that needs a new dependency is skipped with exit 0" >&2; \
+      printf '%s\n' "${upgrade_plan}" >&2; \
+      exit 1; \
+    fi; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       bash \
+      bzip2 \
       ca-certificates \
       curl \
       git \
-      gosu \
-      procps \
       tini \
+      util-linux \
       xz-utils; \
+    rm -f /tmp/apt-sources.txt; \
     rm -rf /var/lib/apt/lists/*
-
-# Install Node.js runtime
-RUN set -eux; \
-    arch="$(dpkg --print-architecture)"; \
-    case "${arch}" in \
-      amd64) node_selector="linux-x64" ;; \
-      arm64) node_selector="linux-arm64" ;; \
-      armhf) node_selector="linux-armv7l" ;; \
-      *) echo "unsupported architecture for Node.js: ${arch}" >&2; exit 1 ;; \
-    esac; \
-    node_dir="node-v${NODE_VERSION}-${node_selector}"; \
-    node_url="https://nodejs.org/dist/v${NODE_VERSION}/${node_dir}.tar.xz"; \
-    curl -fsSL "${node_url}" -o "/tmp/${node_dir}.tar.xz"; \
-    curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt" -o /tmp/SHASUMS256.txt; \
-    (cd /tmp && grep " ${node_dir}.tar.xz$" SHASUMS256.txt > node.sha256); \
-    (cd /tmp && sha256sum -c node.sha256); \
-    tar -xJf "/tmp/${node_dir}.tar.xz" -C /usr/local --strip-components=1; \
-    rm "/tmp/${node_dir}.tar.xz" /tmp/SHASUMS256.txt /tmp/node.sha256; \
-    node --version; \
-    npm --version
 
 # Install GitLab CLI (glab)
 RUN set -eux; \
@@ -91,37 +112,15 @@ COPY app/ /work/app/
 
 RUN pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}" && \
     pip install --no-cache-dir "uv==${UV_VERSION}" && \
-    uv pip install --system /work
+    uv sync --frozen --no-dev --no-install-project
 
 COPY prompts/ /work/prompts/
 COPY config/ /work/config/
 COPY scripts/ /work/scripts/
 RUN mkdir -p /work/run-logs
 
-# Generate SBOM for reproducibility records
-RUN set -eux; \
-    arch="$(dpkg --print-architecture)"; \
-    case "${arch}" in \
-      amd64) syft_arch="linux_amd64" ;; \
-      arm64) syft_arch="linux_arm64" ;; \
-      *) echo "unsupported architecture for syft: ${arch}" >&2; exit 1 ;; \
-    esac; \
-    syft_tar="syft_${SYFT_VERSION}_${syft_arch}.tar.gz"; \
-    syft_url="https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/${syft_tar}"; \
-    curl -fsSL "${syft_url}" -o "/tmp/${syft_tar}"; \
-    curl -fsSL "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_checksums.txt" -o /tmp/syft_checksums.txt; \
-    (cd /tmp && grep " ${syft_tar}$" syft_checksums.txt > syft.sha256); \
-    (cd /tmp && sha256sum -c syft.sha256); \
-    tar -xzf "/tmp/${syft_tar}" -C /usr/local/bin syft; \
-    chmod +x /usr/local/bin/syft; \
-    mkdir -p /work/sbom; \
-    syft scan dir:/ --scope all-layers --output spdx-json=/work/sbom/sbom.spdx.json; \
-    rm /usr/local/bin/syft; \
-    rm "/tmp/${syft_tar}" /tmp/syft_checksums.txt /tmp/syft.sha256
-
 ENV HOME=/home/appuser \
-    NPM_CONFIG_PREFIX=/home/appuser/.npm-global \
-    PATH="/home/appuser/.local/bin:/home/appuser/.npm-global/bin:${PATH}"
+    PATH="/opt/venv/bin:/home/appuser/.local/bin:${PATH}"
 
 RUN useradd -u 10001 -ms /bin/bash appuser && chown -R appuser:appuser /work /home/appuser
 

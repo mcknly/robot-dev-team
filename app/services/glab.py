@@ -134,7 +134,7 @@ async def unassign_agent(project_path: str, iid: int, resource_type: str, agent:
     return await run_glab([cmd_type, "update", str(iid), "--repo", project_path, "--assignee", f"-{agent}"])
 
 
-def _agent_token_env_var(agent: str) -> str:
+def agent_token_env_var(agent: str) -> str:
     """Derive the GitLab token env var name for any agent using a naming convention.
 
     Convention: ``<AGENT_UPPER>_AGENT_GITLAB_TOKEN``
@@ -154,7 +154,7 @@ def resolve_agent_token(agent: str) -> Optional[str]:
     whitespace -- enforcing the policy that a *configured* agent
     token must actually contain a value.
     """
-    env_var = _agent_token_env_var(agent.lower())
+    env_var = agent_token_env_var(agent.lower())
     raw = os.environ.get(env_var)
     if raw is None:
         return None
@@ -176,7 +176,7 @@ def _get_agent_glab_env(agent: str) -> Dict[str, str]:
     env = os.environ.copy()
 
     token: Optional[str] = None
-    env_var = _agent_token_env_var(agent.lower())
+    env_var = agent_token_env_var(agent.lower())
     token = os.environ.get(env_var)
 
     if not token:

@@ -48,6 +48,6 @@ After using the kill switch, review `run-logs/<uuid>-<project>-<route>-<agent>.o
 
 - **Dashboard not available** — confirm `LIVE_DASHBOARD_ENABLED` is `true` and the server restarted with the new configuration.
 - **Stale content** — force-refresh the page; hot reloading of backend code can temporarily pause websocket updates.
-- **Permission errors on assets** — ensure `run-logs/` and `npm-cache/` directories are writable by the container user.
+- **Permission errors on assets** — ensure `run-logs/` is writable by the container user.
 
 For more operational practices, see the Logging & Observability section in `README.md`.

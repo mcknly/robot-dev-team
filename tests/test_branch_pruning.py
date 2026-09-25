@@ -17,6 +17,16 @@ import pytest
 
 from app.services.branch_pruning import BranchPruner
 
+# A representative glab-usr CREDENTIAL-CONFIG line (see glab-usr).  The store
+# path is fake; nothing here reads it.
+_CREDENTIAL_KEY = "credential.https://git.example.com.helper"
+_CREDENTIAL_HELPER = "store --file '/home/appuser/.config/glab-cli/git-credentials-git.example.com'"
+_CREDENTIAL_CONFIG_LINE = (
+    f"[glab-usr] INFO: configured global credential store at /somewhere\n"
+    f"[glab-usr] CREDENTIAL-CONFIG scope=global key={_CREDENTIAL_KEY} "
+    f"helper={_CREDENTIAL_HELPER}\n"
+).encode()
+
 
 @pytest.fixture
 def pruner(tmp_path: Path) -> BranchPruner:
@@ -677,27 +687,175 @@ class TestPruneOnce:
 
 class TestAuthenticate:
     @pytest.mark.asyncio
-    async def test_auth_success(self) -> None:
+    async def test_auth_success(self, pruner: BranchPruner) -> None:
         mock_proc = AsyncMock()
         mock_proc.returncode = 0
-        mock_proc.communicate.return_value = (b"", b"")
+        mock_proc.communicate.return_value = (b"", _CREDENTIAL_CONFIG_LINE)
 
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
-            assert await BranchPruner._authenticate("claude") is True
+            assert await pruner._authenticate("claude") is True
 
     @pytest.mark.asyncio
-    async def test_auth_failure(self) -> None:
+    async def test_auth_failure(self, pruner: BranchPruner) -> None:
         mock_proc = AsyncMock()
         mock_proc.returncode = 1
         mock_proc.communicate.return_value = (b"", b"auth error")
 
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
-            assert await BranchPruner._authenticate("claude") is False
+            assert await pruner._authenticate("claude") is False
 
     @pytest.mark.asyncio
-    async def test_auth_command_not_found(self) -> None:
+    async def test_auth_command_not_found(self, pruner: BranchPruner) -> None:
         with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError):
-            assert await BranchPruner._authenticate("claude") is False
+            assert await pruner._authenticate("claude") is False
+
+
+class TestCredentialOverride:
+    """The pruner authenticates globally but runs git inside each project.
+
+    A repository-scoped helper left by a dispatched agent is read after (and
+    resets) the pruner's global one, so without a command-line override the
+    fetch and ``push --delete`` authenticate as that agent.
+    """
+
+    def test_reset_value_precedes_the_store(self) -> None:
+        args = BranchPruner._credential_args_from_stderr(
+            _CREDENTIAL_CONFIG_LINE.decode()
+        )
+        # Order matters: the empty value resets the inherited helper list, so
+        # a store listed before it would still lose to a repository helper.
+        assert args == [
+            "-c", f"{_CREDENTIAL_KEY}=",
+            "-c", f"{_CREDENTIAL_KEY}={_CREDENTIAL_HELPER}",
+        ]
+
+    def test_helper_value_keeps_its_spaces_and_quoting(self) -> None:
+        args = BranchPruner._credential_args_from_stderr(
+            "[glab-usr] CREDENTIAL-CONFIG scope=repository "
+            "key=credential.http://git.example.com:8080.helper "
+            "helper=store --file '/work/my repo/.git/credentials'"
+        )
+        assert args[1] == "credential.http://git.example.com:8080.helper="
+        assert args[3] == (
+            "credential.http://git.example.com:8080.helper="
+            "store --file '/work/my repo/.git/credentials'"
+        )
+
+    def test_absent_contract_line_yields_no_args(self) -> None:
+        assert BranchPruner._credential_args_from_stderr("authenticated as claude") == []
+
+    @pytest.mark.asyncio
+    async def test_auth_without_contract_line_fails(self, pruner: BranchPruner) -> None:
+        """A successful exit is not enough: identity must be known."""
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate.return_value = (b"", b"authenticated as claude\n")
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            assert await pruner._authenticate("claude") is False
+        assert pruner._credential_args == []
+
+    @pytest.mark.asyncio
+    async def test_authenticates_outside_any_checkout(self, pruner: BranchPruner) -> None:
+        """glab-usr must take its global path, not adopt a surrounding repo.
+
+        Under ./launch-uvicorn-dev the process cwd is a real checkout, which
+        may itself be a pruning target; inheriting it would have glab-usr
+        rewrite that repository's config and credentials.
+        """
+        observed: dict[str, object] = {}
+
+        def spawn(program, *args, **kwargs):
+            # The directory only exists for the duration of the call, so it
+            # has to be inspected here rather than afterwards.
+            authdir = Path(kwargs["cwd"])
+            observed["is_dir"] = authdir.is_dir()
+            observed["contents"] = list(authdir.iterdir())
+            observed["in_a_repo"] = any(
+                (parent / ".git").exists() for parent in [authdir, *authdir.parents]
+            )
+            proc = AsyncMock()
+            proc.returncode = 0
+            proc.communicate.return_value = (b"", _CREDENTIAL_CONFIG_LINE)
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", side_effect=spawn):
+            assert await pruner._authenticate("claude") is True
+
+        assert observed["is_dir"] is True
+        assert observed["contents"] == []
+        assert observed["in_a_repo"] is False
+
+    @pytest.mark.asyncio
+    async def test_run_git_injects_override_before_the_subcommand(
+        self, pruner: BranchPruner, tmp_path: Path,
+    ) -> None:
+        repo = _make_repo(tmp_path, "ns", "repo")
+        auth_proc = AsyncMock()
+        auth_proc.returncode = 0
+        auth_proc.communicate.return_value = (b"", _CREDENTIAL_CONFIG_LINE)
+        git_proc = AsyncMock()
+        git_proc.returncode = 0
+        git_proc.communicate.return_value = (b"", b"")
+
+        with patch("asyncio.create_subprocess_exec", return_value=auth_proc):
+            assert await pruner._authenticate("claude") is True
+
+        with patch("asyncio.create_subprocess_exec", return_value=git_proc) as spawn:
+            await pruner._run_git(["push", "origin", "--delete", "feature"], cwd=repo)
+
+        argv = list(spawn.call_args.args)
+        # `git -c ... push`: -c is only honoured before the subcommand.
+        assert argv[0] == "git"
+        assert argv[1:5] == [
+            "-c", f"{_CREDENTIAL_KEY}=",
+            "-c", f"{_CREDENTIAL_KEY}={_CREDENTIAL_HELPER}",
+        ]
+        assert argv[5:] == ["push", "origin", "--delete", "feature"]
+
+    @pytest.mark.asyncio
+    async def test_run_git_is_unchanged_before_authentication(
+        self, pruner: BranchPruner, tmp_path: Path,
+    ) -> None:
+        repo = _make_repo(tmp_path, "ns", "repo")
+        git_proc = AsyncMock()
+        git_proc.returncode = 0
+        git_proc.communicate.return_value = (b"", b"")
+
+        with patch("asyncio.create_subprocess_exec", return_value=git_proc) as spawn:
+            await pruner._run_git(["status"], cwd=repo)
+
+        assert list(spawn.call_args.args) == ["git", "status"]
+
+    @pytest.mark.asyncio
+    async def test_a_full_pass_carries_the_override_into_every_repo(
+        self, pruner: BranchPruner, tmp_path: Path,
+    ) -> None:
+        """prune_once authenticates once; every repo's git call must be pinned."""
+        _make_repo(tmp_path, "ns", "repo-a")
+        _make_repo(tmp_path, "ns", "repo-b")
+        git_argvs: list[list[str]] = []
+
+        def spawn(program, *args, **kwargs):
+            proc = AsyncMock()
+            proc.returncode = 0
+            if program == "glab-usr":
+                proc.communicate.return_value = (b"", _CREDENTIAL_CONFIG_LINE)
+            else:
+                git_argvs.append([program, *args])
+                proc.communicate.return_value = (b"", b"")
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", side_effect=spawn):
+            await pruner.prune_once()
+
+        assert git_argvs, "expected git commands during the pass"
+        expected = [
+            "-c", f"{_CREDENTIAL_KEY}=",
+            "-c", f"{_CREDENTIAL_KEY}={_CREDENTIAL_HELPER}",
+        ]
+        for argv in git_argvs:
+            assert argv[1:5] == expected, f"unpinned git command: {argv!r}"
 
 
 # --- Config parsing tests ---
@@ -798,7 +956,7 @@ class TestRunGitTimeout:
 
 class TestAuthenticateTimeout:
     @pytest.mark.asyncio
-    async def test_auth_timeout_returns_false(self) -> None:
+    async def test_auth_timeout_returns_false(self, pruner: BranchPruner) -> None:
         """A hanging glab-usr call is killed and returns False."""
         async def _hanging_communicate():
             await asyncio.sleep(10)
@@ -811,7 +969,7 @@ class TestAuthenticateTimeout:
 
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc), \
              patch.object(BranchPruner, "_AUTH_TIMEOUT_SECONDS", 0.05):
-            result = await BranchPruner._authenticate("claude")
+            result = await pruner._authenticate("claude")
 
         assert result is False
 
@@ -827,7 +985,6 @@ class TestStartupDelay:
         )
 
         sleep_calls: list[float] = []
-        original_sleep = asyncio.sleep
 
         async def tracking_sleep(seconds, *args, **kwargs):
             sleep_calls.append(seconds)
@@ -856,7 +1013,8 @@ class TestPruneOnceTimeout:
             agent="claude", min_age_hours=0,
             projects_root=tmp_path,
         )
-        repo = _make_repo(tmp_path, "ns", "repo")
+        # Created for its on-disk side effect: prune_once scans projects_root for repos.
+        _make_repo(tmp_path, "ns", "repo")
 
         async def mock_run_git(args, cwd, timeout=None):
             if args[0] == "fetch":

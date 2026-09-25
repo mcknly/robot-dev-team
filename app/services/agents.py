@@ -15,6 +15,7 @@ import os
 import shlex
 import signal
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -29,6 +30,104 @@ from app.services.project_paths import PROJECT_PATHS
 from app.services.routes import AgentTask
 
 LOGGER = get_logger(__name__)
+
+# Routes may place this token in an agent's `args` to request that the rendered
+# prompt be passed as that argv element instead of being written to the agent's
+# stdin. Antigravity (`agy`) needs this: its `--print`/`-p` flag takes the
+# prompt as the flag's *value* and the CLI never reads stdin, so a stdin-only
+# handoff reaches it as an empty prompt. Agents whose CLI does read stdin
+# (claude, codex, opencode) simply omit the token and keep the stdin path.
+PROMPT_ARG_PLACEHOLDER = "${PROMPT}"
+
+# Linux caps a single argv element at MAX_ARG_STRLEN (32 pages = 128 KiB,
+# including the trailing NUL); exceeding it fails the execve with E2BIG. Guard
+# the substitution so an oversized prompt produces an actionable error in the
+# run log rather than an opaque OSError at spawn time.
+MAX_PROMPT_ARG_BYTES = 32 * 4096 - 1
+
+
+class PromptTooLargeError(RuntimeError):
+    """Raised when a prompt is too large to pass as a single argv element."""
+
+
+def _inject_prompt_arg(args: List[str], prompt_text: str) -> Tuple[List[str], bool]:
+    """Substitute the rendered prompt into any PROMPT_ARG_PLACEHOLDER slots.
+
+    Returns the argv to launch with and whether a substitution happened. When
+    it did, the caller must not also write the prompt to stdin -- the agent
+    would otherwise receive it twice.
+    """
+
+    if PROMPT_ARG_PLACEHOLDER not in args:
+        return args, False
+
+    encoded_size = len(prompt_text.encode("utf-8"))
+    if encoded_size > MAX_PROMPT_ARG_BYTES:
+        raise PromptTooLargeError(
+            f"prompt is {encoded_size} bytes, which exceeds the {MAX_PROMPT_ARG_BYTES}-byte "
+            f"limit for a single command-line argument. This agent's CLI accepts the prompt "
+            f"only as an argv value (via the '{PROMPT_ARG_PLACEHOLDER}' placeholder in "
+            f"routes.yaml) and cannot read it from stdin, so the prompt must be shortened "
+            f"-- trim the prompt template in prompts/ or narrow the event context."
+        )
+
+    return [prompt_text if arg == PROMPT_ARG_PLACEHOLDER else arg for arg in args], True
+
+
+# Antigravity (the `gemini` agent's CLI harness, binary name `agy`) stores
+# its OAuth credential as a JSON file at this path when no host-style
+# libsecret session is available, which is the container's natural state.
+# The file is created by a one-time interactive `agy` run; see
+# docs/AGENT_ONBOARDING.md for the bootstrap procedure.
+ANTIGRAVITY_TOKEN_PATH = Path.home() / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+ANTIGRAVITY_BOOTSTRAP_HINT = (
+    "Antigravity (`agy`) is not bootstrapped in this container -- the OAuth "
+    "credential file is missing or unreadable at "
+    "~/.gemini/antigravity-cli/antigravity-oauth-token. Run the one-time "
+    "OAuth bootstrap so the token lands on the host-mounted ~/.gemini "
+    "directory:\n"
+    "  docker compose run --rm app agy\n"
+    "The default entrypoint runs the UID/GID remap and the install scripts "
+    "before exec'ing `agy` as appuser, so the token file ends up readable by "
+    "normal webhook dispatch. Complete the Google OAuth flow in your browser, "
+    "then re-trigger the webhook."
+)
+
+
+def _antigravity_preflight(token_path: Optional[Path] = None) -> Optional[str]:
+    """Validate the Antigravity OAuth credential file before invoking `agy`.
+
+    Returns ``None`` when the file looks usable, or a user-facing error
+    message when it is missing, unreadable, empty, not valid JSON, or
+    missing the expected ``token`` key. The credential value itself is
+    never logged or returned -- only presence and parseability are checked
+    so the failure mode does not leak the OAuth token through logs or
+    GitLab comments.
+
+    Invoke only for the `gemini` agent; other agents have no equivalent
+    file-based credential check and must not be blocked by it.
+
+    The default path is resolved at call time (not at function-definition
+    time) so test fixtures can monkeypatch the module-level constant.
+    """
+
+    if token_path is None:
+        token_path = ANTIGRAVITY_TOKEN_PATH
+    if not token_path.exists():
+        return ANTIGRAVITY_BOOTSTRAP_HINT
+    try:
+        raw = token_path.read_bytes()
+    except OSError:
+        return ANTIGRAVITY_BOOTSTRAP_HINT
+    if not raw:
+        return ANTIGRAVITY_BOOTSTRAP_HINT
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return ANTIGRAVITY_BOOTSTRAP_HINT
+    if not isinstance(parsed, dict) or "token" not in parsed:
+        return ANTIGRAVITY_BOOTSTRAP_HINT
+    return None
 
 
 class AgentKilledError(Exception):
@@ -155,6 +254,11 @@ async def dispatch_agents(event_id: str, tasks: List[AgentTask], context: Dict[s
     await agent_registry.register_dispatch(event_id)
     results: List[Dict[str, Any]] = []
     try:
+        # Serial dispatch is load-bearing for the panel-aware review prompts
+        # (issue_review / merge_request_review): later reviewers only see
+        # prior agents' comments because the earlier agent has already
+        # finished and posted. Parallelizing here will break that strategy --
+        # see docs/SYSTEM_DESIGN.md "Panel-aware review prompts".
         for agent_task in tasks:
             if await agent_registry.is_marked_killed(event_id):
                 raise AgentKilledError(event_id)
@@ -171,276 +275,182 @@ async def dispatch_agents(event_id: str, tasks: List[AgentTask], context: Dict[s
         await agent_registry.unregister_dispatch(event_id)
 
 
-async def _execute_agent(event_id: str, agent_task: AgentTask, context: Dict[str, Any]) -> Dict[str, Any]:
-    prompt_name = agent_task.prompt or f"{agent_task.task}.txt"
-    log_file = _log_path(event_id, agent_task.agent, context)
-
-    dashboard_key = dashboard_manager.agent_started(event_id, agent_task.agent, agent_task.task)
-
-    command = agent_task.options.get("command", agent_task.agent)
-    args = agent_task.options.get("args", [])
-    if not isinstance(args, list):
-        args = [str(args)]
-
-    env_options = agent_task.options.get("env", {})
-    if not isinstance(env_options, dict):
-        env_options = {}
-
-    # Resolve agent-specific GitLab token and inject into subprocess env.
-    # This ensures each agent's glab/gitlab-connect calls use the correct
-    # identity regardless of the shared global glab config state.
-    try:
-        agent_token = resolve_agent_token(agent_task.agent)
-    except ValueError as exc:
-        error_msg = str(exc)
-        LOGGER.error(
-            "Agent token resolution failed",
-            extra={"event_id": event_id, "agent": agent_task.agent, "error": error_msg},
-        )
-        error_payload = {
-            "prompt": [],
-            "error": error_msg,
-        }
-        log_file = _write_text_log(log_file, json.dumps(error_payload, indent=2, ensure_ascii=False))
-        result: Dict[str, Any] = {
+def _log_agent_finished(
+    event_id: str,
+    agent_task: AgentTask,
+    status: str,
+    returncode: int,
+    log_file: str,
+) -> None:
+    """Emit the structured 'Agent finished' record shared by every exit path."""
+    LOGGER.info(
+        "Agent finished: agent=%s task=%s status=%s rc=%s log=%s",
+        agent_task.agent,
+        agent_task.task,
+        status,
+        returncode,
+        log_file,
+        extra={
+            "event_id": event_id,
             "agent": agent_task.agent,
             "task": agent_task.task,
-            "prompt": prompt_name,
-            "log_file": str(log_file),
-            "status": "error",
-            "error": error_msg,
-            "returncode": -1,
-        }
-        LOGGER.info(
-            "Agent finished: agent=%s task=%s status=%s rc=%s log=%s",
-            agent_task.agent,
-            agent_task.task,
-            "error",
-            -1,
-            result["log_file"],
-            extra={
-                "event_id": event_id,
-                "agent": agent_task.agent,
-                "task": agent_task.task,
-                "status": "error",
-                "returncode": -1,
-                "log_file": result["log_file"],
-            },
-        )
-        dashboard_manager.agent_finished(dashboard_key)
-        return result
+            "status": status,
+            "returncode": returncode,
+            "log_file": log_file,
+        },
+    )
 
-    # env_options (from route config) is spread first so that agent-specific
-    # GITLAB_TOKEN and GITLAB_HOST always take precedence, even if the route
-    # config env stanza sets them.
-    env = {
-        **env_options,
-        "ROBOT_AGENT_NAME": agent_task.agent,
-        "ROBOT_TASK_NAME": agent_task.task,
-        "CURRENT_AGENT": agent_task.agent,
-    }
-    if agent_token:
-        env["GITLAB_TOKEN"] = agent_token
-    if settings.glab_host:
-        env["GITLAB_HOST"] = settings.glab_host
 
-    access = context.get("access", "readonly")
-    project_path = context.get("project")
-    try:
-        working_dir = await PROJECT_PATHS.ensure_project_exists(
-            project_path=project_path,
-            access=access,
-            clone_url=context.get("clone_url"),
-            agent=agent_task.agent,
-        )
-    except RuntimeError as exc:
-        LOGGER.error(
-            "Failed to ensure project exists",
-            extra={"event_id": event_id, "error": str(exc)},
-        )
-        error_payload = {
-            "prompt": [],
-            "error": str(exc),
-        }
-        log_file = _write_text_log(log_file, json.dumps(error_payload, indent=2, ensure_ascii=False))
-        result: Dict[str, Any] = {
-            "agent": agent_task.agent,
-            "task": agent_task.task,
-            "prompt": prompt_name,
-            "log_file": str(log_file),
-            "status": "error",
-            "error": str(exc),
-            "returncode": -1,
-        }
-        LOGGER.info(
-            "Agent finished: agent=%s task=%s status=%s rc=%s log=%s",
-            agent_task.agent,
-            agent_task.task,
-            "error",
-            -1,
-            result["log_file"],
-            extra={
-                "event_id": event_id,
-                "agent": agent_task.agent,
-                "task": agent_task.task,
-                "status": "error",
-                "returncode": -1,
-                "log_file": result["log_file"],
-            },
-        )
-        dashboard_manager.agent_finished(dashboard_key)
-        return result
+def _finalize_error(
+    event_id: str,
+    agent_task: AgentTask,
+    prompt_name: str,
+    dashboard_key: str,
+    log_file: Path,
+    error: str,
+    returncode: int = -1,
+) -> Dict[str, Any]:
+    """Build the result for a pre-dispatch failure and close out the run.
 
-    # Fail fast if project path could not be resolved - prevents agents from
-    # running in the wrong directory (e.g., /work instead of the project mount)
-    if working_dir is None:
-        error_msg = f"Project path not found: {project_path}"
-        LOGGER.error(
-            "Project path could not be resolved",
-            extra={
-                "event_id": event_id,
-                "project_path": project_path,
-                "access": access,
-            },
-        )
-        error_payload = {
-            "prompt": [],
-            "error": error_msg,
-        }
-        log_file = _write_text_log(log_file, json.dumps(error_payload, indent=2, ensure_ascii=False))
-        result: Dict[str, Any] = {
-            "agent": agent_task.agent,
-            "task": agent_task.task,
-            "prompt": prompt_name,
-            "log_file": str(log_file),
-            "status": "error",
-            "error": error_msg,
-            "returncode": -1,
-        }
-        LOGGER.info(
-            "Agent finished: agent=%s task=%s status=%s rc=%s log=%s",
-            agent_task.agent,
-            agent_task.task,
-            "error",
-            -1,
-            result["log_file"],
-            extra={
-                "event_id": event_id,
-                "agent": agent_task.agent,
-                "task": agent_task.task,
-                "status": "error",
-                "returncode": -1,
-                "log_file": result["log_file"],
-            },
-        )
-        dashboard_manager.agent_finished(dashboard_key)
-        return result
-
+    Used by the early-exit validation paths (preflight, token resolution,
+    project resolution) that fail before the agent subprocess is launched.
+    Preserves the observable lifecycle: a fully-populated error ``result``,
+    the structured finish log, and exactly-once dashboard completion.
+    """
     result: Dict[str, Any] = {
         "agent": agent_task.agent,
         "task": agent_task.task,
         "prompt": prompt_name,
         "log_file": str(log_file),
+        "status": "error",
+        "error": error,
+        "returncode": returncode,
     }
-    if working_dir:
-        result["working_dir"] = working_dir
+    _log_agent_finished(event_id, agent_task, "error", returncode, result["log_file"])
+    dashboard_manager.agent_finished(dashboard_key)
+    return result
 
-    # Resolve and checkout appropriate branch before agent dispatch
-    # Branch resolution requires read-write access for git operations (fetch, checkout, reset)
-    # even if the agent itself will run with read-only access
+
+async def _resolve_and_apply_branch(
+    event_id: str,
+    agent_task: AgentTask,
+    context: Dict[str, Any],
+    project_path: Optional[str],
+    result: Dict[str, Any],
+    log_file: Path,
+    dashboard_key: str,
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Resolve/checkout the dispatch branch, folding results into ``result``.
+
+    Returns ``(current_branch, error_result)``. A non-None ``error_result`` means
+    branch resolution failed and the caller must return it immediately; the run
+    has already been finalized (log written, dashboard completion recorded).
+    """
     current_branch: Optional[str] = None
-    if working_dir and settings.enable_branch_switch:
-        # Get read-write path for branch operations
-        branch_working_dir = PROJECT_PATHS.resolve(project_path, access="readwrite")
-        if branch_working_dir is None:
-            LOGGER.warning(
-                "Cannot resolve read-write path for branch switching, skipping",
-                extra={"project_path": project_path},
-            )
-        else:
-            branch_result = await resolve_branch(
-                event=context.get("payload", {}),
-                project_path=project_path or "",
-                working_dir=branch_working_dir,
-                agent=agent_task.agent,
-            )
-            if branch_result.switched:
-                LOGGER.info(
-                    "Switched to branch '%s' before dispatch",
-                    branch_result.branch,
-                    extra={
-                        "event_id": event_id,
-                        "branch": branch_result.branch,
-                        "backup_branch": branch_result.backup_branch,
-                    },
-                )
-            if branch_result.backups:
-                result["backups"] = [
-                    {"branch": b.branch, "reason": b.reason}
-                    for b in branch_result.backups
-                ]
-            if branch_result.branch:
-                result["branch"] = branch_result.branch
-                current_branch = branch_result.branch
-            if not branch_result.success:
-                LOGGER.error(
-                    "Branch resolution failed",
-                    extra={
-                        "event_id": event_id,
-                        "error": branch_result.error,
-                    },
-                )
-                error_payload = {
-                    "prompt": [],
-                    "error": f"Branch resolution failed: {branch_result.error}",
-                }
-                log_file = _write_text_log(log_file, json.dumps(error_payload, indent=2, ensure_ascii=False))
-                result["log_file"] = str(log_file)
-                result.update(
-                    {
-                        "status": "error",
-                        "error": f"Branch resolution failed: {branch_result.error}",
-                        "returncode": -1,
-                    }
-                )
-                LOGGER.info(
-                    "Agent finished: agent=%s task=%s status=%s rc=%s log=%s",
-                    agent_task.agent,
-                    agent_task.task,
-                    "error",
-                    -1,
-                    result["log_file"],
-                    extra={
-                        "event_id": event_id,
-                        "agent": agent_task.agent,
-                        "task": agent_task.task,
-                        "status": "error",
-                        "returncode": -1,
-                        "log_file": result["log_file"],
-                    },
-                )
-                dashboard_manager.agent_finished(dashboard_key)
-                return result
+    # Branch operations need the read-write path even when the agent runs read-only.
+    branch_working_dir = PROJECT_PATHS.resolve(project_path, access="readwrite")
+    if branch_working_dir is None:
+        LOGGER.warning(
+            "Cannot resolve read-write path for branch switching, skipping",
+            extra={"project_path": project_path},
+        )
+        return current_branch, None
 
-    # If branch switching is disabled or didn't determine a branch, query git directly
-    if current_branch is None and working_dir:
-        current_branch = await _get_current_branch(working_dir)
+    branch_result = await resolve_branch(
+        event=context.get("payload", {}),
+        project_path=project_path or "",
+        working_dir=branch_working_dir,
+        agent=agent_task.agent,
+    )
+    if branch_result.switched:
+        LOGGER.info(
+            "Switched to branch '%s' before dispatch",
+            branch_result.branch,
+            extra={
+                "event_id": event_id,
+                "branch": branch_result.branch,
+                "backup_branch": branch_result.backup_branch,
+            },
+        )
+    if branch_result.backups:
+        result["backups"] = [
+            {"branch": b.branch, "reason": b.reason}
+            for b in branch_result.backups
+        ]
+    if branch_result.branch:
+        result["branch"] = branch_result.branch
+        current_branch = branch_result.branch
+    if not branch_result.success:
+        LOGGER.error(
+            "Branch resolution failed",
+            extra={"event_id": event_id, "error": branch_result.error},
+        )
+        error_payload = {
+            "prompt": [],
+            "error": f"Branch resolution failed: {branch_result.error}",
+        }
+        log_file = _write_text_log(log_file, json.dumps(error_payload, indent=2, ensure_ascii=False))
+        result["log_file"] = str(log_file)
+        result.update(
+            {
+                "status": "error",
+                "error": f"Branch resolution failed: {branch_result.error}",
+                "returncode": -1,
+            }
+        )
+        _log_agent_finished(event_id, agent_task, "error", -1, result["log_file"])
+        dashboard_manager.agent_finished(dashboard_key)
+        return current_branch, result
 
-    # Populate current_branch in context for prompt substitution
-    context["current_branch"] = current_branch or ""
+    return current_branch, None
 
-    # Render prompt after branch resolution so ${CURRENT_BRANCH} reflects actual repo state
-    prompt_text = render_prompt(prompt_name, context)
-    if dashboard_manager.enabled:
-        for line in _stream_lines(prompt_text):
-            dashboard_manager.publish_prompt(event_id, agent_task.agent, agent_task.task, line)
 
-    auth_stdout = ""
-    auth_stderr = ""
+@dataclass
+class _RunOutcome:
+    """Outcome of the authenticate-and-run phase of a dispatch.
+
+    ``error_result`` is set when authentication or subprocess launch fails; the
+    caller must return it directly. Otherwise the subprocess output fields carry
+    the completed run for success finalization.
+    """
+
+    error_result: Optional[Dict[str, Any]] = None
+    stdout: str = ""
+    stderr: str = ""
+    returncode: int = -1
+    timed_out: Optional[str] = None
+    auth_stdout: str = ""
+    auth_stderr: str = ""
     auth_returncode: Optional[int] = None
 
+
+async def _run_with_auth(
+    command: str,
+    args: List[str],
+    prompt_text: str,
+    env: Dict[str, str],
+    working_dir: Optional[str],
+    event_id: str,
+    agent_task: AgentTask,
+    result: Dict[str, Any],
+    log_file: Path,
+    dashboard_key: str,
+) -> _RunOutcome:
+    """Authenticate the agent and run its subprocess.
+
+    Owns the try/except/finally so dashboard completion fires exactly once for
+    the auth-failure, prompt-too-large, command-not-found, and success paths
+    alike. On any launch/auth failure it populates ``result`` and returns it via
+    ``_RunOutcome.error_result``.
+    """
+    outcome = _RunOutcome()
     try:
-        auth_stdout, auth_stderr, auth_returncode = await _authenticate_agent(agent_task.agent, env, working_dir)
+        auth_stdout, auth_stderr, auth_returncode = await _authenticate_agent(
+            agent_task.agent, env, working_dir
+        )
+        outcome.auth_stdout = auth_stdout
+        outcome.auth_stderr = auth_stderr
+        outcome.auth_returncode = auth_returncode
         if auth_returncode != 0:
             LOGGER.error(
                 "GitLab authentication failed",
@@ -463,34 +473,20 @@ async def _execute_agent(event_id: str, agent_task: AgentTask, context: Dict[str
             }
             log_file = _write_text_log(log_file, json.dumps(auth_payload, indent=2, ensure_ascii=False))
             result["log_file"] = str(log_file)
+            rc = auth_returncode if auth_returncode is not None else -1
             result.update(
                 {
                     "status": "error",
                     "error": "glab-usr authentication failed",
-                    "returncode": auth_returncode if auth_returncode is not None else -1,
+                    "returncode": rc,
                     "auth_stdout": _split_lines(auth_stdout),
                     "auth_stderr": _split_lines(auth_stderr),
                     "auth_returncode": auth_returncode,
                 }
             )
-            rc = auth_returncode if auth_returncode is not None else -1
-            LOGGER.info(
-                "Agent finished: agent=%s task=%s status=%s rc=%s log=%s",
-                agent_task.agent,
-                agent_task.task,
-                "error",
-                rc,
-                result["log_file"],
-                extra={
-                    "event_id": event_id,
-                    "agent": agent_task.agent,
-                    "task": agent_task.task,
-                    "status": "error",
-                    "returncode": rc,
-                    "log_file": result["log_file"],
-                },
-            )
-            return result
+            _log_agent_finished(event_id, agent_task, "error", rc, result["log_file"])
+            outcome.error_result = result
+            return outcome
         stdout, stderr, returncode, timed_out = await _run_subprocess(
             command,
             args,
@@ -500,99 +496,347 @@ async def _execute_agent(event_id: str, agent_task: AgentTask, context: Dict[str
             event_id,
             agent_task,
         )
+        outcome.stdout = stdout
+        outcome.stderr = stderr
+        outcome.returncode = returncode
+        outcome.timed_out = timed_out
+    except PromptTooLargeError as exc:
+        LOGGER.error(
+            "Prompt too large to pass as a command-line argument",
+            extra={"event_id": event_id, "agent": agent_task.agent, "task": agent_task.task},
+        )
+        outcome.error_result = _finalize_run_error(
+            event_id, agent_task, result, log_file, prompt_text,
+            str(exc), outcome.auth_stdout, outcome.auth_stderr, outcome.auth_returncode,
+        )
     except FileNotFoundError as exc:
         missing_command = exc.filename or command
         LOGGER.error("Subprocess command not found", extra={"command": missing_command})
-        error_payload = {
-            "prompt": _split_lines(prompt_text),
-            "auth": {
-                "stdout": _split_lines(auth_stdout),
-                "stderr": _split_lines(auth_stderr),
-                "returncode": auth_returncode,
-            },
-            "error": f"command not found: {missing_command}",
-        }
-        log_file = _write_text_log(log_file, json.dumps(error_payload, indent=2, ensure_ascii=False))
-        result["log_file"] = str(log_file)
-        result.update(
-            {
-                "status": "error",
-                "error": f"command not found: {missing_command}",
-                "returncode": -1,
-                "auth_stdout": _split_lines(auth_stdout),
-                "auth_stderr": _split_lines(auth_stderr),
-                "auth_returncode": auth_returncode,
-            }
+        outcome.error_result = _finalize_run_error(
+            event_id, agent_task, result, log_file, prompt_text,
+            f"command not found: {missing_command}",
+            outcome.auth_stdout, outcome.auth_stderr, outcome.auth_returncode,
         )
-        LOGGER.info(
-            "Agent finished: agent=%s task=%s status=%s rc=%s log=%s",
-            agent_task.agent,
-            agent_task.task,
-            "error",
-            -1,
-            result["log_file"],
-            extra={
-                "event_id": event_id,
-                "agent": agent_task.agent,
-                "task": agent_task.task,
-                "status": "error",
-                "returncode": -1,
-                "log_file": result["log_file"],
-            },
-        )
-        return result
     finally:
         dashboard_manager.agent_finished(dashboard_key)
 
-    if await agent_registry.is_marked_killed(event_id):
-        raise AgentKilledError(event_id)
+    return outcome
 
-    output_payload = {
-        "stdout": _split_lines(stdout),
-        "stderr": _split_lines(stderr),
+
+def _finalize_run_error(
+    event_id: str,
+    agent_task: AgentTask,
+    result: Dict[str, Any],
+    log_file: Path,
+    prompt_text: str,
+    error: str,
+    auth_stdout: str,
+    auth_stderr: str,
+    auth_returncode: Optional[int],
+) -> Dict[str, Any]:
+    """Write the error log and finalize ``result`` for a post-auth launch failure."""
+    error_payload: Dict[str, Any] = {
         "prompt": _split_lines(prompt_text),
-        "stdout_trailing_newline": stdout.endswith("\n") if stdout else False,
-        "stderr_trailing_newline": stderr.endswith("\n") if stderr else False,
         "auth": {
             "stdout": _split_lines(auth_stdout),
             "stderr": _split_lines(auth_stderr),
             "returncode": auth_returncode,
         },
+        "error": error,
     }
-    log_file = _write_text_log(log_file, json.dumps(output_payload, indent=2, ensure_ascii=False))
+    log_file = _write_text_log(log_file, json.dumps(error_payload, indent=2, ensure_ascii=False))
     result["log_file"] = str(log_file)
-
-    status = "ok" if returncode == 0 else "error"
     result.update(
         {
-            "status": status,
-            "returncode": returncode,
+            "status": "error",
+            "error": error,
+            "returncode": -1,
             "auth_stdout": _split_lines(auth_stdout),
             "auth_stderr": _split_lines(auth_stderr),
             "auth_returncode": auth_returncode,
         }
     )
-    if timed_out:
-        result["timed_out"] = timed_out
-    if returncode != 0:
-        result["error"] = stderr
-    LOGGER.info(
-        "Agent finished: agent=%s task=%s status=%s rc=%s log=%s",
-        agent_task.agent,
-        agent_task.task,
-        status,
-        returncode,
-        result["log_file"],
-        extra={
-            "event_id": event_id,
-            "agent": agent_task.agent,
-            "task": agent_task.task,
-            "status": status,
-            "returncode": returncode,
-            "log_file": result["log_file"],
-        },
-    )
+    _log_agent_finished(event_id, agent_task, "error", -1, result["log_file"])
     return result
+
+
+def _finalize_success(
+    event_id: str,
+    agent_task: AgentTask,
+    result: Dict[str, Any],
+    log_file: Path,
+    prompt_text: str,
+    outcome: _RunOutcome,
+) -> Dict[str, Any]:
+    """Write the output log and finalize ``result`` for a completed run."""
+    output_payload = {
+        "stdout": _split_lines(outcome.stdout),
+        "stderr": _split_lines(outcome.stderr),
+        "prompt": _split_lines(prompt_text),
+        "stdout_trailing_newline": outcome.stdout.endswith("\n") if outcome.stdout else False,
+        "stderr_trailing_newline": outcome.stderr.endswith("\n") if outcome.stderr else False,
+        "auth": {
+            "stdout": _split_lines(outcome.auth_stdout),
+            "stderr": _split_lines(outcome.auth_stderr),
+            "returncode": outcome.auth_returncode,
+        },
+    }
+    log_file = _write_text_log(log_file, json.dumps(output_payload, indent=2, ensure_ascii=False))
+    result["log_file"] = str(log_file)
+
+    status = "ok" if outcome.returncode == 0 else "error"
+    result.update(
+        {
+            "status": status,
+            "returncode": outcome.returncode,
+            "auth_stdout": _split_lines(outcome.auth_stdout),
+            "auth_stderr": _split_lines(outcome.auth_stderr),
+            "auth_returncode": outcome.auth_returncode,
+        }
+    )
+    if outcome.timed_out:
+        result["timed_out"] = outcome.timed_out
+    if outcome.returncode != 0:
+        result["error"] = outcome.stderr
+    _log_agent_finished(event_id, agent_task, status, outcome.returncode, result["log_file"])
+    return result
+
+
+def _assemble_env(agent_task: AgentTask, agent_token: Optional[str]) -> Dict[str, str]:
+    """Build the subprocess environment for an agent dispatch.
+
+    Route-config ``env`` is spread first so the agent-specific GITLAB_TOKEN and
+    GITLAB_HOST always take precedence, even if the route config sets them.
+    """
+    env_options = agent_task.options.get("env", {})
+    if not isinstance(env_options, dict):
+        env_options = {}
+    env = {
+        **env_options,
+        "ROBOT_AGENT_NAME": agent_task.agent,
+        "ROBOT_TASK_NAME": agent_task.task,
+        "CURRENT_AGENT": agent_task.agent,
+    }
+    if agent_token:
+        env["GITLAB_TOKEN"] = agent_token
+    if settings.glab_host:
+        env["GITLAB_HOST"] = settings.glab_host
+    return env
+
+
+@dataclass
+class _DispatchSetup:
+    """Validated inputs for an agent dispatch, produced by ``_prepare_dispatch``."""
+
+    command: str
+    args: List[str]
+    env: Dict[str, str]
+    working_dir: Optional[str]
+    project_path: Optional[str]
+    result: Dict[str, Any]
+
+
+async def _prepare_dispatch(
+    event_id: str,
+    agent_task: AgentTask,
+    context: Dict[str, Any],
+    prompt_name: str,
+    log_file: Path,
+    dashboard_key: str,
+) -> Tuple[Optional[_DispatchSetup], Optional[Dict[str, Any]]]:
+    """Run the pre-dispatch validation gauntlet and build the base env/result.
+
+    Returns ``(setup, error_result)``. A non-None ``error_result`` means a
+    pre-dispatch check failed (Antigravity preflight, token resolution, or
+    project resolution); the run is already finalized and the caller must return
+    it. Otherwise ``setup`` carries the validated command/args/env/working_dir.
+    """
+    # Antigravity (`gemini` agent) requires a one-time OAuth bootstrap that
+    # writes a credential file under ~/.gemini/antigravity-cli/. Without
+    # that file, `agy -p` prints an OAuth URL and waits ~30s for a callback
+    # before exiting, which gives operators a confusing "agent timed out"
+    # signal instead of a clear "needs bootstrap" message. Fail fast here
+    # with a one-line hint so the failure mode is obvious. Other agents
+    # have no equivalent precondition and bypass this check entirely.
+    if agent_task.agent.lower() == "gemini":
+        preflight_error = _antigravity_preflight()
+        if preflight_error:
+            LOGGER.error(
+                "Antigravity preflight failed: credential file missing or invalid",
+                extra={"event_id": event_id, "agent": agent_task.agent},
+            )
+            error_payload = {
+                "prompt": [],
+                "error": preflight_error,
+            }
+            log_file = _write_text_log(log_file, json.dumps(error_payload, indent=2, ensure_ascii=False))
+            return None, _finalize_error(
+                event_id, agent_task, prompt_name, dashboard_key, log_file, preflight_error,
+            )
+
+    command = agent_task.options.get("command", agent_task.agent)
+    args = agent_task.options.get("args", [])
+    if not isinstance(args, list):
+        args = [str(args)]
+
+    # Resolve agent-specific GitLab token and inject into subprocess env.
+    # This ensures each agent's glab/gitlab-connect calls use the correct
+    # identity regardless of the shared global glab config state.
+    try:
+        agent_token = resolve_agent_token(agent_task.agent)
+    except ValueError as exc:
+        error_msg = str(exc)
+        LOGGER.error(
+            "Agent token resolution failed",
+            extra={"event_id": event_id, "agent": agent_task.agent, "error": error_msg},
+        )
+        error_payload = {
+            "prompt": [],
+            "error": error_msg,
+        }
+        log_file = _write_text_log(log_file, json.dumps(error_payload, indent=2, ensure_ascii=False))
+        return None, _finalize_error(
+            event_id, agent_task, prompt_name, dashboard_key, log_file, error_msg,
+        )
+
+    env = _assemble_env(agent_task, agent_token)
+
+    access = context.get("access", "readonly")
+    project_path = context.get("project")
+    try:
+        working_dir = await PROJECT_PATHS.ensure_project_exists(
+            project_path=project_path,
+            access=access,
+            clone_url=context.get("clone_url"),
+            agent=agent_task.agent,
+        )
+    except RuntimeError as exc:
+        LOGGER.error(
+            "Failed to ensure project exists",
+            extra={"event_id": event_id, "error": str(exc)},
+        )
+        error_payload = {
+            "prompt": [],
+            "error": str(exc),
+        }
+        log_file = _write_text_log(log_file, json.dumps(error_payload, indent=2, ensure_ascii=False))
+        return None, _finalize_error(
+            event_id, agent_task, prompt_name, dashboard_key, log_file, str(exc),
+        )
+
+    # Fail fast if project path could not be resolved - prevents agents from
+    # running in the wrong directory (e.g., /work instead of the project mount)
+    if working_dir is None:
+        error_msg = f"Project path not found: {project_path}"
+        LOGGER.error(
+            "Project path could not be resolved",
+            extra={
+                "event_id": event_id,
+                "project_path": project_path,
+                "access": access,
+            },
+        )
+        error_payload = {
+            "prompt": [],
+            "error": error_msg,
+        }
+        log_file = _write_text_log(log_file, json.dumps(error_payload, indent=2, ensure_ascii=False))
+        return None, _finalize_error(
+            event_id, agent_task, prompt_name, dashboard_key, log_file, error_msg,
+        )
+
+    result: Dict[str, Any] = {
+        "agent": agent_task.agent,
+        "task": agent_task.task,
+        "prompt": prompt_name,
+        "log_file": str(log_file),
+    }
+    if working_dir:
+        result["working_dir"] = working_dir
+
+    setup = _DispatchSetup(
+        command=command,
+        args=args,
+        env=env,
+        working_dir=working_dir,
+        project_path=project_path,
+        result=result,
+    )
+    return setup, None
+
+
+async def _checkout_and_render_prompt(
+    event_id: str,
+    agent_task: AgentTask,
+    context: Dict[str, Any],
+    setup: _DispatchSetup,
+    prompt_name: str,
+    log_file: Path,
+    dashboard_key: str,
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Check out the dispatch branch and render the prompt for the run.
+
+    Returns ``(prompt_text, error_result)``. A non-None ``error_result`` means
+    branch resolution failed and the run is already finalized.
+    """
+    # Resolve and checkout appropriate branch before agent dispatch. Branch
+    # resolution requires read-write access for git operations (fetch, checkout,
+    # reset) even if the agent itself will run with read-only access.
+    current_branch: Optional[str] = None
+    if setup.working_dir and settings.enable_branch_switch:
+        current_branch, branch_error = await _resolve_and_apply_branch(
+            event_id, agent_task, context, setup.project_path,
+            setup.result, log_file, dashboard_key,
+        )
+        if branch_error is not None:
+            return None, branch_error
+
+    # If branch switching is disabled or didn't determine a branch, query git directly
+    if current_branch is None and setup.working_dir:
+        current_branch = await _get_current_branch(setup.working_dir)
+
+    # Populate current_branch in context for prompt substitution
+    context["current_branch"] = current_branch or ""
+
+    # Render prompt after branch resolution so ${CURRENT_BRANCH} reflects actual repo state
+    prompt_text = render_prompt(prompt_name, context)
+    if dashboard_manager.enabled:
+        for line in _stream_lines(prompt_text):
+            dashboard_manager.publish_prompt(event_id, agent_task.agent, agent_task.task, line)
+    return prompt_text, None
+
+
+async def _execute_agent(event_id: str, agent_task: AgentTask, context: Dict[str, Any]) -> Dict[str, Any]:
+    prompt_name = agent_task.prompt or f"{agent_task.task}.txt"
+    log_file = _log_path(event_id, agent_task.agent, context)
+
+    dashboard_key = dashboard_manager.agent_started(event_id, agent_task.agent, agent_task.task)
+
+    setup, setup_error = await _prepare_dispatch(
+        event_id, agent_task, context, prompt_name, log_file, dashboard_key,
+    )
+    if setup_error is not None:
+        return setup_error
+    assert setup is not None  # narrowed: setup is populated when setup_error is None
+
+    prompt_text, checkout_error = await _checkout_and_render_prompt(
+        event_id, agent_task, context, setup, prompt_name, log_file, dashboard_key,
+    )
+    if checkout_error is not None:
+        return checkout_error
+    assert prompt_text is not None  # narrowed: set when checkout_error is None
+
+    outcome = await _run_with_auth(
+        setup.command, setup.args, prompt_text, setup.env, setup.working_dir,
+        event_id, agent_task, setup.result, log_file, dashboard_key,
+    )
+    if outcome.error_result is not None:
+        return outcome.error_result
+
+    if await agent_registry.is_marked_killed(event_id):
+        raise AgentKilledError(event_id)
+
+    return _finalize_success(event_id, agent_task, setup.result, log_file, prompt_text, outcome)
 
 
 async def _run_subprocess(
@@ -604,7 +848,10 @@ async def _run_subprocess(
     event_id: str,
     agent_task: AgentTask,
 ) -> tuple[str, str, int, Optional[str]]:
-    proc = await _launch_subprocess(command, args, env, working_dir)
+    launch_args, prompt_in_argv = _inject_prompt_arg(args, prompt_text)
+    proc = await _launch_subprocess(command, launch_args, env, working_dir)
+    # Log the pre-substitution argv so the placeholder stands in for the prompt
+    # body -- the rendered prompt is already captured in the run log.
     command_line = shlex.join([command] + args)
     LOGGER.info(
         "Agent started: agent=%s task=%s pid=%s cmd=%s cwd=%s",
@@ -623,8 +870,11 @@ async def _run_subprocess(
         },
     )
     if proc.stdin is not None:
-        proc.stdin.write(prompt_text.encode("utf-8"))
-        await proc.stdin.drain()
+        # When the prompt went into argv, still close stdin so CLIs that block
+        # on EOF do not hang -- just don't hand them the prompt a second time.
+        if not prompt_in_argv:
+            proc.stdin.write(prompt_text.encode("utf-8"))
+            await proc.stdin.drain()
         proc.stdin.close()
 
     await agent_registry.register_process(event_id, proc, agent_task.agent, agent_task.task)
@@ -735,7 +985,10 @@ async def _authenticate_agent(
             return "", f"glab-usr timed out after {GLAB_USR_TIMEOUT_SECONDS:.0f}s", -1
         stdout_text = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
         stderr_text = stderr_bytes.decode("utf-8", errors="replace") if stderr_bytes else ""
-        return stdout_text, stderr_text, proc.returncode
+        # communicate() has completed, so returncode is set; fall back to -1
+        # to satisfy the int return contract if it is somehow still None.
+        returncode = proc.returncode if proc.returncode is not None else -1
+        return stdout_text, stderr_text, returncode
 
 
 def _stream_subprocess_output(

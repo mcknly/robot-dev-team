@@ -15,12 +15,124 @@ API_HOST="${GLAB_API_HOST:-$HOST}"
 # Protocol for API and git operations.  Use 'http' for local HTTP deployments.
 PROTOCOL="${GLAB_PROTOCOL:-https}"
 
-BASE_USER="${SUDO_USER:-${USER:-}}"
-if [[ -z "$BASE_USER" ]]; then
-  BASE_USER=$(id -un 2>/dev/null || printf 'root')
+# Loud-fail when GLAB_HOST resolves to the placeholder so we never silently
+# target a non-existent server. Intent-based: trips even when explicitly
+# exported, and matches ported variants (e.g. gitlab.example.com:8080).
+# The hint deliberately names no example host: this file ships in the published
+# image, and the one example a reader would find obvious is the placeholder the
+# guard just rejected.
+case "${HOST%%:*}" in
+  gitlab.example.com)
+    printf 'Error: GLAB_HOST is not configured (resolves to placeholder "%s").\n' "$HOST" >&2
+    printf '       Export GLAB_HOST=<your-gitlab-host> and retry.\n' >&2
+    exit 1
+    ;;
+esac
+# Reject scheme in GLAB_HOST / GLAB_API_HOST: glab auth flags and the
+# credential URL construction below both assume a bare host[:port].
+for _h in "$HOST" "$API_HOST"; do
+  case "$_h" in
+    *://*)
+      printf 'Error: GLAB_HOST/GLAB_API_HOST must be a bare host (no scheme); got "%s".\n' "$_h" >&2
+      printf '       Use bare <host>[:port] and set GLAB_PROTOCOL=http when needed.\n' >&2
+      exit 1
+      ;;
+  esac
+done
+unset _h
+# Validate GLAB_PROTOCOL: only http/https are meaningful for glab and for
+# the credential URL written below.
+case "$PROTOCOL" in
+  http|https) ;;
+  *)
+    printf 'Error: GLAB_PROTOCOL must be "http" or "https"; got "%s".\n' "$PROTOCOL" >&2
+    exit 1
+    ;;
+esac
+
+# When invoked under sudo, resolve the *original* user's home via tilde
+# expansion so credential writes land in their account, not root's. Without
+# sudo, use $HOME directly: the login shell / container entrypoint sets
+# it, and tilde-expansion through /etc/passwd would override deliberately
+# scoped HOME values (e.g. in isolated test environments).
+if [[ -n "${SUDO_USER:-}" ]]; then
+  BASE_USER="$SUDO_USER"
+  BASE_HOME=$(eval echo "~$BASE_USER" 2>/dev/null || echo "${HOME:-/root}")
+else
+  BASE_USER="$(id -un 2>/dev/null || printf 'root')"
+  BASE_HOME="${HOME:-$(eval echo "~$BASE_USER" 2>/dev/null || echo /root)}"
 fi
-BASE_HOME=$(eval echo "~$BASE_USER" 2>/dev/null || echo "${HOME:-/root}")
 CONFIG_FILE="$BASE_HOME/.config/glab-cli/config.yml"
+
+# Global-fallback credential store, used when no writable repository is
+# available. Deliberately NOT $BASE_HOME/.git-credentials: that path is
+# git's shared default store and holds entries for other hosts (GitHub
+# mirrors, other GitLab instances). This script writes its store as a
+# single line, so pointing it at the shared file destroys every unrelated
+# credential on each invocation. A dedicated per-host file removes that
+# blast radius by construction. HOST may carry a port, so slugify anything
+# outside the portable filename set.
+HOST_SLUG="$(printf '%s' "$HOST" | tr -c 'A-Za-z0-9._-' '_')"
+GLOBAL_CRED_FILE="$BASE_HOME/.config/glab-cli/git-credentials-$HOST_SLUG"
+
+# Self-defense against root-owned config files in $BASE_HOME. A stray
+# `docker compose exec app ...` (which defaults to root) that invokes
+# glab will create $BASE_HOME/.config/glab-cli/ owned by root with mode
+# 700, after which appuser-driven calls fail with a cryptic
+# "failed to create config directory: mkdir ... permission denied".
+# Catch that here with a one-line remediation instead of letting glab
+# emit the unhelpful error. Skips silently when paths don't exist yet
+# (normal first-run path).
+#
+# Writability/executability tests are routed through $BASE_USER so root
+# callers (sudo, `docker exec` as root) do not bypass the guard via
+# Unix permission-ignore semantics. `-e` follows symlinks, so a
+# dangling symlink reads as nonexistent and slips past -- which is the
+# desired behavior; there is no poisoning to detect on a broken link.
+_check_as_base() {
+  if [[ -n "${SUDO_USER:-}" ]]; then
+    sudo -u "$SUDO_USER" test "$@"
+  else
+    test "$@"
+  fi
+}
+
+_bad_path=""
+# Directories must be writable (create files) and searchable (traverse).
+for _dir in "$BASE_HOME/.config" "$BASE_HOME/.config/glab-cli"; do
+  if [[ -e "$_dir" ]] && { ! _check_as_base -w "$_dir" || ! _check_as_base -x "$_dir"; }; then
+    _bad_path="$_dir"
+    break
+  fi
+done
+# Files: directories may be appuser-owned while the file itself was
+# written by root (e.g. `git config --global` ran as root with .config
+# already appuser-owned). Catch those too.
+if [[ -z "$_bad_path" ]]; then
+  for _file in \
+    "$BASE_HOME/.config/glab-cli/config.yml" \
+    "$BASE_HOME/.gitconfig" \
+    "$GLOBAL_CRED_FILE"; do
+    if [[ -f "$_file" ]] && ! _check_as_base -w "$_file"; then
+      _bad_path="$_file"
+      break
+    fi
+  done
+fi
+
+if [[ -n "$_bad_path" ]]; then
+  printf 'Error: %s exists but is not writable by %s (uid %s).\n' \
+    "$_bad_path" "$BASE_USER" "${SUDO_UID:-$(id -u)}" >&2
+  printf '       This usually means a previous root-owned `docker exec` created\n' >&2
+  printf '       these files. Fix from the docker host with:\n' >&2
+  printf '         docker compose exec -u root app chown -R %s %s\n' \
+    "$BASE_USER" "$BASE_HOME" >&2
+  printf '       To avoid recurrence, always pass `-u %s` when exec-ing into the container.\n' \
+    "$BASE_USER" >&2
+  exit 1
+fi
+unset _dir _file _bad_path
+unset -f _check_as_base
 
 timestamp() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
@@ -99,59 +211,237 @@ ensure_safe_directory() {
   fi
 }
 
-update_git_credentials() {
-  local username="$1"
-  local token="$2"
-  local repo_root cred_file cred_scope
+# Resolve the checkout the credential store and the git identity attach to.
+# Sets REPO_ROOT and RESOLVED_COMMON_DIR; both are empty when cwd is not inside
+# a repository, which is the caller's signal to take the global fallback.
+#
+# The resolved common dir rather than "$REPO_ROOT/.git": in a linked worktree
+# .git is a *file* holding a gitdir: pointer, and in a submodule it points into
+# <parent>/.git/modules/<name>. --git-common-dir resolves the shared directory
+# in both shapes, which is where per-repository config and the credential store
+# belong. The old `-d .git` predicate simply failed on both and dropped to the
+# global path from inside a perfectly writable checkout (issue #43).
+#
+# Scope note: this makes the store and helper *shared across every worktree of
+# a repository*, because `git config --local` from a linked worktree writes
+# the common config. One agent per repository is therefore an invariant --
+# authenticating in one worktree re-points its siblings. Isolating them would
+# mean `--worktree` config plus enabling extensions.worktreeConfig on the
+# operator's repository, a repository-wide semantic change for a guarantee the
+# rest of the system (shared ~/.config/glab-cli state) does not offer anyway.
+# See docs/AGENT_ONBOARDING.md.
+resolve_repo_paths() {
+  REPO_ROOT=""
+  RESOLVED_COMMON_DIR=""
 
-  # First, try to detect the repo root using the current directory
+  # Walk up and register safe.directory *before* any git-native resolution:
+  # on an ownership-mismatched mount rev-parse fails the dubious-ownership
+  # check before it can report a path. `-e` covers the .git file shapes above;
+  # registering the worktree/submodule top level alone is enough for git to
+  # then resolve the common dir (verified against git 2.39.5).
   local potential_root
   potential_root=$(pwd)
   while [[ "$potential_root" != "/" ]]; do
-    if [[ -d "$potential_root/.git" ]]; then
+    if [[ -e "$potential_root/.git" ]]; then
       ensure_safe_directory "$potential_root"
       break
     fi
     potential_root=$(dirname "$potential_root")
   done
 
-  if repo_root=$(run_as_base git rev-parse --show-toplevel 2>/dev/null); then
-    if is_writable_dir "$repo_root/.git"; then
-      cred_file="$repo_root/.git/credentials"
-      cred_scope="repository"
-    fi
+  REPO_ROOT=$(run_as_base git rev-parse --show-toplevel 2>/dev/null) || REPO_ROOT=""
+  [[ -n "$REPO_ROOT" ]] || return 0
+
+  local common_dir
+  common_dir=$(run_as_base git rev-parse --git-common-dir 2>/dev/null) || common_dir=""
+  case "$common_dir" in
+    "") RESOLVED_COMMON_DIR="" ;;
+    /*) RESOLVED_COMMON_DIR="$common_dir" ;;
+    *)  RESOLVED_COMMON_DIR=$(cd "$common_dir" 2>/dev/null && pwd -P) || RESOLVED_COMMON_DIR="" ;;
+  esac
+}
+
+# Wrap a value in POSIX single quotes so git can hand the helper string to
+# /bin/sh without word-splitting it. Git runs credential helpers through a
+# shell, so an unquoted checkout path containing a space is parsed as extra
+# arguments and the helper aborts with a usage error.
+shell_quote() {
+  printf "'%s'" "${1//\'/\'\\\'\'}"
+}
+
+# The host-scoped credential key. Single source of truth: consumers that need
+# to reproduce this configuration on a git command line (see the
+# CREDENTIAL-CONFIG contract line below) read it from us rather than deriving
+# it again, because a wrong key fails silently -- it simply does not match the
+# request, and whatever helper was inherited answers as before.
+#
+# The key must be built from GLAB_PROTOCOL and from GLAB_HOST *including any
+# port*: a `https://` key does not match an `http` credential request, and a
+# portless key does not match a `host:8080` request. Both were verified
+# against git 2.39.5.
+credential_helper_key() {
+  printf 'credential.%s://%s.helper' "$PROTOCOL" "$HOST"
+}
+
+# The helper value for a store path, shell-quoted (see shell_quote).
+credential_helper_value() {
+  printf 'store --file %s' "$(shell_quote "$1")"
+}
+
+# Point git at the selected agent's credential store for GLAB_HOST, and make
+# sure nothing else answers first.
+#
+# Credential helpers accumulate across configuration scopes and are queried
+# in order (system -> global -> local). A plain `credential.helper` written
+# at repository scope therefore loses to any helper the operator already
+# configured globally: the wrong agent's credential answers the prompt, and
+# the push is attributed to that agent even though glab-usr reported success
+# and the commits carry the right author. Writing a *host-scoped* key whose
+# first value is empty resets the inherited helper list for GLAB_HOST only,
+# which leaves the selected agent's store as the sole responder while
+# helpers for every other host keep working.
+#
+# See credential_helper_key for the constraints on the key itself.
+configure_credential_helper() {
+  local scope="$1"
+  local cred_file="$2"
+  local repo_root="${3:-}"
+  local key helper legacy
+  local -a git_cmd
+
+  key="$(credential_helper_key)"
+  helper="$(credential_helper_value "$cred_file")"
+
+  if [[ "$scope" == "repository" ]]; then
+    git_cmd=(git -C "$repo_root" config --local)
+    legacy="store --file $cred_file"
+  else
+    git_cmd=(git config --global)
+    legacy="store --file $BASE_HOME/.git-credentials"
+  fi
+
+  # glab-usr runs on every agent dispatch, so clear the scoped key before
+  # re-adding it; otherwise the config grows a duplicate reset/store pair
+  # per run. `--unset-all` exits 5 when the key is absent, which is the
+  # normal first-run path.
+  run_as_base "${git_cmd[@]}" --unset-all "$key" >/dev/null 2>&1 || true
+
+  # Drop the generic entry older versions of this script wrote, matching the
+  # exact value only so unrelated helpers in the same scope (GCM, cache)
+  # survive. Best-effort: --fixed-value needs git >= 2.30, and leaving the
+  # stale entry behind is harmless because the scoped reset outranks it.
+  run_as_base "${git_cmd[@]}" --fixed-value --unset-all credential.helper "$legacy" >/dev/null 2>&1 || true
+
+  # Fatal rather than a warning: a half-configured helper means the next
+  # push authenticates as whoever the inherited helper returns, which is the
+  # misattribution this function exists to prevent.
+  if ! run_as_base "${git_cmd[@]}" --add "$key" "" >/dev/null 2>&1 ||
+     ! run_as_base "${git_cmd[@]}" --add "$key" "$helper" >/dev/null 2>&1; then
+    echo "[glab-usr] ERROR: failed to configure $scope credential helper for $HOST" >&2
+    exit 1
+  fi
+}
+
+# Warn when a global-scope run lands in a checkout that already carries a
+# *different* agent's repository-scoped helper.
+#
+# Repository config is read last, so its scoped reset discards the global one:
+# git resolves the other agent's credential for every operation run inside
+# that checkout, and the "configured global credential store" line above would
+# otherwise report success for a configuration that is never consulted there.
+# Read-only project mounts hit this by construction -- docker-compose exposes
+# the same tree read-write and read-only, so the .git/config a writable
+# dispatch wrote is the one the read-only view reads.
+#
+# Deliberately a warning, not a hard failure: the read-only path cannot push,
+# and glab / gitlab-connect authenticate from GLAB_TOKEN rather than the git
+# helper, so exiting non-zero would break every read-only dispatch over an
+# identity those dispatches never use. Callers that *do* write to the remote
+# from a foreign checkout (the branch pruner) must override the helper on the
+# git command line -- see the CREDENTIAL-CONFIG contract below.
+warn_if_shadowed_by_repository_helper() {
+  local repo_root="$1"
+  local cred_file="$2"
+  local key expected value
+  key="$(credential_helper_key)"
+  expected="$(credential_helper_value "$cred_file")"
+
+  while IFS= read -r value; do
+    # The empty first value is git's helper-list reset, not a store.
+    [[ -n "$value" ]] || continue
+    [[ "$value" != "$expected" ]] || continue
+    echo "[glab-usr] WARN: $repo_root has a repository-scoped credential helper ($value)" >&2
+    echo "[glab-usr] WARN: repository config outranks global, so git operations run inside that" >&2
+    echo "[glab-usr] WARN: checkout will authenticate with that store, not the one configured above." >&2
+    return
+  done < <(run_as_base git -C "$repo_root" config --local --get-all "$key" 2>/dev/null || true)
+}
+
+update_git_credentials() {
+  local username="$1"
+  local token="$2"
+  local repo_root cred_file cred_scope
+
+  resolve_repo_paths
+  repo_root="$REPO_ROOT"
+  if is_writable_dir "$RESOLVED_COMMON_DIR"; then
+    cred_file="$RESOLVED_COMMON_DIR/credentials"
+    cred_scope="repository"
   fi
 
   if [[ -z "${cred_file:-}" ]]; then
-    cred_file="$BASE_HOME/.git-credentials"
+    cred_file="$GLOBAL_CRED_FILE"
     cred_scope="global"
   fi
 
-  run_as_base env HOST="$API_HOST" USERNAME="$username" TOKEN="$token" CRED_FILE="$cred_file" PROTOCOL="$PROTOCOL" python3 - <<'PY'
+  # Git credentials key on the *web/git* host (GLAB_HOST), not the API
+  # host. When GLAB_HOST and GLAB_API_HOST differ, git push/pull
+  # authenticates against the remote URL host (GLAB_HOST). Writing
+  # credentials keyed to GLAB_API_HOST would leave git operations
+  # unauthenticated.
+  # The token is passed through the environment, never argv, so it cannot
+  # surface in process listings or in the tool-call log above.
+  if ! run_as_base env HOST="$HOST" USERNAME="$username" TOKEN="$token" CRED_FILE="$cred_file" PROTOCOL="$PROTOCOL" python3 - <<'PY'
 import os
 import pathlib
 
 cred_file = pathlib.Path(os.environ["CRED_FILE"]).expanduser()
-cred_file.parent.mkdir(parents=True, exist_ok=True)
+# Only tighten a directory this script creates. A repository store's parent
+# is the resolved common git directory, whose mode belongs to git.
+if not cred_file.parent.exists():
+    cred_file.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(cred_file.parent, 0o700)
 
 with cred_file.open("w", encoding="utf-8") as fh:
     fh.write(f"{os.environ['PROTOCOL']}://{os.environ['USERNAME']}:{os.environ['TOKEN']}@{os.environ['HOST']}\n")
 
 os.chmod(cred_file, 0o600)
 PY
-  if [[ $? -ne 0 ]]; then
-    echo "[glab-usr] WARN: failed to write $cred_scope credential store" >&2
-    return
+  then
+    echo "[glab-usr] ERROR: failed to write $cred_scope credential store at $cred_file" >&2
+    exit 1
   fi
 
-  if [[ "$cred_scope" == "repository" ]]; then
-    run_as_base git -C "$repo_root" config credential.helper "store --file $cred_file" >/dev/null 2>&1 || \
-      echo "[glab-usr] WARN: failed to configure repository credential helper" >&2
-  else
-    run_as_base git config --global credential.helper "store --file $cred_file" >/dev/null 2>&1 || \
-      echo "[glab-usr] WARN: failed to configure global credential helper" >&2
-  fi
+  configure_credential_helper "$cred_scope" "$cred_file" "${repo_root:-}"
   echo "[glab-usr] INFO: configured $cred_scope credential store at $cred_file" >&2
+
+  # repo_root stays set when a repository was found but rejected as
+  # unwritable, which is exactly the case that can be shadowed.
+  if [[ "$cred_scope" == "global" && -n "${repo_root:-}" ]]; then
+    warn_if_shadowed_by_repository_helper "$repo_root" "$cred_file"
+  fi
+
+  # Machine-readable contract for callers that must reproduce this
+  # configuration on a git command line (`git -c key= -c key=<helper> ...`),
+  # which is the only scope that outranks a foreign checkout's repository
+  # config without writing to it. Emitting the key and the quoted helper here
+  # keeps their derivation in one place; a second copy would drift, and the
+  # drift is silent. Consumed by app/services/branch_pruning.py.
+  #
+  # On stderr with the other [glab-usr] diagnostics so stdout stays exactly
+  # what it was for existing callers. Contains a path, never token material.
+  printf '[glab-usr] CREDENTIAL-CONFIG scope=%s key=%s helper=%s\n' \
+    "$cred_scope" "$(credential_helper_key)" "$(credential_helper_value "$cred_file")" >&2
 }
 
 set_git_identity_local() {
@@ -191,25 +481,29 @@ configure_git_identity() {
   name="${!name_var:-$default_name}"
   email="${!email_var:-${agent}@example.com}"
 
+  # Loud-fail when the email is the placeholder. Falling back silently
+  # would land commits with @example.com authorship. Note: this check
+  # also blocks read-only flows (e.g. `gitlab-connect issue view`) when
+  # the agent has no configured email; that is intentional for the
+  # automation environment, which expects every configured agent to have
+  # a real identity. Document via *_AGENT_GIT_EMAIL in .env.
+  if [[ "$email" == *"@example.com" ]]; then
+    printf 'Error: %s is not configured (resolves to placeholder "%s").\n' "$email_var" "$email" >&2
+    printf '       Export %s=<real-email> (and optionally %s=<real-name>) before authenticating.\n' "$email_var" "$name_var" >&2
+    exit 1
+  fi
+
   if ! command -v git >/dev/null 2>&1; then
     echo "[glab-usr] WARN: git not available; skipping identity configuration" >&2
     return
   fi
 
-  # Ensure safe.directory is set for current repo
-  local potential_root
-  potential_root=$(pwd)
-  while [[ "$potential_root" != "/" ]]; do
-    if [[ -d "$potential_root/.git" ]]; then
-      ensure_safe_directory "$potential_root"
-      break
-    fi
-    potential_root=$(dirname "$potential_root")
-  done
+  # Same resolution as update_git_credentials, so the identity can never land
+  # in a different scope than the credential that will be used to push it.
+  resolve_repo_paths
 
-  local repo_root
-  if repo_root=$(run_as_base git rev-parse --show-toplevel 2>/dev/null) && is_writable_dir "$repo_root/.git"; then
-    set_git_identity_local "$repo_root" "$name" "$email"
+  if [[ -n "$REPO_ROOT" ]] && is_writable_dir "$RESOLVED_COMMON_DIR"; then
+    set_git_identity_local "$REPO_ROOT" "$name" "$email"
     config_scope="repository"
   else
     set_git_identity_global "$name" "$email"
@@ -235,7 +529,7 @@ token_dir="$(printf '%s' "$target_user" | tr '[:upper:]_' '[:lower:]-')"
 token=$(read_token "${!token_env_var:-}" "$BASE_HOME/.$token_dir/glab-token")
 
 if [[ -z "$token" ]]; then
-  echo "missing token for user $target_user" >&2
+  echo "missing token for user $target_user (expected env var $token_env_var or file $BASE_HOME/.$token_dir/glab-token)" >&2
   exit 1
 fi
 

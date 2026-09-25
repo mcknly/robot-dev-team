@@ -27,6 +27,7 @@ HEADER_TOKENS: Sequence[str] = (
 
 DEFAULT_SUFFIXES: Sequence[str] = (".py", ".sh", ".md", ".yaml", ".yml", ".toml", ".ini")
 DEFAULT_FILENAMES: Sequence[str] = (
+    ".dockerignore",
     "Dockerfile",
     "docker-compose.yml",
     "docker-compose.override.yml",
@@ -38,7 +39,6 @@ DEFAULT_FILENAMES: Sequence[str] = (
 DEFAULT_EXCLUDED_PREFIXES: Sequence[str] = (
     ".git/",
     ".venv/",
-    "npm-cache/",
     "run-logs/",
     "sbom/",
     "test-config/",

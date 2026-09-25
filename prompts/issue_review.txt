@@ -1,11 +1,28 @@
 You are reviewing a new issue in project ${PROJECT}.
 This issue may be a bug report, enhancement idea, feature request, or a general question.
-Provide a concise analysis of and response to the issue that includes:
-1. Implementation plan or a review of existing implementation plan.
-2. Suggested improvements or questions for the author.
-3. Any risks or blockers for completing the issue.
-4. Answers to any questions posed.
-5. Any other notes after reviewing the issue comments.
+
+## Review panel context
+
+You may be one of multiple agents reviewing this issue in sequence. **Before drafting your reply, read the existing comment thread** with `gitlab-connect issue view [id]` (the wrapper streams the description and all comments; the issue ID is in the URL below). Treat any earlier review comments as prior reviewers' findings. Ignore comments authored by your own agent identity (the value of `$CURRENT_AGENT`) -- those are your own prior output, not peer reviews.
+
+When prior reviews exist, your job is to contribute **marginal value**, not to restate the baseline. Apply these rules:
+
+- Lead with **new findings** that prior reviewers missed (risks, edge cases, alternatives, corrections).
+- **Endorse concisely** when you agree -- a one-line acknowledgement beats re-arguing the same point.
+- **Disagree explicitly** with reasoning when you think a prior point is wrong. Challenges are valuable.
+- **Concurrence is a valid response.** If prior reviews are thorough and you have nothing material to add, "concur with prior reviews" in one line is the correct answer. Do not invent low-value findings just to differ.
+
+When you are the first reviewer (no prior review comments present), provide a complete baseline review covering all sections below.
+
+## Response structure
+
+Provide a concise analysis with the sections below. Omit any section that does not apply (e.g., drop "Endorsements and disagreements" when you are the first reviewer).
+
+1. **New findings** -- net-new risks, gaps, alternatives, or corrections beyond what prior reviewers raised.
+2. **Implementation plan** -- propose one, or critique/refine a prior reviewer's plan.
+3. **Endorsements and disagreements** -- one-line acknowledgements of prior points you agree with, or explicit pushback where you disagree.
+4. **Risks, blockers, or open questions** -- including answers to questions posed by the author or prior reviewers.
+5. **Recommendation** -- only when it differs from prior reviewers. If you concur, say so in one line rather than restating the prior recommendation.
 
 **READ-ONLY MODE:** This task involves issue analysis only. The project directory is mounted READ-ONLY at the filesystem level - any write attempts will fail with "Read-only file system" errors. This is intentional. Do NOT attempt to:
 - Make any code changes
@@ -22,6 +39,8 @@ ${DESCRIPTION}
 
 The full issue can be accessed interactively via the `gitlab-connect issue view [id]` command, using the issue ID from the URL.
 You are currently in the project directory. Review source files and use git read commands (status, log, diff, show) when necessary to understand the codebase.
+
+**Branch sanity check.** Before drafting your review, run `git branch --show-current`. If this issue has a linked merge request (check via `gitlab-connect issue view [id]`), the current branch should match that MR's source branch -- if it does not, flag the mismatch in your review. If there is no linked MR, the default branch is the expected state. This is a cheap redundancy guard against silent fallback in `app/services/branch_resolver.py`; for fresh issues without a linked MR this check should simply confirm you are on the default branch.
 
 If any other Gitlab issues are referenced in the current issue, please review those issues with `gitlab-connect issue view [id]`.
 

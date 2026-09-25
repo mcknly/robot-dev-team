@@ -1,0 +1,81 @@
+# Robot Dev Team Project
+# File: .github/ISSUE_TEMPLATE/bug_report.yml
+# Description: Bug report issue form for the public GitHub mirror.
+# License: MIT
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 MCKNLY LLC
+
+name: Bug report
+description: Something behaves incorrectly in the service, the wrappers, or the container image.
+title: "[bug] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Thanks for reporting. Two things worth knowing before you start: this repository's
+        release line is a one-way publication of a private canonical instance, so triage and the
+        fix happen out of your view (see
+        [docs/MIRRORING.md](https://github.com/mcknly/robot-dev-team/blob/main/docs/MIRRORING.md)),
+        and a fix reaches you with the next stable release rather than on merge.
+
+
+        **If this is a security vulnerability, stop here** and report it privately instead --
+        see [SECURITY.md](https://github.com/mcknly/robot-dev-team/blob/main/SECURITY.md).
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened
+      description: What you observed, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: >-
+        The smallest sequence that shows the problem. Route config, the webhook event type, and
+        the agent involved are usually the details that matter.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or image digest
+      description: >-
+        The release you are running. An image digest is better than a tag --
+        `docker inspect --format '{{index .RepoDigests 0}}' <image>`.
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: How are you running it
+      options:
+        - Published container image
+        - Locally built container image
+        - Outside Docker (local uvicorn)
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or run-log excerpt
+      description: >-
+        Application logs, or the relevant `run-logs/` entry. This is rendered as a code block,
+        so no backticks are needed.
+      render: text
+    validations:
+      required: false
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Before submitting
+      options:
+        - label: >-
+            I have removed tokens, webhook secrets, GitLab hostnames, and any other sensitive
+            values from everything pasted above.
+          required: true
+        - label: This is not a security vulnerability report.
+          required: true

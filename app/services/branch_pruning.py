@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import tempfile
 import time
 from datetime import timedelta
 from fnmatch import fnmatch
@@ -26,6 +27,16 @@ PROJECTS_ROOT = Path("/work/projects")
 
 # Refs that must never be pruned regardless of configuration
 _BUILTIN_PROTECTED = {"main", "master", "HEAD"}
+
+# The contract line glab-usr emits on stderr after configuring credentials.
+# It carries the host-scoped credential key and the shell-quoted helper value
+# so this service does not re-derive either (protocol prefix, retained port,
+# quoted store path); a re-derived key that does not match the request fails
+# silently, leaving the repository's own helper to answer.
+_CREDENTIAL_CONFIG_RE = re.compile(
+    r"^\[glab-usr\] CREDENTIAL-CONFIG "
+    r"scope=(?P<scope>\S+) key=(?P<key>\S+) helper=(?P<helper>.+)$"
+)
 
 
 class BranchPruner:
@@ -50,6 +61,10 @@ class BranchPruner:
         self.min_age_seconds = min_age_hours * 3600
         self.projects_root = projects_root or PROJECTS_ROOT
         self._protected_patterns = self._parse_patterns(protected_patterns)
+        # `git -c` arguments that pin every git command in this pass to the
+        # pruning agent's credential store.  Populated by _authenticate from
+        # glab-usr's CREDENTIAL-CONFIG line; empty until then.
+        self._credential_args: list[str] = []
 
     @staticmethod
     def _parse_patterns(raw: str) -> list[str]:
@@ -205,44 +220,53 @@ class BranchPruner:
         pruned: list[str] = []
 
         for branch in merged_branches:
-            if self._is_protected(branch):
-                continue
-
-            # Check merge age -- skip branches merged less than min_age_seconds ago
-            if self.min_age_seconds > 0:
-                age = await self._get_merge_age(repo_dir, branch, base)
-                if age is not None and age < self.min_age_seconds:
-                    logger.debug(
-                        "Skipping recently-merged branch %s in %s (age=%.0fh, min=%dh)",
-                        branch,
-                        repo_dir,
-                        age / 3600,
-                        self.min_age_seconds // 3600,
-                    )
-                    continue
-
-            if self.dry_run:
-                logger.info("[DRY-RUN] Would prune branch %s in %s", branch, repo_dir)
-                pruned.append(branch)
-                continue
-
-            rc, _, stderr = await self._run_git(
-                ["push", "origin", "--delete", branch],
-                cwd=repo_dir,
-            )
-            if rc == 0:
-                logger.info("Pruned branch %s in %s", branch, repo_dir)
-                pruned.append(branch)
-            else:
-                logger.warning(
-                    "Failed to delete branch %s in %s: %s", branch, repo_dir, stderr
-                )
+            result = await self._prune_one_branch(repo_dir, branch, base)
+            if result is not None:
+                pruned.append(result)
 
         if pruned:
             mode = "Would prune" if self.dry_run else "Pruned"
             logger.info("%s %d branch(es) in %s", mode, len(pruned), repo_dir)
 
         return pruned
+
+    async def _prune_one_branch(self, repo_dir: Path, branch: str, base: str) -> str | None:
+        """Consider a single merged branch for pruning.
+
+        Returns the branch name when it was pruned (or would be, in dry-run),
+        or None when it is protected, too recently merged, or the delete failed.
+        """
+        if self._is_protected(branch):
+            return None
+
+        # Check merge age -- skip branches merged less than min_age_seconds ago
+        if self.min_age_seconds > 0:
+            age = await self._get_merge_age(repo_dir, branch, base)
+            if age is not None and age < self.min_age_seconds:
+                logger.debug(
+                    "Skipping recently-merged branch %s in %s (age=%.0fh, min=%dh)",
+                    branch,
+                    repo_dir,
+                    age / 3600,
+                    self.min_age_seconds // 3600,
+                )
+                return None
+
+        if self.dry_run:
+            logger.info("[DRY-RUN] Would prune branch %s in %s", branch, repo_dir)
+            return branch
+
+        rc, _, stderr = await self._run_git(
+            ["push", "origin", "--delete", branch],
+            cwd=repo_dir,
+        )
+        if rc == 0:
+            logger.info("Pruned branch %s in %s", branch, repo_dir)
+            return branch
+        logger.warning(
+            "Failed to delete branch %s in %s: %s", branch, repo_dir, stderr
+        )
+        return None
 
     @staticmethod
     def _parse_merged_branches(raw_output: str) -> list[str]:
@@ -310,13 +334,18 @@ class BranchPruner:
     # dispatch.
     _GIT_TIMEOUT_SECONDS: float = 120.0
 
-    @staticmethod
     async def _run_git(
+        self,
         args: list[str],
         cwd: Path,
         timeout: float | None = None,
     ) -> tuple[int, str, str]:
         """Execute a git command and return (returncode, stdout, stderr).
+
+        Credential configuration from _authenticate is injected as ``-c``
+        arguments so the command authenticates as the pruning agent even
+        inside a checkout that carries another agent's repository-scoped
+        helper.  See _credential_args_from_stderr for why command scope.
 
         If *timeout* is provided (or falls back to the class default), the
         subprocess is killed after that many seconds and the call returns a
@@ -326,6 +355,7 @@ class BranchPruner:
             timeout = BranchPruner._GIT_TIMEOUT_SECONDS
         proc = await asyncio.create_subprocess_exec(
             "git",
+            *self._credential_args,
             *args,
             cwd=str(cwd),
             stdout=asyncio.subprocess.PIPE,
@@ -363,33 +393,81 @@ class BranchPruner:
     _AUTH_TIMEOUT_SECONDS: float = GLAB_USR_TIMEOUT_SECONDS
 
     @staticmethod
-    async def _authenticate(agent: str) -> bool:
+    def _credential_args_from_stderr(stderr_text: str) -> list[str]:
+        """Build ``git -c`` arguments from glab-usr's CREDENTIAL-CONFIG line.
+
+        The pruner authenticates once, outside any repository, then runs its
+        fetch and ``push --delete`` with ``cwd`` set to each project.  Git
+        reads repository config last, so the scoped helper a dispatched agent
+        left in that checkout discards the pruner's global one and answers in
+        its place.  Command-line ``-c`` outranks repository config, and unlike
+        re-authenticating with ``cwd=repo_dir`` it writes nothing: a
+        long-running agent holding that checkout is not disturbed, since it
+        released git_auth_lock before its CLI started.
+
+        Two values are required, in order: an empty one to reset the inherited
+        helper list for this host, then the store.  Returns [] when the line
+        is absent.
+        """
+        for line in stderr_text.splitlines():
+            match = _CREDENTIAL_CONFIG_RE.match(line.strip())
+            if match:
+                key = match.group("key")
+                return ["-c", f"{key}=", "-c", f"{key}={match.group('helper')}"]
+        return []
+
+    async def _authenticate(self, agent: str) -> bool:
         """Set up git credentials via glab-usr for the configured agent."""
+        # Never let a previous pass's override survive a failed re-auth: these
+        # args are only ever the ones this call established.
+        self._credential_args = []
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "glab-usr",
-                agent,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=os.environ.copy(),
-            )
-            try:
-                _, stderr_bytes = await asyncio.wait_for(
-                    proc.communicate(),
-                    timeout=BranchPruner._AUTH_TIMEOUT_SECONDS,
+            # Authenticate from a throwaway empty directory so glab-usr takes
+            # its global path deterministically.  Inheriting the process cwd
+            # would let it detect a surrounding checkout and write credentials
+            # and identity into that repository -- harmless in the container
+            # (cwd is the app directory) but not under `./launch-uvicorn-dev`,
+            # where cwd is a real checkout that may also be a pruning target.
+            with tempfile.TemporaryDirectory(prefix="branch-pruner-auth-") as authdir:
+                proc = await asyncio.create_subprocess_exec(
+                    "glab-usr",
+                    agent,
+                    cwd=authdir,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=os.environ.copy(),
                 )
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
+                try:
+                    _, stderr_bytes = await asyncio.wait_for(
+                        proc.communicate(),
+                        timeout=BranchPruner._AUTH_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    logger.error(
+                        "glab-usr timed out after %.0fs for agent '%s'",
+                        BranchPruner._AUTH_TIMEOUT_SECONDS,
+                        agent,
+                    )
+                    return False
+
+            stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+            if proc.returncode != 0:
+                logger.error("glab-usr authentication failed: %s", stderr_text)
+                return False
+
+            self._credential_args = self._credential_args_from_stderr(stderr_text)
+            if not self._credential_args:
+                # Without the override the pruner's identity is decided by
+                # whatever helper each checkout carries.  Refuse the cycle
+                # rather than fetch and delete branches as an unknown agent.
                 logger.error(
-                    "glab-usr timed out after %.0fs for agent '%s'",
-                    BranchPruner._AUTH_TIMEOUT_SECONDS,
+                    "glab-usr did not report a credential configuration for agent "
+                    "'%s'; skipping pruning to avoid operating under another "
+                    "agent's credentials.",
                     agent,
                 )
-                return False
-            if proc.returncode != 0:
-                stderr_text = stderr_bytes.decode("utf-8", errors="replace")
-                logger.error("glab-usr authentication failed: %s", stderr_text)
                 return False
             return True
         except FileNotFoundError:

@@ -17,8 +17,8 @@ from fastapi import FastAPI
 from app.api.webhooks import router as webhooks_router
 from app.core.config import settings
 from app.core.logging import setup_logging
-from app.services.dashboard import dashboard_manager
 from app.services.branch_pruning import branch_pruner
+from app.services.dashboard import dashboard_manager
 from app.services.log_pruning import log_pruner
 
 setup_logging()

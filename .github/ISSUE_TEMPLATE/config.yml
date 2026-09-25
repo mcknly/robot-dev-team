@@ -1,0 +1,27 @@
+# Robot Dev Team Project
+# File: .github/ISSUE_TEMPLATE/config.yml
+# Description: Issue chooser configuration for the public GitHub mirror.
+# License: MIT
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 MCKNLY LLC
+
+# Blank issues are disabled so every report arrives through a form that states the
+# canonical-source policy. A stranger's first contact should not be the place they discover
+# that this repository's release line is a publication of a canonical instance they cannot see.
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability (do not open an issue)
+    url: https://github.com/mcknly/robot-dev-team/security/advisories/new
+    about: >-
+      Use GitHub Private Vulnerability Reporting. A public issue discloses the finding to
+      everyone before a fix exists. See SECURITY.md.
+  - name: How contributions are reviewed and merged
+    url: https://github.com/mcknly/robot-dev-team/blob/main/docs/CONTRIBUTING.md
+    about: >-
+      Pull requests target the rc branch, are qualified on the canonical instance first, and
+      become public with the next stable release.
+  - name: Canonical source and mirror policy
+    url: https://github.com/mcknly/robot-dev-team/blob/main/docs/MIRRORING.md
+    about: >-
+      Why the public release line is read-only while issues and pull requests are not, why the
+      history is one commit per release, and what is published with each release.

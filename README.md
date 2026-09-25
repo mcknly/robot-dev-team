@@ -14,7 +14,7 @@ Copyright (c) 2025 MCKNLY LLC
 </div>
 
 **Bring Your Own Agents (BYOA)** — Robot Dev Team is a containerized FastAPI service that consumes GitLab webhooks, enriches events with the GitLab CLI, and dispatches context-rich prompts to any CLI-based LLM agent via YAML routing rules.
-Ships with adapters for Claude Code, Google Gemini, and OpenAI Codex, but any tool that accepts prompts on stdin can be wired in simply by replacing CLI command strings.
+Ships with adapters for Claude Code, Google Gemini, and OpenAI Codex, but any tool that accepts prompts on stdin or as a command-line value can be wired in simply by replacing CLI command strings.
 No need for separate pay-as-you-go API keys, use the command line agents you already have.
 
 <div align="center">
@@ -48,7 +48,7 @@ If you're already authenticated in the host CLI, your agents are ready to work, 
 
 ## Features
 
-- **BYOA** — Agent-agnostic by design. Route GitLab webhooks to Claude, Gemini, Codex, or any custom CLI agent (OpenCode, Goose...) using flexible, first-match YAML routing rules.
+- **BYOA** — Agent-agnostic by design. Route GitLab webhooks to Claude, Gemini, Codex, or any custom CLI agent (OpenCode, Goose, Grok...) using flexible, first-match YAML routing rules.
 - **Event-driven agent orchestration** — GitLab webhooks triggered by repository events are processed by the router; mentioning an agent in issue or MR comments dispatches it with full event context, and multi-mention comments (or `@all`) fan out into separate, independent dispatches with per-mention event tracking.
 - **On-demand project cloning** — Projects are cloned automatically on first webhook trigger, with namespace-aware paths and concurrent-clone protection — no manual repo setup required.
 - **Automatic branch resolution** — The system detects the relevant branch from the webhook payload and checks it out before the agent starts work, including divergence handling, backup branch creation, and stale branch auto-cleanup.
@@ -96,24 +96,38 @@ Create GitLab user accounts for each agent you plan to use (`claude`, `gemini`, 
 For multi-project setups, add agents at the **Group** level so access is inherited automatically -- see `docs/GROUP_SETUP.md`. Agents cannot interact with projects they are not members of, even if webhooks are configured correctly.
 
 ### Linux (read this first as it applies to other platforms as well)
-1. Install Node.js using `nvm` (ensures a modern LTS build) and then install the agent CLIs:
+1. Install the agent CLIs using each vendor's native installer (no Node.js / npm required, except the optional Pi harness -- see its note below):
    ```bash
-   curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/master/install.sh | bash
-   export NVM_DIR="$HOME/.nvm"
-   [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-   nvm install --lts
-   npm install -g @anthropic-ai/claude-code @google/gemini-cli @openai/codex
+   # Claude Code (Anthropic)
+   curl -fsSL https://claude.ai/install.sh | bash
+   # Antigravity CLI -- the `gemini` agent's harness, installs the `agy` binary
+   curl -fsSL https://antigravity.google/cli/install.sh | bash
+   # Codex CLI (OpenAI)
+   curl -fsSL https://openai.com/cli/install.sh | bash
    ```
-   The CLIs will be available as `claude`, `gemini`, and `codex` on your `PATH`.  
-   _note1: some of these agent CLIs are migrating to native installers. Consult the latest installation guides for each._  
+   The CLIs will be available as `claude`, `agy`, and `codex` on your `PATH`. The Antigravity CLI replaces the deprecated `@google/gemini-cli` npm package; the agent is still referenced as `gemini` throughout the project (route identity, env vars, GitLab account), only the binary name differs.  
+   _note1: consult the latest installation guides for each vendor — installer URLs may change._  
    _note2: you can omit any of these agents from your config, just remove all references to that agent from your routing rules._
 2. Authenticate each agent CLI under your user account so their configs live in `~/.claude`, `~/.gemini`, and `~/.codex`:
    ```bash
    claude    # follow the interactive prompts (Anthropic)
-   gemini    # sign in with your Google account
+   agy       # sign in with your Google account (Antigravity stores state under ~/.gemini/antigravity-cli/)
    codex     # authenticate with your OpenAI account
    ```
    Run each command interactively once to seed credentials; Docker mounts the same directories so automation reuses your local auth. Using your personal subscription means agent operations stay under your existing plan limits. Requires a paid subscription for each provider you intend to use (or locally-hosted models if you're a cowboy).
+
+   > **Antigravity headless permissions.** `agy` does not expose `--yolo` or
+   > `--skip-trust`; instead it accepts `--dangerously-skip-permissions`
+   > (verbatim Claude name) to auto-approve all tool invocations. The shipped
+   > `routes.yaml` for the `gemini` agent already passes this flag, so no
+   > host-side `settings.json` editing is required for headless tool use.
+   >
+   > **Antigravity prompt delivery.** Unlike the other CLIs, `agy` never reads
+   > stdin -- `-p` / `--print` takes the prompt as the flag's *value*. The
+   > gemini routes therefore pass the `${PROMPT}` placeholder, which dispatch
+   > substitutes with the rendered prompt (see `docs/ROUTES.md`). Keep it in
+   > any local `routes.local.yaml` override, or `agy` will exit immediately
+   > with `Error: empty prompt`.
 3. Clone the repository and change into it:
    ```bash
    git clone https://github.com/mcknly/robot-dev-team.git
@@ -128,12 +142,29 @@ For multi-project setups, add agents at the **Group** level so access is inherit
    - Set `GLAB_TOKEN` to your own PAT with `api` scope for the app process — used for procedural GitLab tasks (context enrichment, auto-unassign, termination comments) and is separate from the per-agent tokens.
    - Set `GLAB_HOST` to your GitLab instance hostname.
    - Set `GITLAB_WEBHOOK_SECRET` to a shared secret token (this must match the value configured in the GitLab webhook settings in step 9) - _optionally leave blank_.
-   - Set `CLAUDE_MODEL`, `GEMINI_MODEL`, and `CODEX_MODEL` to the desired default model for each agent (e.g., `claude-opus-4-6`, `gemini-3.1-pro-preview`, `gpt-5.4`). These are required when the default `routes.yaml` references `${..._MODEL}` placeholders -- if your routes hard-code the model value or omit `--model`, the corresponding variable can be skipped.
+   - Set `CLAUDE_MODEL`, `GEMINI_MODEL`, and `CODEX_MODEL` to the desired default model for each agent (e.g., `claude-opus-5`, `gemini-3.6-flash-high`, `gpt-5.6-sol`). These are required when the default `routes.yaml` references `${..._MODEL}` placeholders; the service will not start if a referenced model variable is missing or blank. If your routes hard-code the model value or omit `--model`, the corresponding variable can be skipped. **`GEMINI_MODEL` takes one of the stable model slugs printed by `agy models`**, which encode the reasoning-effort tier and need no quoting; this form requires the Antigravity CLI at version 1.1.5 or newer. Older builds (>= 1.1.1) accept only the friendly form -- `"Gemini 3.6 Flash (High)"`, quoted because it contains spaces and parentheses -- which newer builds still honor. List the names available to your account with `docker compose exec -u appuser app agy models` (or plain `agy models` for a local install) -- `agy` is installed inside the container, so it is normally not on your host `PATH`:
+
+     ```console
+     $ docker compose exec -u appuser app agy models
+     gemini-3.6-flash-high
+     gemini-3.6-flash-medium
+     gemini-3.6-flash-low
+     gemini-3.5-flash-high
+     gemini-3.5-flash-medium
+     gemini-3.5-flash-low
+     gemini-3.1-pro-high
+     gemini-3.1-pro-low
+     claude-sonnet-4-6
+     claude-opus-4-6-thinking
+     gpt-oss-120b-medium
+     ```
+
+     The list is fetched per account, so treat the CLI's output -- not this snapshot -- as the source of truth.
    - Set `LOCAL_UID` / `LOCAL_GID` to your local user/group ID (use `id -u` / `id -g` - docker-compose defaults to 1000; mismatches will cause bind-mount permission errors).
    - See `docs/ENVIRONMENT.md` for the full variable reference.
    - To **omit a default agent**, remove its route entries from `routes.yaml`, remove it from `ALL_MENTIONS_AGENTS` (if set), and optionally remove its env vars and Docker volume mounts. See the "Removing an Agent" section in `docs/ADDING_AN_AGENT.md` for details.
 5. Edit `docker-compose.yml` to set the project volume mount paths (the `./projects:/work/projects` lines) to a local directory that will serve as the working directory for project repositories. This directory can start empty — with `ENABLE_AUTO_CLONE=true`, projects are cloned automatically on first webhook trigger using the `<namespace>/<project-name>` structure. You can also pre-clone repositories here if preferred.
-6. Configure routing rules for your GitLab username. Copy `config/routes.yaml` to `config/routes.local.yaml`, replace `your-username` with your GitLab username, and add `ROUTE_CONFIG_PATH=config/routes.local.yaml` to your `.env`. This keeps your local configuration separate from the shipped defaults.
+6. Configure routing rules for your GitLab username. Copy `config/routes.yaml` to `config/routes.local.yaml`, replace `your-username` with your GitLab username (or a list of usernames such as `author: ["alice", "bob"]` to authorize multiple operators on the same route — matching is case-insensitive in both forms), and add `ROUTE_CONFIG_PATH=config/routes.local.yaml` to your `.env`. This keeps your local configuration separate from the shipped defaults.
 7. Ensure your account can run Docker without `sudo`:
    ```bash
    sudo usermod -aG docker "$USER"
@@ -147,7 +178,7 @@ For multi-project setups, add agents at the **Group** level so access is inherit
 9. Configure the GitLab webhook to point at `http://localhost:8080/webhooks/gitlab` (or your tunnel URL) and send a test event. See [`docs/GITLAB_WEBHOOKS.md`](docs/GITLAB_WEBHOOKS.md) for detailed webhook configuration including event selection and secret token setup, or [`docs/GROUP_SETUP.md`](docs/GROUP_SETUP.md) for automated webhook provisioning via File Hooks. Set `LIVE_DASHBOARD_ENABLED=true` in `.env` to enable the live dashboard at `/dashboard`. Set `DEBUG_RELOAD_ROUTES=true`, configure a route in your routes file (e.g., `config/routes.local.yaml`), trigger the event, confirm a run log appears on the dashboard and in `run-logs/`.
 
 ### macOS (with Docker Desktop)
-1. Install Node.js via Homebrew and add the agent CLIs (follow latest guides)
+1. Install the agent CLIs using each vendor's native installer (see the Linux section above).
 2. Authenticate each CLI so credentials live under `~/.claude`, `~/.gemini`, and `~/.codex` (as above).
 3. Install Docker Desktop for Mac and ensure it is running (`docker info` should succeed in a new terminal).
 4. Clone the repository, configure `.env`, and edit volume mount paths as in steps 3-6 of the Linux section.
@@ -159,8 +190,8 @@ For multi-project setups, add agents at the **Group** level so access is inherit
 
 ### Windows (WSL + Docker Desktop)
 1. Install WSL2 (`wsl --install -d Ubuntu`) and Docker Desktop, enabling Docker WSL integration for your distribution.
-2. Inside the WSL shell, install Node.js with `nvm` as in the Linux section.
-3. Install & authenticate the agent CLIs as above.
+2. Inside the WSL shell, install the agent CLIs using each vendor's native installer (see the Linux section above).
+3. Authenticate each CLI as above.
 4. Install Git and clone the repository inside the WSL filesystem (e.g., `/home/<user>/robot-dev-team`). Configure `.env` and edit volume mount paths as in steps 3-6 of the Linux section.
 5. Make sure your WSL user belongs to the `docker` group (`sudo usermod -aG docker "$USER"` and `newgrp docker`), then start the stack:
    ```bash
@@ -209,7 +240,6 @@ scripts/
   generate-sbom.sh         # SBOM extraction helper
 tests/             # Pytest suite (mocked glab/agent subprocesses)
 run-logs/          # Per-event agent output (populated at runtime)
-npm-cache/         # Shared npm cache volume for agent CLIs
 gitlab/            # Reference GitLab CE deployment & File Hook script
 docker-entrypoint.sh       # Container entrypoint (credentials, CLI install)
 docker-compose.yml
@@ -226,9 +256,8 @@ LICENSE
 ## Prerequisites
 When running outside Docker:
 - Python 3.12 or newer
-- Node.js + npm (installs agent CLIs during startup)
 - GitLab CLI (`glab`)
-- Agent CLIs (`claude`, `gemini`, `codex`, etc.) accessible on `$PATH`
+- Agent CLIs (`claude`, `agy`, `codex`, etc.) accessible on `$PATH` — the default agents use native installers, so Node.js / npm are not required. The **exception** is the optional Pi harness: it is an npm package needing Node >=22.19.0. Inside Docker, `scripts/install-pi.sh` bootstraps a pinned user-local Node automatically; running **outside** Docker with Pi enabled, you must provide Node >=22.19.0 and `pi` on `$PATH` yourself.
 - Git access to repositories referenced by incoming events
 
 ## Configuration
@@ -239,7 +268,7 @@ When running outside Docker:
    - `GLAB_TOKEN` — a PAT with `api` scope for the app process, used for procedural GitLab tasks such as context enrichment, auto-unassign, and termination comments (separate from the per-agent tokens). See `docs/ENVIRONMENT.md` for scope details.
    - `GITLAB_WEBHOOK_SECRET` — shared token configured in GitLab project webhook settings (leave empty if GitLab and the listener share a trusted network/host).
    - `CLAUDE_AGENT_GITLAB_TOKEN`, `GEMINI_AGENT_GITLAB_TOKEN`, `CODEX_AGENT_GITLAB_TOKEN` — personal access tokens for each agent account. On startup the entrypoint mirrors these into `~/.claude/glab-token`, `~/.gemini/glab-token`, and `~/.codex/glab-token` (with `0600` permissions) so sandboxed agent subprocesses can still authenticate even if environment variables are stripped.
-   - `CLAUDE_MODEL`, `GEMINI_MODEL`, `CODEX_MODEL` — default model for each agent (e.g., `claude-opus-4-6`, `gemini-3.1-pro-preview`, `gpt-5.4`).
+   - `CLAUDE_MODEL`, `GEMINI_MODEL`, `CODEX_MODEL` — default model for each agent (e.g., `claude-opus-5`, `gemini-3.6-flash-high`, `gpt-5.6-sol`). Referenced model variables must be set and non-empty or startup fails. `GEMINI_MODEL` must be one of the names printed by `agy models` (list them with `docker compose exec -u appuser app agy models`); the slug form requires `agy` >= 1.1.5, and the older friendly form works on `agy` >= 1.1.1.
    - `LOCAL_UID` / `LOCAL_GID` — set to `id -u` / `id -g` so the container remaps `appuser` to your host identity (defaults to 1000 if unset).
    - See `docs/ENVIRONMENT.md` for the full variable reference including optional settings (timeouts, log pruning, branch switching, dashboard, etc.).
 2. Edit the project volume mount paths in `docker-compose.yml` (the `./projects:/work/projects` lines) to a local directory that will serve as the working directory for project repositories. This can start empty — with `ENABLE_AUTO_CLONE=true`, projects are cloned automatically on first webhook trigger using the `<namespace>/<project-name>` structure. The container mounts the directory to `/work/projects` (read-write) and `/work/projects-ro` (read-only); routes use the `access` field to determine which mount the agent receives.
@@ -292,8 +321,10 @@ Common flows:
 - `gitlab-connect issue create --title "Bug" --file body.md`
 - `gitlab-connect issue comment 42 --file reply.md`
 - `gitlab-connect issue view 42` (includes comments and activities)
+- `gitlab-connect issue list --state opened --author alice` (pass-through to `glab issue list`)
 - `gitlab-connect mr comment 17 --file feedback.md`
 - `gitlab-connect mr view 17`
+- `gitlab-connect mr list --source-branch feature/foo` (pass-through to `glab mr list`)
 
 Pass additional `glab issue`/`glab mr` flags after `--`.
 
@@ -333,11 +364,10 @@ docker compose up --build
 ```
 
 Key volume bindings in `docker-compose.yml`:
-- `~/.claude`, `~/.gemini`, `~/.codex` mount directly into the container user's home. Because the container remaps `appuser` to your host UID/GID, the CLIs reuse the same credentials and the entrypoint writes token mirrors (`glab-token`) back onto the host for sandboxed agent use. Set `LOCAL_UID` / `LOCAL_GID` in `.env` (typically `id -u` / `id -g`) so the container remaps `appuser` to your host identity before startup; `docker-compose.yml` falls back to 1000 when unset.
-- `./npm-cache` — caches global npm installs for agent CLIs.
+- `~/.claude`, `~/.gemini`, `~/.codex` mount directly into the container user's home. Because the container remaps `appuser` to your host UID/GID, the CLIs reuse the same credentials and the entrypoint writes token mirrors (`glab-token`) back onto the host for sandboxed agent use. The Antigravity CLI keeps its state under `~/.gemini/antigravity-cli/` so the existing `~/.gemini` bind mount covers both the legacy Gemini auth and the new harness settings. Set `LOCAL_UID` / `LOCAL_GID` in `.env` (typically `id -u` / `id -g`) so the container remaps `appuser` to your host identity before startup; `docker-compose.yml` falls back to 1000 when unset.
 - `./projects` (configurable in `docker-compose.yml`) — parent directory containing all project repositories. Mounted twice: read-write at `/work/projects` and read-only at `/work/projects-ro`. Projects should be organized as `<namespace>/<project-name>` to match GitLab's path structure. Routes with `access: readonly` use the read-only mount (default), while `access: readwrite` routes use the writable mount.
 
-The entrypoint verifies that the npm cache directory is writable, falling back to `/tmp/npm-cache` if not. If the bind-mount is owned by the host user, ensure it is group/world writable (e.g., `chmod 777 npm-cache`) or point `NPM_CONFIG_CACHE` at a writable path so CLI installation succeeds. Run-log writes fall back to `/tmp/run-logs` automatically if the primary directory is not writable.
+Run-log writes fall back to `/tmp/run-logs` automatically if the primary directory is not writable.
 
 The container runs as a non-root `appuser`, installs agent CLIs on startup via `docker-entrypoint.sh`, and launches FastAPI with Uvicorn. Update environment variables in `.env` or compose overrides before deployment.
 
@@ -350,11 +380,12 @@ The container runs as a non-root `appuser`, installs agent CLIs on startup via `
 
 ### Dependency Licenses
 
-Verified against `uv.lock` on March 15, 2026.
+Verified against `uv.lock` on August 3, 2026.
 
 | Dependency | Version | License | Notes |
 | --- | --- | --- | --- |
-| fastapi | 0.135.1 | MIT | Includes Starlette and Pydantic under the same permissive terms. |
+| fastapi | 0.141.1 | MIT | Includes Pydantic under the same permissive terms. |
+| starlette | 1.3.1 | BSD-3-Clause | Direct pin so the ASGI layer tracks security releases independently of FastAPI's floor. |
 | uvicorn | 0.41.0 | BSD-3-Clause | Redistribute with attribution notice retained. |
 | pydantic-settings | 2.13.1 | MIT | Shares the Pydantic license terms. |
 | pyyaml | 6.0.3 | MIT | No additional obligations beyond notice preservation. |
@@ -386,7 +417,15 @@ Verified against `uv.lock` on March 15, 2026.
 - **Agent command not found** — verify CLI executables exist on the host or inside the container and update `agents[].options.command` if using custom wrappers.
 - **`glab` failures** — confirm `GLAB_HOST` and tokens are configured; run `glab auth status` inside the container to debug.
 - **Permission issues accessing repositories** — make sure compose volume paths map to directories accessible by the Docker daemon and align with the `appuser` UID (`LOCAL_UID`, defaults to 1000 in `docker-compose.yml`).
-- **npm cache permission errors** — adjust permissions on the host cache directory or set `NPM_CONFIG_CACHE=/tmp/npm-cache` before `docker compose up`.
+- **`agy` hangs or waits for trust/permission prompt** — confirm the gemini route args include `--dangerously-skip-permissions` (the verbatim Claude flag name, which `agy` also accepts). `--yolo` / `--skip-trust` do not exist on `agy`.
+- **`agy` exits with `flags provided but not defined: -model`** — the installed Antigravity CLI predates 1.1.1, which is where `--model` landed. Re-run `scripts/install-gemini.sh` (or `curl -fsSL https://antigravity.google/cli/install.sh | bash`) to pick up a current build, or drop `--model ${GEMINI_MODEL}` from the gemini routes to fall back to the model selected in `~/.gemini/antigravity-cli/`.
+- **Gemini dispatches fail with `invalid model selection`** — `GEMINI_MODEL` does not match anything `agy models` prints. Since 1.1.5 `agy` validates `--model` and aborts with exit 1, listing the models your account can use; the dispatch fails loudly rather than silently downgrading. Note that `agy` slugs are its own identifiers (e.g. `gemini-3.6-flash-high`), not Google SDK model IDs -- something like `gemini-3.1-pro-preview` is rejected. On builds older than 1.1.5, slugs are unrecognized and only the friendly form (`"Gemini 3.6 Flash (High)"`) works; those builds also ignore a bad value silently and fall back to `Gemini 3.5 Flash (Medium)` with exit 0, so upgrade if you are chasing a model that never took effect. To confirm what actually ran, dispatch with `--log-file` and look for `Propagating selected model override to backend: label="..."`.
+- **`agy` exits immediately with `Error: empty prompt`** — the gemini route is relying on the stdin prompt handoff, which `agy` does not support. Its `-p` / `--print` flag takes the prompt as the flag's *value*. Ensure the route args end with `"-p", "${PROMPT}"` so dispatch substitutes the rendered prompt into argv (see `docs/ROUTES.md`); a bare `-p` or `-p ""` produces this error.
+- **`agy` reports "Authentication required" inside the container** — the Antigravity OAuth credential file is missing at `~/.gemini/antigravity-cli/antigravity-oauth-token`. Run the one-time bootstrap so the token lands on the host-mounted `~/.gemini` directory and gets inherited by every container start:
+  ```bash
+  docker compose run --rm app agy
+  ```
+  The default entrypoint runs the UID/GID remap and installs `agy` before exec'ing it as `appuser`, so the resulting token file is owned by the same UID that normal webhook dispatch uses. Complete the Google sign-in in the browser when `agy` prints the URL. The Gemini preflight in `app/services/agents.py` writes the same message into the run log when the file is absent, so you'll see it without `agy`'s 30-second OAuth-callback timeout.
 - **Run-log write failures** — ensure `run-logs/` is writable by the container user or remove the bind mount to fall back to `/tmp/run-logs`.
 - **Inotify watcher exhaustion** — heavy file watchers (Claude’s dev server, VS Code, Expo, etc.) can consume the host inotify budget and trigger `Too many open files`. Inspect usage with `sudo inotifywatch -r .` or `find /proc/*/fd`, bump the host sysctls (`sudo sysctl fs.inotify.max_user_watches=262144 fs.inotify.max_user_instances=512`), and restart the services. The FastAPI container inherits these limits; use `sysctls:` in compose if you need to lower them per container.
 - **Queued triggers backing up** — check application logs for slow agent runs; the trigger queue processes mention-level jobs sequentially, so one long task can delay others.
@@ -394,6 +433,20 @@ Verified against `uv.lock` on March 15, 2026.
 
 ## Additional Documentation
 
+**Source publication note.** Public `main` and stable release artifacts on GitHub are a one-way
+publication of this project's canonical workflow, which runs on a private self-hosted GitLab
+instance. GitHub Issues and pull requests are public intake. The container image is published at
+[`docker.io/mcknly/robot-dev-team`](https://hub.docker.com/r/mcknly/robot-dev-team) from the first
+public release. Each GitHub Release carries a **publication receipt** binding the published image
+digests to the source commit and tree they were built from. The SBOM and vulnerability evidence for
+that digest are **not published yet** -- they name the canonical instance by construction, so the
+receipt pins their SHA-256 instead; see the mirror policy for that gap. The checked-in
+`sbom/sbom.spdx.json` is a reference document and describes no published image. See [Contributing](docs/CONTRIBUTING.md), [Security](SECURITY.md), and the
+[mirror policy](docs/MIRRORING.md).
+
+- `docs/CI.md` — GitLab CI runner, validation, image publication, and pull-by-digest workflow.
+- `docs/RELEASING.md` — protected stable tags, SemVer image aliases, and release recovery.
+- `docs/MIRRORING.md` — canonical-source policy, public mirror contract, and no-reverse-sync rule.
 - `docs/ADD_NEW_PROJECT.md` — checklist for adding a new project to an existing deployment.
 - `docs/ENVIRONMENT.md` — environment variables, `.env` samples, and Compose overrides.
 - `docs/AGENT_ONBOARDING.md` — setup checklist for Linux and Windows (WSL) operators.
@@ -407,4 +460,5 @@ Verified against `uv.lock` on March 15, 2026.
 - `docs/ADDING_AN_AGENT.md` — step-by-step guide for onboarding a custom agent CLI (BYOA).
 - `docs/ROUTES.md` — routing rule schema, field reference, and configuration examples.
 - `docs/SANITIZATION_REPORT.md` — pre-release sanitization audit results.
+- `docs/LICENSE_REVIEW.md` — license classification of the release image's SBOM and the obligations redistributing it carries.
 - `gitlab/readme-gitlab.md` — reference GitLab CE deployment and upgrade path.

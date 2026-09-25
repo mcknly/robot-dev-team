@@ -15,13 +15,44 @@ from app.services import branch_resolver
 from app.services.branch_resolver import (
     BackupRecord,
     BranchResult,
+    _as_optional_int,
+    _as_optional_str,
+    _fetch_closes_issues_batch,
+    _get_branch_from_mr_event,
+    _lookup_issue_branch,
+    _smart_select_branch,
     get_branch_context,
     resolve_branch,
-    _get_branch_from_mr_event,
-    _smart_select_branch,
-    _fetch_closes_issues_batch,
-    _lookup_issue_branch,
 )
+
+
+class TestBoundaryNarrowing:
+    """The isinstance-based boundary helpers narrow untyped webhook/API values.
+
+    Regression guard for issue #37: malformed source_branch/iid values must
+    surface as None (or be skipped) rather than leaking an untyped value.
+    """
+
+    @pytest.mark.parametrize("value", ["feature/x", ""])
+    def test_as_optional_str_passes_strings(self, value):
+        assert _as_optional_str(value) == value
+
+    @pytest.mark.parametrize("value", [None, 42, 1.5, ["feature/x"], {"a": 1}, True])
+    def test_as_optional_str_rejects_non_strings(self, value):
+        assert _as_optional_str(value) is None
+
+    @pytest.mark.parametrize("value", [0, 1, 42, -3])
+    def test_as_optional_int_passes_ints(self, value):
+        assert _as_optional_int(value) == value
+
+    @pytest.mark.parametrize("value", [None, "42", 1.5, ["7"], {"iid": 7}])
+    def test_as_optional_int_rejects_non_ints(self, value):
+        assert _as_optional_int(value) is None
+
+    def test_as_optional_int_rejects_bool(self):
+        # bool is an int subclass; a JSON `true` must not read as iid 1.
+        assert _as_optional_int(True) is None
+        assert _as_optional_int(False) is None
 
 
 class TestGetBranchFromMrEvent:
@@ -170,14 +201,14 @@ async def test_resolve_branch_mr_event_extracts_source_branch(monkeypatch, tmp_p
     async def mock_get_current_branch(working_dir):
         return current_branch
 
-    async def mock_is_working_tree_clean(working_dir):
-        return True
+    async def mock_classify_dirty_state(working_dir):
+        return "clean"
 
     async def mock_checkout_branch(working_dir, branch, agent="unknown"):
         return BranchResult(success=True, branch=branch, switched=True)
 
     monkeypatch.setattr(branch_resolver, "_get_current_branch", mock_get_current_branch)
-    monkeypatch.setattr(branch_resolver, "_is_working_tree_clean", mock_is_working_tree_clean)
+    monkeypatch.setattr(branch_resolver, "_classify_dirty_state", mock_classify_dirty_state)
     monkeypatch.setattr(branch_resolver, "_checkout_branch", mock_checkout_branch)
 
     event = {
@@ -242,8 +273,8 @@ async def test_resolve_branch_dirty_tree_creates_backup(monkeypatch, tmp_path):
     async def mock_get_current_branch(working_dir):
         return "main"
 
-    async def mock_is_working_tree_clean(working_dir):
-        return False
+    async def mock_classify_dirty_state(working_dir):
+        return "dirty"
 
     async def mock_create_backup_branch(working_dir, current_branch, agent):
         return BranchResult(
@@ -255,7 +286,7 @@ async def test_resolve_branch_dirty_tree_creates_backup(monkeypatch, tmp_path):
         return BranchResult(success=True, branch=branch, switched=True)
 
     monkeypatch.setattr(branch_resolver, "_get_current_branch", mock_get_current_branch)
-    monkeypatch.setattr(branch_resolver, "_is_working_tree_clean", mock_is_working_tree_clean)
+    monkeypatch.setattr(branch_resolver, "_classify_dirty_state", mock_classify_dirty_state)
     monkeypatch.setattr(branch_resolver, "_create_backup_branch", mock_create_backup_branch)
     monkeypatch.setattr(branch_resolver, "_checkout_branch", mock_checkout_branch)
 
@@ -288,14 +319,14 @@ async def test_resolve_branch_dirty_tree_backup_fails(monkeypatch, tmp_path):
     async def mock_get_current_branch(working_dir):
         return "main"
 
-    async def mock_is_working_tree_clean(working_dir):
-        return False
+    async def mock_classify_dirty_state(working_dir):
+        return "dirty"
 
     async def mock_create_backup_branch(working_dir, current_branch, agent):
         return BranchResult(success=False, error="Push failed")
 
     monkeypatch.setattr(branch_resolver, "_get_current_branch", mock_get_current_branch)
-    monkeypatch.setattr(branch_resolver, "_is_working_tree_clean", mock_is_working_tree_clean)
+    monkeypatch.setattr(branch_resolver, "_classify_dirty_state", mock_classify_dirty_state)
     monkeypatch.setattr(branch_resolver, "_create_backup_branch", mock_create_backup_branch)
 
     event = {
@@ -324,14 +355,14 @@ async def test_resolve_branch_checkout_fails_clean_tree_continues(monkeypatch, t
     async def mock_get_current_branch(working_dir):
         return "main"
 
-    async def mock_is_working_tree_clean(working_dir):
-        return True
+    async def mock_classify_dirty_state(working_dir):
+        return "clean"
 
     async def mock_checkout_branch(working_dir, branch, agent="unknown"):
         return BranchResult(success=False, error="Branch does not exist")
 
     monkeypatch.setattr(branch_resolver, "_get_current_branch", mock_get_current_branch)
-    monkeypatch.setattr(branch_resolver, "_is_working_tree_clean", mock_is_working_tree_clean)
+    monkeypatch.setattr(branch_resolver, "_classify_dirty_state", mock_classify_dirty_state)
     monkeypatch.setattr(branch_resolver, "_checkout_branch", mock_checkout_branch)
 
     event = {
@@ -363,14 +394,14 @@ async def test_resolve_branch_note_on_mr(monkeypatch, tmp_path):
     async def mock_get_current_branch(working_dir):
         return "main"
 
-    async def mock_is_working_tree_clean(working_dir):
-        return True
+    async def mock_classify_dirty_state(working_dir):
+        return "clean"
 
     async def mock_checkout_branch(working_dir, branch, agent="unknown"):
         return BranchResult(success=True, branch=branch, switched=True)
 
     monkeypatch.setattr(branch_resolver, "_get_current_branch", mock_get_current_branch)
-    monkeypatch.setattr(branch_resolver, "_is_working_tree_clean", mock_is_working_tree_clean)
+    monkeypatch.setattr(branch_resolver, "_classify_dirty_state", mock_classify_dirty_state)
     monkeypatch.setattr(branch_resolver, "_checkout_branch", mock_checkout_branch)
 
     event = {
@@ -405,8 +436,8 @@ async def test_resolve_branch_issue_event_no_mr_uses_default(monkeypatch, tmp_pa
     async def mock_get_current_branch(working_dir):
         return "feature/old-branch"
 
-    async def mock_is_working_tree_clean(working_dir):
-        return True
+    async def mock_classify_dirty_state(working_dir):
+        return "clean"
 
     async def mock_lookup_issue_branch(project_path, issue_iid):
         return None  # No linked MR
@@ -418,7 +449,7 @@ async def test_resolve_branch_issue_event_no_mr_uses_default(monkeypatch, tmp_pa
         return BranchResult(success=True, branch=branch, switched=True)
 
     monkeypatch.setattr(branch_resolver, "_get_current_branch", mock_get_current_branch)
-    monkeypatch.setattr(branch_resolver, "_is_working_tree_clean", mock_is_working_tree_clean)
+    monkeypatch.setattr(branch_resolver, "_classify_dirty_state", mock_classify_dirty_state)
     monkeypatch.setattr(branch_resolver, "_lookup_issue_branch", mock_lookup_issue_branch)
     monkeypatch.setattr(branch_resolver, "_get_default_branch", mock_get_default_branch)
     monkeypatch.setattr(branch_resolver, "_checkout_branch", mock_checkout_branch)
@@ -451,8 +482,8 @@ async def test_resolve_branch_issue_with_linked_mr(monkeypatch, tmp_path):
     async def mock_get_current_branch(working_dir):
         return "main"
 
-    async def mock_is_working_tree_clean(working_dir):
-        return True
+    async def mock_classify_dirty_state(working_dir):
+        return "clean"
 
     async def mock_lookup_issue_branch(project_path, issue_iid):
         return "feature/issue-42"  # Linked MR branch
@@ -461,7 +492,7 @@ async def test_resolve_branch_issue_with_linked_mr(monkeypatch, tmp_path):
         return BranchResult(success=True, branch=branch, switched=True)
 
     monkeypatch.setattr(branch_resolver, "_get_current_branch", mock_get_current_branch)
-    monkeypatch.setattr(branch_resolver, "_is_working_tree_clean", mock_is_working_tree_clean)
+    monkeypatch.setattr(branch_resolver, "_classify_dirty_state", mock_classify_dirty_state)
     monkeypatch.setattr(branch_resolver, "_lookup_issue_branch", mock_lookup_issue_branch)
     monkeypatch.setattr(branch_resolver, "_checkout_branch", mock_checkout_branch)
 
@@ -517,8 +548,8 @@ async def test_lookup_issue_branch_uses_glab_env(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_lookup_issue_branch_timeout(monkeypatch):
     """_lookup_issue_branch should timeout and return None."""
-    from app.services import branch_resolver
     from app.core.config import settings
+    from app.services import branch_resolver
 
     monkeypatch.setattr(settings, "glab_timeout_seconds", 0.01)
 
@@ -552,8 +583,8 @@ async def test_backup_push_failure_is_fatal(monkeypatch, tmp_path):
     async def mock_get_current_branch(working_dir):
         return "main"
 
-    async def mock_is_working_tree_clean(working_dir):
-        return False
+    async def mock_classify_dirty_state(working_dir):
+        return "dirty"
 
     call_count = {"backup_created": False}
 
@@ -567,7 +598,7 @@ async def test_backup_push_failure_is_fatal(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr(branch_resolver, "_get_current_branch", mock_get_current_branch)
-    monkeypatch.setattr(branch_resolver, "_is_working_tree_clean", mock_is_working_tree_clean)
+    monkeypatch.setattr(branch_resolver, "_classify_dirty_state", mock_classify_dirty_state)
     monkeypatch.setattr(branch_resolver, "_create_backup_branch", mock_create_backup_branch)
 
     event = {
@@ -954,10 +985,8 @@ class TestCheckoutBranchAheadHandling:
         """Fails checkout if backup push fails when ahead check fails (unknown state)."""
         call_sequence = {"index": 0}
         # Expected: fetch, checkout, rev-list (fails), branch (backup), push (fails)
-        expected_sequence = ["fetch", "checkout", "rev-list", "branch", "push"]
 
         async def mock_create_subprocess_exec(*args, **kwargs):
-            idx = call_sequence["index"]
             call_sequence["index"] += 1
 
             # rev-list (index 2) fails, push (index 4) fails
@@ -1804,8 +1833,6 @@ class TestSmartBranchSelectionIntegration:
 
         captured_note_body = {}
 
-        original_lookup = _lookup_issue_branch
-
         async def mock_lookup(project_path, issue_iid, note_body=""):
             captured_note_body["value"] = note_body
             return "feature/from-note"
@@ -1813,15 +1840,15 @@ class TestSmartBranchSelectionIntegration:
         async def mock_get_current_branch(working_dir):
             return "main"
 
-        async def mock_is_working_tree_clean(working_dir):
-            return True
+        async def mock_classify_dirty_state(working_dir):
+            return "clean"
 
         async def mock_checkout_branch(working_dir, branch, agent="unknown"):
             return BranchResult(success=True, branch=branch, switched=True)
 
         monkeypatch.setattr(branch_resolver, "_lookup_issue_branch", mock_lookup)
         monkeypatch.setattr(branch_resolver, "_get_current_branch", mock_get_current_branch)
-        monkeypatch.setattr(branch_resolver, "_is_working_tree_clean", mock_is_working_tree_clean)
+        monkeypatch.setattr(branch_resolver, "_classify_dirty_state", mock_classify_dirty_state)
         monkeypatch.setattr(branch_resolver, "_checkout_branch", mock_checkout_branch)
 
         event = {
@@ -1861,15 +1888,15 @@ class TestSmartBranchSelectionIntegration:
         async def mock_get_current_branch(working_dir):
             return "main"
 
-        async def mock_is_working_tree_clean(working_dir):
-            return True
+        async def mock_classify_dirty_state(working_dir):
+            return "clean"
 
         async def mock_checkout_branch(working_dir, branch, agent="unknown"):
             return BranchResult(success=True, branch=branch, switched=True)
 
         monkeypatch.setattr(branch_resolver, "_lookup_issue_branch", mock_lookup)
         monkeypatch.setattr(branch_resolver, "_get_current_branch", mock_get_current_branch)
-        monkeypatch.setattr(branch_resolver, "_is_working_tree_clean", mock_is_working_tree_clean)
+        monkeypatch.setattr(branch_resolver, "_classify_dirty_state", mock_classify_dirty_state)
         monkeypatch.setattr(branch_resolver, "_checkout_branch", mock_checkout_branch)
 
         event = {
@@ -1963,7 +1990,12 @@ class TestSmartBranchSelectionIntegration:
         assert result == "fix/proper-fix"
 
     @pytest.mark.asyncio
-    async def test_end_to_end_note_mention_steers_branch(self, monkeypatch, tmp_path):
+    # noqa rationale: the branching lives in the nested subprocess mock, which
+    # routes each git/glab-API call to a canned response. Keeping that routing
+    # inline next to the event payload and assertions is what makes this
+    # end-to-end test legible; hoisting it to a module-level responder would
+    # fragment the scenario. Narrow, per-test suppression (see issue #37).
+    async def test_end_to_end_note_mention_steers_branch(self, monkeypatch, tmp_path):  # noqa: C901
         """Full path: resolve_branch -> note event -> smart selection with note mention.
 
         Exercises the complete call chain with subprocess mocks to verify
@@ -2009,14 +2041,14 @@ class TestSmartBranchSelectionIntegration:
         async def mock_get_current_branch(working_dir):
             return "main"
 
-        async def mock_is_working_tree_clean(working_dir):
-            return True
+        async def mock_classify_dirty_state(working_dir):
+            return "clean"
 
         async def mock_checkout_branch(working_dir, branch, agent="unknown"):
             return BranchResult(success=True, branch=branch, switched=True)
 
         monkeypatch.setattr(branch_resolver, "_get_current_branch", mock_get_current_branch)
-        monkeypatch.setattr(branch_resolver, "_is_working_tree_clean", mock_is_working_tree_clean)
+        monkeypatch.setattr(branch_resolver, "_classify_dirty_state", mock_classify_dirty_state)
         monkeypatch.setattr(branch_resolver, "_checkout_branch", mock_checkout_branch)
 
         event = {
@@ -2051,8 +2083,8 @@ async def test_sync_dual_backup_both_uncommitted_and_ahead(monkeypatch):
     async def mock_authenticate_git(agent):
         return True
 
-    async def mock_is_working_tree_clean(working_dir):
-        return False
+    async def mock_classify_dirty_state(working_dir):
+        return "dirty"
 
     backup_call_count = {"uncommitted": 0, "commits": 0}
 
@@ -2082,7 +2114,7 @@ async def test_sync_dual_backup_both_uncommitted_and_ahead(monkeypatch):
         return FakeProc()
 
     monkeypatch.setattr(branch_resolver, "_authenticate_git", mock_authenticate_git)
-    monkeypatch.setattr(branch_resolver, "_is_working_tree_clean", mock_is_working_tree_clean)
+    monkeypatch.setattr(branch_resolver, "_classify_dirty_state", mock_classify_dirty_state)
     monkeypatch.setattr(branch_resolver, "_create_backup_branch", mock_create_backup_branch)
     monkeypatch.setattr(branch_resolver, "_backup_local_commits", mock_backup_local_commits)
     monkeypatch.setattr(branch_resolver, "_get_branch_divergence", mock_get_branch_divergence)
@@ -2110,8 +2142,8 @@ async def test_resolve_branch_dirty_tree_plus_checkout_ahead(monkeypatch, tmp_pa
     async def mock_get_current_branch(working_dir):
         return "old-branch"
 
-    async def mock_is_working_tree_clean(working_dir):
-        return False
+    async def mock_classify_dirty_state(working_dir):
+        return "dirty"
 
     async def mock_create_backup_branch(working_dir, current_branch, agent):
         return BranchResult(
@@ -2129,7 +2161,7 @@ async def test_resolve_branch_dirty_tree_plus_checkout_ahead(monkeypatch, tmp_pa
         )
 
     monkeypatch.setattr(branch_resolver, "_get_current_branch", mock_get_current_branch)
-    monkeypatch.setattr(branch_resolver, "_is_working_tree_clean", mock_is_working_tree_clean)
+    monkeypatch.setattr(branch_resolver, "_classify_dirty_state", mock_classify_dirty_state)
     monkeypatch.setattr(branch_resolver, "_create_backup_branch", mock_create_backup_branch)
     monkeypatch.setattr(branch_resolver, "_checkout_branch", mock_checkout_branch)
 
@@ -2168,8 +2200,8 @@ async def test_resolve_branch_dirty_backup_preserved_on_checkout_failure(monkeyp
     async def mock_get_current_branch(working_dir):
         return "old-branch"
 
-    async def mock_is_working_tree_clean(working_dir):
-        return False
+    async def mock_classify_dirty_state(working_dir):
+        return "dirty"
 
     async def mock_create_backup_branch(working_dir, current_branch, agent):
         return BranchResult(
@@ -2184,7 +2216,7 @@ async def test_resolve_branch_dirty_backup_preserved_on_checkout_failure(monkeyp
         )
 
     monkeypatch.setattr(branch_resolver, "_get_current_branch", mock_get_current_branch)
-    monkeypatch.setattr(branch_resolver, "_is_working_tree_clean", mock_is_working_tree_clean)
+    monkeypatch.setattr(branch_resolver, "_classify_dirty_state", mock_classify_dirty_state)
     monkeypatch.setattr(branch_resolver, "_create_backup_branch", mock_create_backup_branch)
     monkeypatch.setattr(branch_resolver, "_checkout_branch", mock_checkout_branch)
 
@@ -2213,7 +2245,8 @@ async def test_resolve_branch_dirty_backup_preserved_on_checkout_failure(monkeyp
 async def test_authenticate_git_timeout_returns_false():
     """A hanging glab-usr call is killed and _authenticate_git returns False."""
     import asyncio
-    from unittest.mock import patch, AsyncMock
+    from unittest.mock import AsyncMock, patch
+
     from app.services.git_runtime import git_auth_lock
 
     async def _hanging_communicate():
@@ -2241,8 +2274,7 @@ async def test_authenticate_git_timeout_returns_false():
 @pytest.mark.asyncio
 async def test_authenticate_git_normal_completes():
     """A fast glab-usr call completes normally with the timeout in place."""
-    import asyncio
-    from unittest.mock import patch, AsyncMock
+    from unittest.mock import AsyncMock, patch
 
     mock_proc = AsyncMock()
     mock_proc.communicate.return_value = (b"ok\n", b"")
@@ -2252,3 +2284,328 @@ async def test_authenticate_git_normal_completes():
         result = await branch_resolver._authenticate_git("claude")
 
     assert result is True
+
+
+class TestClassifyDirtyState:
+    """Tests for _classify_dirty_state: distinguishes submodule-only vs real edits.
+
+    Background: issue #15. `git status --porcelain` alone treats a submodule
+    gitlink mismatch as a dirty path, which previously caused auto-backup to
+    commit a misleading gitlink rollback. The classifier compares
+    --ignore-submodules=none against --ignore-submodules=all so the caller can
+    skip the backup in the submodule-only case.
+    """
+
+    @staticmethod
+    def _patch_porcelain(monkeypatch, *, full: bytes, files_only: bytes,
+                        full_rc: int = 0, files_only_rc: int = 0):
+        """Patch asyncio.create_subprocess_exec to return canned porcelain output.
+
+        Routes the two flavors of `git status --porcelain --ignore-submodules=<x>`
+        to distinct byte payloads / return codes.
+        """
+        calls = []
+
+        async def mock_create_subprocess_exec(*args, **kwargs):
+            calls.append(args)
+
+            class FakeProc:
+                def __init__(self, stdout: bytes, rc: int):
+                    self._stdout = stdout
+                    self.returncode = rc
+
+                async def communicate(self):
+                    return (self._stdout, b"")
+
+            if "--ignore-submodules=none" in args:
+                return FakeProc(full, full_rc)
+            if "--ignore-submodules=all" in args:
+                return FakeProc(files_only, files_only_rc)
+            # Anything else (e.g. submodule status) — return empty success
+            return FakeProc(b"", 0)
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", mock_create_subprocess_exec)
+        return calls
+
+    @pytest.mark.asyncio
+    async def test_clean_returns_clean(self, monkeypatch):
+        calls = self._patch_porcelain(monkeypatch, full=b"", files_only=b"")
+        state = await branch_resolver._classify_dirty_state("/dummy")
+        assert state == "clean"
+        # Only the first porcelain call is needed when full output is empty
+        assert any("--ignore-submodules=none" in c for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_submodule_only_unstaged(self, monkeypatch):
+        """Unstaged submodule ref mismatch (` M hermes-src`) classifies as submodule_only."""
+        self._patch_porcelain(
+            monkeypatch,
+            full=b" M hermes-src\n",
+            files_only=b"",
+        )
+        state = await branch_resolver._classify_dirty_state("/dummy")
+        assert state == "submodule_only"
+
+    @pytest.mark.asyncio
+    async def test_submodule_only_staged(self, monkeypatch):
+        """Staged submodule gitlink (`M  hermes-src`) also classifies as submodule_only."""
+        self._patch_porcelain(
+            monkeypatch,
+            full=b"M  hermes-src\n",
+            files_only=b"",
+        )
+        state = await branch_resolver._classify_dirty_state("/dummy")
+        assert state == "submodule_only"
+
+    @pytest.mark.asyncio
+    async def test_real_edit_returns_dirty(self, monkeypatch):
+        self._patch_porcelain(
+            monkeypatch,
+            full=b" M README.md\n",
+            files_only=b" M README.md\n",
+        )
+        state = await branch_resolver._classify_dirty_state("/dummy")
+        assert state == "dirty"
+
+    @pytest.mark.asyncio
+    async def test_mixed_changes_return_dirty(self, monkeypatch):
+        """Submodule mismatch PLUS a real file edit must still classify as dirty
+        so the existing backup behavior protects the file edit."""
+        self._patch_porcelain(
+            monkeypatch,
+            full=b" M hermes-src\n M README.md\n",
+            files_only=b" M README.md\n",
+        )
+        state = await branch_resolver._classify_dirty_state("/dummy")
+        assert state == "dirty"
+
+    @pytest.mark.asyncio
+    async def test_untracked_file_returns_dirty(self, monkeypatch):
+        self._patch_porcelain(
+            monkeypatch,
+            full=b"?? new_file.txt\n",
+            files_only=b"?? new_file.txt\n",
+        )
+        state = await branch_resolver._classify_dirty_state("/dummy")
+        assert state == "dirty"
+
+    @pytest.mark.asyncio
+    async def test_first_porcelain_failure_returns_dirty(self, monkeypatch):
+        """If git itself fails, fall back to dirty so backup still runs."""
+        self._patch_porcelain(
+            monkeypatch,
+            full=b"",
+            files_only=b"",
+            full_rc=128,
+        )
+        state = await branch_resolver._classify_dirty_state("/dummy")
+        assert state == "dirty"
+
+    @pytest.mark.asyncio
+    async def test_second_porcelain_failure_returns_dirty(self, monkeypatch):
+        """Second porcelain failure (rare) also falls back to dirty."""
+        self._patch_porcelain(
+            monkeypatch,
+            full=b" M hermes-src\n",
+            files_only=b"",
+            files_only_rc=128,
+        )
+        state = await branch_resolver._classify_dirty_state("/dummy")
+        assert state == "dirty"
+
+
+@pytest.mark.asyncio
+async def test_resolve_branch_submodule_only_skips_backup(monkeypatch, tmp_path):
+    """resolve_branch: submodule-only dirty paths must skip _create_backup_branch
+    and continue to checkout (issue #15)."""
+    monkeypatch.setattr(settings, "enable_branch_switch", True)
+
+    async def mock_get_current_branch(working_dir):
+        return "main"
+
+    async def mock_classify_dirty_state(working_dir):
+        return "submodule_only"
+
+    backup_called = {"count": 0}
+
+    async def mock_create_backup_branch(working_dir, current_branch, agent):
+        backup_called["count"] += 1
+        return BranchResult(
+            success=True,
+            backups=[BackupRecord(branch="should-not-exist", reason="uncommitted_changes")],
+        )
+
+    async def mock_checkout_branch(working_dir, branch, agent="unknown"):
+        return BranchResult(success=True, branch=branch, switched=True)
+
+    monkeypatch.setattr(branch_resolver, "_get_current_branch", mock_get_current_branch)
+    monkeypatch.setattr(branch_resolver, "_classify_dirty_state", mock_classify_dirty_state)
+    monkeypatch.setattr(branch_resolver, "_create_backup_branch", mock_create_backup_branch)
+    monkeypatch.setattr(branch_resolver, "_checkout_branch", mock_checkout_branch)
+
+    event = {
+        "object_kind": "merge_request",
+        "object_attributes": {
+            "source_branch": "feature/work",
+        },
+    }
+
+    result = await resolve_branch(
+        event=event,
+        project_path="group/project",
+        working_dir=str(tmp_path),
+        agent="claude",
+    )
+
+    assert result.success is True
+    assert result.branch == "feature/work"
+    assert result.switched is True
+    assert backup_called["count"] == 0
+    assert result.backup_branch is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_branch_submodule_only_checkout_fail_continues(monkeypatch, tmp_path):
+    """resolve_branch: submodule_only + checkout failure should follow the same
+    'continue on current branch' path as a clean tree (no backup ever existed)."""
+    monkeypatch.setattr(settings, "enable_branch_switch", True)
+
+    async def mock_get_current_branch(working_dir):
+        return "main"
+
+    async def mock_classify_dirty_state(working_dir):
+        return "submodule_only"
+
+    async def mock_create_backup_branch(*args, **kwargs):
+        raise AssertionError("backup must not be called for submodule_only")
+
+    async def mock_checkout_branch(working_dir, branch, agent="unknown"):
+        return BranchResult(success=False, error="branch missing on remote")
+
+    monkeypatch.setattr(branch_resolver, "_get_current_branch", mock_get_current_branch)
+    monkeypatch.setattr(branch_resolver, "_classify_dirty_state", mock_classify_dirty_state)
+    monkeypatch.setattr(branch_resolver, "_create_backup_branch", mock_create_backup_branch)
+    monkeypatch.setattr(branch_resolver, "_checkout_branch", mock_checkout_branch)
+
+    event = {
+        "object_kind": "merge_request",
+        "object_attributes": {"source_branch": "feature/missing"},
+    }
+
+    result = await resolve_branch(
+        event=event,
+        project_path="group/project",
+        working_dir=str(tmp_path),
+        agent="claude",
+    )
+
+    assert result.success is True
+    assert result.switched is False
+    assert result.branch == "main"
+    assert "Checkout failed" in result.error
+    assert result.backups == []
+
+
+@pytest.mark.asyncio
+async def test_sync_current_branch_submodule_only_skips_backup(monkeypatch):
+    """_sync_current_branch: submodule-only dirty paths skip uncommitted-changes
+    backup but still proceed with the reset/sync (issue #15)."""
+
+    async def mock_authenticate_git(agent):
+        return True
+
+    async def mock_classify_dirty_state(working_dir):
+        return "submodule_only"
+
+    async def mock_create_backup_branch(*args, **kwargs):
+        raise AssertionError("backup must not be called for submodule_only")
+
+    async def mock_get_branch_divergence(working_dir, branch):
+        return (2, 0)  # behind 2, ahead 0 → reset only, no commits backup
+
+    async def mock_create_subprocess_exec(*args, **kwargs):
+        class FakeProc:
+            returncode = 0
+            async def communicate(self):
+                return (b"", b"")
+        return FakeProc()
+
+    monkeypatch.setattr(branch_resolver, "_authenticate_git", mock_authenticate_git)
+    monkeypatch.setattr(branch_resolver, "_classify_dirty_state", mock_classify_dirty_state)
+    monkeypatch.setattr(branch_resolver, "_create_backup_branch", mock_create_backup_branch)
+    monkeypatch.setattr(branch_resolver, "_get_branch_divergence", mock_get_branch_divergence)
+    monkeypatch.setattr("asyncio.create_subprocess_exec", mock_create_subprocess_exec)
+
+    from app.services.branch_resolver import _sync_current_branch
+    result = await _sync_current_branch("/tmp/repo", "main", "claude")
+
+    assert result.success is True
+    assert result.backups == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_branch_e2e_submodule_only_via_porcelain(monkeypatch, tmp_path):  # noqa: C901
+    # noqa rationale: the branching lives in the nested subprocess mock, which
+    # feeds exact porcelain bytes per git invocation. Keeping that routing
+    # inline is what locks the parser against the issue #15 shape readably;
+    # hoisting it out would fragment the scenario. Narrow suppression (issue #37).
+    """End-to-end through the real _classify_dirty_state: feed actual porcelain
+    bytes for ` M hermes-src` and verify no backup is created.
+
+    Locks down the parser against the exact submodule-only output shape that
+    triggered issue #15.
+    """
+    monkeypatch.setattr(settings, "enable_branch_switch", True)
+
+    async def mock_get_current_branch(working_dir):
+        return "main"
+
+    backup_called = {"count": 0}
+
+    async def mock_create_backup_branch(*args, **kwargs):
+        backup_called["count"] += 1
+        return BranchResult(success=True, backups=[])
+
+    async def mock_checkout_branch(working_dir, branch, agent="unknown"):
+        return BranchResult(success=True, branch=branch, switched=True)
+
+    async def mock_create_subprocess_exec(*args, **kwargs):
+        class FakeProc:
+            def __init__(self, stdout: bytes):
+                self._stdout = stdout
+                self.returncode = 0
+            async def communicate(self):
+                return (self._stdout, b"")
+
+        # Submodule-only porcelain output: full reports the gitlink mismatch,
+        # files-only filter is empty.
+        if "status" in args and "--porcelain" in args:
+            if "--ignore-submodules=none" in args:
+                return FakeProc(b" M hermes-src\n")
+            if "--ignore-submodules=all" in args:
+                return FakeProc(b"")
+        # submodule status used for advisory logging
+        if args[:2] == ("git", "submodule"):
+            return FakeProc(b" 5a61c116e1453bfd579d75617ef59962a5f7866d hermes-src\n")
+        return FakeProc(b"")
+
+    monkeypatch.setattr(branch_resolver, "_get_current_branch", mock_get_current_branch)
+    monkeypatch.setattr(branch_resolver, "_create_backup_branch", mock_create_backup_branch)
+    monkeypatch.setattr(branch_resolver, "_checkout_branch", mock_checkout_branch)
+    monkeypatch.setattr("asyncio.create_subprocess_exec", mock_create_subprocess_exec)
+
+    event = {
+        "object_kind": "merge_request",
+        "object_attributes": {"source_branch": "feature/work"},
+    }
+
+    result = await resolve_branch(
+        event=event,
+        project_path="group/project",
+        working_dir=str(tmp_path),
+        agent="claude",
+    )
+
+    assert result.success is True
+    assert result.branch == "feature/work"
+    assert backup_called["count"] == 0

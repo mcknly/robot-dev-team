@@ -1,0 +1,459 @@
+# Robot Dev Team Project
+# File: .gitlab-ci.yml
+# Description: GitLab CI validation, image build, and protected release workflow.
+# License: MIT
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 MCKNLY LLC
+
+stages:
+  - validate
+  - image
+  - security
+  - release
+  - publish
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v/'
+    # The public-repository drift audit. Its pipeline runs that job alone.
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - when: never
+
+default:
+  interruptible: true
+
+validate:
+  stage: validate
+  tags:
+    - rdt-validate
+  image: python:3.14.7-slim-trixie@sha256:656d12e70054d5fda18a045e2494c96701e9792dd1445f95b3d038df954f57e9
+  # The one exclusion is the scheduled drift audit. A failed scheduled pipeline *is* the drift
+  # alert, so a test failure there would read as public drift. Every other pipeline the workflow
+  # admits -- merge requests, default-branch pushes, `v*` tags -- still runs this job.
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - when: on_success
+  variables:
+    UV_CACHE_DIR: "$CI_PROJECT_DIR/.uv-cache"
+    CLAUDE_MODEL: "ci-placeholder"
+    CODEX_MODEL: "ci-placeholder"
+    GEMINI_MODEL: "ci-placeholder"
+    GOOSE_GEMMA_MODEL: "ci-placeholder"
+    GROK_MODEL: "ci-placeholder"
+    OPENCODE_KIMI_MODEL: "ci-placeholder"
+    PI_NEMOTRON_MODEL: "ci-placeholder"
+  cache:
+    key: "uv-${CI_COMMIT_REF_SLUG}"
+    fallback_keys:
+      - "uv-${CI_DEFAULT_BRANCH}"
+    paths:
+      - .uv-cache/
+  # `git` here comes from the live Debian mirrors, not the `Dockerfile`'s `DEBIAN_SNAPSHOT`, and
+  # that is a recorded decision (#65): snapshot enforcement is scoped to the shipped image, the
+  # only artifact that carries a digest, an SBOM, and digest-keyed scan evidence for a
+  # reproducibility claim to bind to. This job contributes no package and no layer to that
+  # image, so nothing it installs can reach what ships. The claim is scoped to package contents
+  # rather than to "produces nothing published" because the latter is false for
+  # `release_contract` -- see the comment on that job.
+  #
+  # The version is logged rather than pinned. An exact `git=<version>` with no snapshot behind
+  # it is *less* reliable than none: Debian prunes superseded binaries from `deb.debian.org`, so
+  # the pin stops resolving at the next point release and the pipeline goes red on an unrelated
+  # commit. A version pin is only resolvable *because* of a snapshot. `tests/test_wrappers.py`
+  # exercises version-sensitive git behaviour -- credential helper-list reset semantics,
+  # host-scoped helper precedence across config scopes, `rev-parse --git-common-dir` in linked
+  # worktrees -- so if a git bump ever flips one of them, the job log is the only record of
+  # which build ran. See SECURITY.md and docs/CI.md.
+  before_script:
+    - apt-get update
+    - apt-get install --yes --no-install-recommends git
+    - rm -rf /var/lib/apt/lists/*
+    - git --version
+    - python -m pip install --disable-pip-version-check --no-cache-dir "uv==0.12.1"
+    - uv sync --frozen --extra dev --no-install-project
+  script:
+    - .venv/bin/ruff check --no-cache --no-fix .
+    - .venv/bin/mypy app scripts
+    - .venv/bin/python scripts/header_guard.py
+    - .venv/bin/pytest tests
+
+compat_python_floor:
+  stage: validate
+  tags:
+    - rdt-validate
+  # Deliberately NOT the runtime image. `pyproject.toml` declares `requires-python = ">=3.12"`
+  # and `README.md` / `docs/AGENT_ONBOARDING.md` advertise 3.12+, so the floor has to be
+  # executed somewhere or the claim decays into an assertion nobody tests. `mypy.ini`'s
+  # `python_version = 3.12` catches syntax and typing, not imports, runtime behaviour, or the
+  # `python_full_version < '3.13'` markers the lock selects only on this interpreter.
+  #
+  # `tests/test_release_contract.py` excludes this pin from the runtime equality set by design;
+  # it must not be moved when PYTHON_IMAGE moves. Its *minor* follows `requires-python`; its
+  # *patch* follows 3.12 security maintenance on its own schedule, so the floor lane does not
+  # sit on a knowingly vulnerable interpreter between floor moves. Its *distro*, by contrast,
+  # does follow the runtime's: the version axes encode a support policy, the codename encodes
+  # nothing about the floor, and leaving this lane behind on an EOL Debian would keep exactly
+  # the condition #59 exists to end. That last part is asserted rather than left to this
+  # comment -- `test_runtime_python_image_pins_agree` requires this pin's codename to equal
+  # PYTHON_IMAGE's and its version to differ. See docs/DEPENDENCY_MANAGEMENT.md.
+  image: python:3.12.14-slim-trixie@sha256:e5c9fa26ffb76e11e0f054f30dc2523a2f9693f0c36c0cf1e39b27e152d899fc
+  # Merge requests and default-branch pushes only. Nothing `needs:` this job, so on a `v*` tag
+  # it could not stop `release_publish` or `release_yank` from acting -- both start as soon as
+  # their own dependencies finish -- but it could still turn the pipeline red *after* the
+  # release completed, and burn a full pytest run on `rdt-validate` in the middle of a yank.
+  # The floor is a property of the code, and the merge request is where the code changes.
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - when: never
+  variables:
+    UV_CACHE_DIR: "$CI_PROJECT_DIR/.uv-cache"
+    CLAUDE_MODEL: "ci-placeholder"
+    CODEX_MODEL: "ci-placeholder"
+    GEMINI_MODEL: "ci-placeholder"
+    GOOSE_GEMMA_MODEL: "ci-placeholder"
+    GROK_MODEL: "ci-placeholder"
+    OPENCODE_KIMI_MODEL: "ci-placeholder"
+    PI_NEMOTRON_MODEL: "ci-placeholder"
+  cache:
+    key: "uv-floor-${CI_COMMIT_REF_SLUG}"
+    fallback_keys:
+      - "uv-floor-${CI_DEFAULT_BRANCH}"
+    paths:
+      - .uv-cache/
+  # `git` is unpinned by the same recorded decision as `validate` (#65), and logged for the
+  # same reason. See the comment on that job.
+  before_script:
+    - apt-get update
+    - apt-get install --yes --no-install-recommends git
+    - rm -rf /var/lib/apt/lists/*
+    - git --version
+    - python -m pip install --disable-pip-version-check --no-cache-dir "uv==0.12.1"
+    - uv sync --frozen --extra dev --no-install-project
+  # Frozen install plus tests only. Lint and type checking are the runtime lane's job: running
+  # them twice buys nothing, since neither reads the interpreter it happens to run on.
+  script:
+    - .venv/bin/pytest tests
+
+build_smoke_publish:
+  stage: image
+  tags:
+    - rdt
+  interruptible: false
+  resource_group: image-publication
+  image: docker:27.5.1-cli
+  services:
+    - name: docker:27.5.1-dind-rootless
+      alias: docker
+  variables:
+    DOCKER_HOST: "tcp://docker:2375"
+    DOCKER_TLS_CERTDIR: ""
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+  script:
+    - sh scripts/ci-build-image.sh
+  artifacts:
+    expire_in: 30 days
+    paths:
+      - artifacts/build-metadata.json
+      - artifacts/image-reference.txt
+      - artifacts/sbom.spdx.json
+    reports:
+      dotenv: artifacts/image.env
+
+sbom_publish:
+  stage: image
+  # The protected-ref runner, not rdt-validate: this job writes durable supply-chain state with
+  # CI_JOB_TOKEN, and rdt-validate also hosts untrusted merge-request containers. It needs no
+  # resource_group -- build_smoke_publish has already released image-publication via needs.
+  tags:
+    - rdt
+  image: python:3.14.7-slim-trixie@sha256:656d12e70054d5fda18a045e2494c96701e9792dd1445f95b3d038df954f57e9
+  interruptible: false
+  needs:
+    - job: build_smoke_publish
+      artifacts: true
+  # Mirrors the build job's rule: any other path leaves IMAGE_PUBLISHED=false and emits no
+  # IMAGE_DIGEST at all. The job validates both anyway rather than trusting the rule.
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+  script:
+    - python scripts/release_tools.py publish-sbom
+
+.security_scan:
+  # PyYAML only, and only here: the exception file is the one YAML the gate reads, and neither
+  # release job may import a third-party module -- both run a bare slim-Python image with no
+  # project dependencies installed. `tests/test_release_contract.py` asserts this pin matches
+  # the one in `pyproject.toml`, because a silent drift between them is a scanner that parses
+  # the policy differently from the project.
+  image: python:3.14.7-slim-trixie@sha256:656d12e70054d5fda18a045e2494c96701e9792dd1445f95b3d038df954f57e9
+  # The protected-ref runner. The tag-time job writes durable supply-chain state with
+  # CI_JOB_TOKEN; the default-branch job handles registry credentials on a protected ref. Neither
+  # belongs on rdt-validate, which also hosts untrusted merge-request containers.
+  tags:
+    - rdt
+  interruptible: false
+  before_script:
+    - python -m pip install --disable-pip-version-check --no-cache-dir "pyyaml==6.0.3"
+  # The database is required to be fresh and the update check is required to succeed, so a
+  # transient 503 from Anchore fails the job. Retrying costs a couple of minutes of a read-only
+  # scan and stops a third-party blip from blocking a release. A genuine policy failure is
+  # therefore attempted three times, which is accepted: the scan is idempotent, and the
+  # alternative is a network hiccup looking exactly like an unsafe image.
+  retry:
+    max: 2
+    when: script_failure
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - artifacts/vulnerability-report.json
+      - artifacts/vulnerability-evaluation.json
+
+security_scan:
+  extends: .security_scan
+  stage: security
+  needs:
+    - job: build_smoke_publish
+      artifacts: true
+  # Mirrors the build job's rule. IMAGE_PUBLISHED and IMAGE_DIGEST arrive by dotenv; the job
+  # validates both rather than trusting the rule.
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+  script:
+    - python scripts/release_tools.py install-tools --tools grype
+    - python scripts/release_tools.py scan
+
+security_scan_release:
+  extends: .security_scan
+  stage: security
+  resource_group: release-publication
+  needs:
+    - job: release_contract
+      artifacts: false
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+  # A fresh re-scan of the same digest with a current database, not a re-assertion of the
+  # default-branch result: vulnerability knowledge is time-dependent, so a scan that passed when
+  # the image was built is not a claim about the day it is released. This job owns the durable
+  # upload so that an upload failure happens with no alias moved.
+  script:
+    - python scripts/release_tools.py install-tools --tools crane,grype
+    - python scripts/release_tools.py publish-scan
+
+dockerhub_credential_probe:
+  stage: release
+  tags:
+    - rdt
+  image: python:3.14.7-slim-trixie@sha256:656d12e70054d5fda18a045e2494c96701e9792dd1445f95b3d038df954f57e9
+  interruptible: false
+  resource_group: release-publication
+  # security_scan is a hard need even without its artifacts: DAG scheduling would otherwise make
+  # the job playable as soon as the build finishes, before the gate can reject the digest.
+  needs:
+    - job: build_smoke_publish
+      artifacts: true
+    - job: security_scan
+      artifacts: false
+  # A protected variable reaches every job on a protected ref whatever its rules, including the
+  # rdt-validate jobs. DOCKERHUB_USERNAME/DOCKERHUB_TOKEN are scoped to this environment, so only
+  # jobs declaring it receive them; tests/test_ci_scripts.py pins which jobs may. `prepare` applies
+  # the scoped variables without recording a deployment.
+  environment:
+    name: dockerhub-publication
+    action: prepare
+  # This is an optional owner-operated acceptance probe, not a release job. The rule admits only a
+  # protected default-branch push and never an MR or manually supplied ref.
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+      when: manual
+      allow_failure: true
+    - when: never
+  script:
+    - python scripts/release_tools.py install-tools --tools crane
+    - python scripts/release_tools.py probe-dockerhub
+  artifacts:
+    expire_in: 30 days
+    paths:
+      - artifacts/dockerhub-probe.json
+
+release_contract:
+  stage: validate
+  tags:
+    - rdt-validate
+  image: python:3.14.7-slim-trixie@sha256:656d12e70054d5fda18a045e2494c96701e9792dd1445f95b3d038df954f57e9
+  variables:
+    GIT_DEPTH: "0"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v/'
+    - when: never
+  # `git` is unpinned by the same recorded decision as `validate` (#65), and logged for the
+  # same reason. See the comment on that job -- with one qualification that does not apply
+  # there: this job *does* declare a release artifact (`artifacts/release-context.json` below,
+  # consumed by `release_publish` and `release_yank`), and on the yank path the annotated tag
+  # message read through `git for-each-ref` is uploaded as durable release metadata. What keeps
+  # it inside the decision is that `git` validates the tag and reads its annotation here; it
+  # contributes no package contents to the shipped image, which is what the snapshot guarantee
+  # covers. See docs/CI.md.
+  before_script:
+    - apt-get update
+    - apt-get install --yes --no-install-recommends git
+    - rm -rf /var/lib/apt/lists/*
+    - git --version
+    - git fetch origin "$CI_DEFAULT_BRANCH" --tags --force
+  script:
+    - python scripts/release_tools.py validate
+  artifacts:
+    expire_in: 30 days
+    paths:
+      - artifacts/release-context.json
+
+release_publish:
+  stage: release
+  tags:
+    - rdt
+  image: python:3.14.7-slim-trixie@sha256:656d12e70054d5fda18a045e2494c96701e9792dd1445f95b3d038df954f57e9
+  interruptible: false
+  resource_group: release-publication
+  needs:
+    - job: validate
+    - job: release_contract
+      artifacts: true
+    # The gate. This job only reads and verifies the evidence security_scan_release staged, so
+    # it never produces a non-deterministic document of its own.
+    - job: security_scan_release
+      artifacts: false
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+  script:
+    - python scripts/release_tools.py install-tools --tools crane
+    - python scripts/release_tools.py publish
+  artifacts:
+    expire_in: 30 days
+    paths:
+      - artifacts/release-manifest.json
+      - artifacts/release-changelog.md
+      - artifacts/sbom.spdx.json
+      - artifacts/vulnerability-report.json
+      - artifacts/vulnerability-evaluation.json
+
+release_yank:
+  stage: release
+  tags:
+    - rdt
+  # In the runtime pin equality set, deliberately. The case for pinning withdrawal separately --
+  # so a bad runtime pin cannot take the yank path down with it -- does not survive the `needs`
+  # block below: this job already depends on `validate` and `release_contract`, both of which run
+  # the runtime image, so an unusable runtime pin blocks the yank whatever this line says. A
+  # second, independent pin would buy no availability and would be a pin nothing ever bumps.
+  image: python:3.14.7-slim-trixie@sha256:656d12e70054d5fda18a045e2494c96701e9792dd1445f95b3d038df954f57e9
+  interruptible: false
+  resource_group: release-publication
+  needs:
+    - job: validate
+    - job: release_contract
+      artifacts: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+-yank$/ && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+  # Crane only. Withdrawal must stay available when Grype's release asset or its vulnerability
+  # database is unreachable -- which is exactly the outage during which a bad release most needs
+  # pulling, and the case where the CVE motivating the yank is the one failing the scan.
+  script:
+    - python scripts/release_tools.py install-tools --tools crane
+    - python scripts/release_tools.py yank
+  artifacts:
+    expire_in: 30 days
+    paths:
+      - artifacts/yank-record.json
+      - artifacts/yanked-release-notes.md
+
+github_release_publish:
+  stage: publish
+  tags:
+    - rdt
+  image: python:3.14.7-slim-trixie@sha256:656d12e70054d5fda18a045e2494c96701e9792dd1445f95b3d038df954f57e9
+  interruptible: false
+  resource_group: release-publication
+  # Ordering, not data. Every input is durable -- the protected tag, and the version-scoped
+  # package release_publish wrote -- because a manual job may be played or retried long after
+  # 30-day artifacts expire, and a blocked pipeline does not keep them as "latest" either. Nothing
+  # becomes public before the canonical release has completed.
+  needs:
+    - job: release_publish
+      artifacts: false
+  # GITHUB_MIRROR_TOKEN is scoped to this environment. A protected variable otherwise reaches
+  # every job on a protected ref whatever its rules, and CE has no protected environments, so
+  # tests/test_ci_scripts.py pins which jobs may declare it.
+  environment:
+    name: github-publication
+    url: https://github.com/mcknly/robot-dev-team/releases/tag/$CI_COMMIT_TAG
+  # Manual: a person makes the final call before anything becomes public. Not allow_failure, so
+  # the tag pipeline stays blocked -- visibly unfinished -- until the projection has run.
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ && $CI_COMMIT_REF_PROTECTED == "true"'
+      when: manual
+    - when: never
+  # `git` is unpinned by the same recorded decision as `validate` (#65), and logged for the same
+  # reason. It builds the public commit and tag objects; it contributes no package contents to
+  # the shipped image. The tag is re-fetched so its annotation, which dates the public objects,
+  # is present whatever the runner's fetch refspec.
+  before_script:
+    - apt-get update
+    - apt-get install --yes --no-install-recommends git
+    - rm -rf /var/lib/apt/lists/*
+    - git --version
+    - git fetch origin "+refs/tags/${CI_COMMIT_TAG}:refs/tags/${CI_COMMIT_TAG}"
+  script:
+    - python -m scripts.github_publication publish
+  artifacts:
+    expire_in: 30 days
+    paths:
+      - artifacts/public-release-receipt.json
+
+github_release_withdraw:
+  stage: publish
+  tags:
+    - rdt
+  image: python:3.14.7-slim-trixie@sha256:656d12e70054d5fda18a045e2494c96701e9792dd1445f95b3d038df954f57e9
+  interruptible: false
+  resource_group: release-publication
+  # The reason is read from release_yank's immutable yank record, not from an expiring artifact.
+  needs:
+    - job: release_yank
+      artifacts: false
+  # `prepare`: withdrawing a release deploys nothing, so no deployment is recorded.
+  environment:
+    name: github-publication
+    action: prepare
+  # Automatic, unlike publication: a withdrawal only marks an existing public release, and the
+  # yank tag already carries the authorization. It installs nothing and carries no scan, for the
+  # same reason release_yank does not.
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+-yank$/ && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+  script:
+    - python -m scripts.github_publication withdraw
+
+github_publication_audit:
+  stage: publish
+  # The protected runner: the job holds a protected-ref CI_JOB_TOKEN, and rdt-validate also hosts
+  # untrusted merge-request containers. It declares no environment and so never sees the GitHub
+  # token -- every read it makes of the public repository is anonymous.
+  tags:
+    - rdt
+  image: python:3.14.7-slim-trixie@sha256:656d12e70054d5fda18a045e2494c96701e9792dd1445f95b3d038df954f57e9
+  needs: []
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+  script:
+    - python -m scripts.github_publication audit

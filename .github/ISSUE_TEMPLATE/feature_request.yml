@@ -1,0 +1,53 @@
+# Robot Dev Team Project
+# File: .github/ISSUE_TEMPLATE/feature_request.yml
+# Description: Feature request issue form for the public GitHub mirror.
+# License: MIT
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 MCKNLY LLC
+
+name: Feature request
+description: Propose a capability, an agent harness, or a workflow change.
+title: "[feature] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Proposals are welcome. Please open one before writing the code: the discussion that
+        decides a feature happens on the private canonical instance, so an unannounced pull
+        request can be declined for reasons you had no way to see. See
+        [docs/CONTRIBUTING.md](https://github.com/mcknly/robot-dev-team/blob/main/docs/CONTRIBUTING.md).
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >-
+        What you are trying to do and where the project gets in the way. Describe the situation
+        rather than the fix -- there may be a better fix than the one you have in mind.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+      description: What the project would do instead, and how a user would reach it.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: >-
+        Including workarounds that already exist. This project is agent-agnostic by design, so a
+        route, a prompt template, or a command override often covers more than it first appears.
+    validations:
+      required: false
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: >-
+            I understand that CI, container builds, and releases stay on the canonical instance,
+            and that this proposal would not add a build or publication path on GitHub.
+          required: true

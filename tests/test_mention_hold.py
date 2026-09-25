@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -20,7 +19,6 @@ from app.core.config import settings
 from app.main import app
 from app.services.routes import AgentTask, RouteMatch
 from app.services.trigger_queue import MentionHoldBuffer, TriggerQueue, TriggerWorkItem
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -282,7 +280,6 @@ class TestMentionHoldBuffer:
     async def test_recent_assignment_resets_on_repeat(self):
         """Recording the same assignment key twice resets the expiry timer."""
         buf = MentionHoldBuffer(hold_seconds=0.2)
-        loop = asyncio.get_event_loop()
         key = ("group/project", 42, "claude")
 
         buf.record_assignment(key)

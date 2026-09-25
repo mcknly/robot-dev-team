@@ -27,10 +27,37 @@ services:
       - ./prompts:/work/prompts:ro
       - ./config:/work/config:ro
       - ./run-logs:/work/run-logs
-      - ./npm-cache:/work/.npm-cache
       - ${CLAUDE_CONFIG_PATH:-$HOME/.claude}:/home/appuser/.claude
       - ${GEMINI_CONFIG_PATH:-$HOME/.gemini}:/home/appuser/.gemini
       - ${CODEX_CONFIG_PATH:-$HOME/.codex}:/home/appuser/.codex
+      # OpenCode (optional, disabled by default). Mount the pre-authenticated host
+      # config + data dirs so provider credentials (~/.local/share/opencode/auth.json)
+      # carry into the container. Uncomment alongside the opencode routes/env to enable.
+      #- ${OPENCODE_CONFIG_PATH:-$HOME/.config/opencode}:/home/appuser/.config/opencode
+      #- ${OPENCODE_DATA_PATH:-$HOME/.local/share/opencode}:/home/appuser/.local/share/opencode
+      # Goose (optional, disabled by default). Unlike the mounts above, this one
+      # lands on a `-host` staging path and is read-only ON PURPOSE: the
+      # entrypoint materializes the real config at ~/.config/goose from it (see
+      # app/goose_config.py), rewriting any loopback base_url so a locally served
+      # model reaches the host instead of resolving to the container. Mounting
+      # straight onto ~/.config/goose would make the container rewrite the
+      # operator's host config -- breaking Goose ON the host. Do not "fix" this.
+      #- ${GOOSE_CONFIG_PATH:-$HOME/.config/goose}:/home/appuser/.config/goose-host:ro
+      # Grok Build (optional, disabled by default). Mount the pre-authenticated host
+      # config dir so the OAuth credentials in ~/.grok/auth.json carry into the
+      # container (run `grok login` on the host first). Read-write like the mounts
+      # above, not `:ro`: the CLI refreshes cached state under ~/.grok on startup.
+      # Uncomment alongside the grok routes/env to enable.
+      #- ${GROK_CONFIG_PATH:-$HOME/.grok}:/home/appuser/.grok
+      # Pi (optional, disabled by default). Mount the pre-authenticated host config
+      # dir so the provider key in ~/.pi/agent/auth.json (OpenRouter for the default
+      # model) carries into the container. Read-write like the mounts above, not
+      # `:ro`: Pi may refresh cached state (models-store.json, version-check marker)
+      # under this dir. The path is the narrow `agent` root on purpose -- it holds
+      # auth.json/settings.json/sessions, not all of ~/.pi. The Pi block in
+      # .env.example sets PI_SKIP_VERSION_CHECK=1 / PI_TELEMETRY=0 for quieter,
+      # non-mutating starts. Uncomment alongside the pi routes/env to enable.
+      #- ${PI_CONFIG_PATH:-$HOME/.pi/agent}:/home/appuser/.pi/agent
       # Parent mount for project repositories (auto-discovery + on-demand cloning)
       # Edit these paths to match your local projects directory structure
       # Read-write mount for work routes

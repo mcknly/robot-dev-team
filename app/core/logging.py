@@ -8,6 +8,7 @@ Copyright (c) 2025 MCKNLY LLC
 
 import logging
 from logging.config import dictConfig
+from typing import Any
 
 from app.core.config import settings
 
@@ -21,7 +22,7 @@ class DashboardLogHandler(logging.Handler):
         dashboard_manager.publish_system(record.getMessage(), record.levelname, record.name)
 
 
-LOGGING_CONFIG = {
+LOGGING_CONFIG: dict[str, Any] = {
     "version": 1,
     "disable_existing_loggers": False,
     "formatters": {

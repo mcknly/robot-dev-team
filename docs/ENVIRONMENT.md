@@ -30,26 +30,27 @@ For container runs, Compose pulls the same `.env` file and binds host credential
 | `APP_PORT` | Exposed port for HTTP traffic. | No | `8888` |
 | `APP_LOG_LEVEL` | Log verbosity (see level guide below). | No | `INFO` |
 | `GITLAB_WEBHOOK_SECRET` | Shared token validated against `X-Gitlab-Token`. Leave empty to disable verification (not recommended). | Yes | _(none)_ |
-| `GLAB_HOST` | GitLab instance hostname used by `glab-usr` and `gitlab-connect`. Must match the hostname in webhook-provided clone URLs (i.e. the hostname part of `GITLAB_EXTERNAL_URL` in `gitlab/.env`). For local Docker deployments using the bundled `gitlab/docker-compose.gitlab.yml`: set to `gitlab` (the Docker service name). For production: your GitLab domain (e.g. `gitlab.example.com`). | Yes | `gitlab.com` |
-| `GLAB_API_HOST` | Override the API host when it differs from `GLAB_HOST` — e.g. when GitLab runs on a non-standard port and is not reachable via the shared Docker network. When using the `robot-gitlab-net` shared network this is not needed since GitLab's internal port 80 is used directly. | No | _(same as `GLAB_HOST`)_ |
-| `GLAB_PROTOCOL` | Protocol for GitLab API and git operations: `https` (default) or `http`. Set to `http` for local deployments without TLS. Used by `glab-usr` for `glab auth login --api-protocol` and the git credential file scheme. | No | `https` |
+| `GLAB_HOST` | GitLab instance hostname used by `glab-usr` and `gitlab-connect`. Must match the hostname in webhook-provided clone URLs (i.e. the hostname part of `GITLAB_EXTERNAL_URL` in `gitlab/.env`). For local Docker deployments using the bundled `gitlab/docker-compose.gitlab.yml`: set to `gitlab` (the Docker service name). For production: your GitLab domain (e.g. `gitlab.example.com`). Must be a bare host (no scheme); set `GLAB_PROTOCOL` separately. The wrappers refuse to run when this resolves to the placeholder `gitlab.example.com`. | Yes | `gitlab.com` |
+| `GLAB_API_HOST` | Override the API host when it differs from `GLAB_HOST` — e.g. when GitLab runs on a non-standard port and is not reachable via the shared Docker network. When using the `robot-gitlab-net` shared network this is not needed since GitLab's internal port 80 is used directly. Bare host (no scheme). | No | _(same as `GLAB_HOST`)_ |
+| `GLAB_PROTOCOL` | Protocol for GitLab API and git operations: `https` (default) or `http`. Set to `http` for local deployments without TLS. Used by `glab-usr` for `glab auth login --api-protocol` and the git credential file scheme. Values outside `http`/`https` are rejected at startup. | No | `https` |
 | `GLAB_TOKEN` | GitLab PAT for the app process. Used for enrichment (fetching issue/MR context) and auto-unassign operations. Requires `api` scope when `ENABLE_AUTO_UNASSIGN` is enabled; `read_api` is sufficient if auto-unassign is disabled. | No | _(none)_ |
 | `GLAB_TIMEOUT_SECONDS` | Timeout for GitLab CLI enrichment calls. | No | `30` |
 | `AGENT_MAX_WALL_CLOCK_SECONDS` | Hard upper-bound run duration for each agent CLI invocation. | No | `7200` |
 | `AGENT_MAX_INACTIVITY_SECONDS` | Inactivity watchdog limit; resets whenever the agent produces stdout output. Stderr is still captured and logged but does not reset the timer. | No | `900` |
 | `AGENT_TIMEOUT_GRACE_SECONDS` | Grace period (SIGTERM before SIGKILL) when terminating an agent. | No | `10` |
 | `ALL_MENTIONS_AGENTS` | Comma-separated agent usernames expanded when `@all`/`@agents` is used in a comment. | No | `claude,gemini,codex` |
+| `RANDOMIZE_ALL_MENTIONS` | Shuffle the per-mention dispatch order for split work items, but **only** when the trigger came from `@all`/`@agents` expansion. Explicitly listing agents (e.g. `@claude @gemini @codex`) preserves author-specified order. | No | `true` |
 | `DEBUG_RELOAD_ROUTES` | Enable hot-reload for `config/routes.yaml`. | No | `false` |
 | `LIVE_DASHBOARD_ENABLED` | Toggle the live dashboard endpoint (`/dashboard`). | No | `false` |
 | `ROUTE_CONFIG_PATH` | Path to routing configuration. | No | `config/routes.yaml` |
 | `PROMPT_DIR` | Directory containing prompt templates. | No | `prompts` |
 | `RUN_LOGS_DIR` | Directory where structured agent outputs are written. | No | `run-logs` |
-| `NPM_CACHE_DIR` | Location used for npm cache when installing agent CLIs. | No | `/work/.npm-cache` |
 | `ENABLE_AUTO_CLONE` | Enable on-demand repository cloning when a webhook arrives for a project that doesn't exist locally. | No | `false` |
 | `AUTO_CLONE_DEPTH` | Clone depth for auto-cloned repositories. `0` = full history (recommended), `1+` = shallow clone (faster). | No | `0` |
 | `ENABLE_BRANCH_SWITCH` | Enable automatic branch switching before agent dispatch based on event type. | No | `false` |
 | `ENABLE_SMART_BRANCH_SELECTION` | Use smart heuristics (closes_issues API, note mentions) instead of first-open-MR when resolving branches for issues. | No | `true` |
 | `ENABLE_AUTO_UNASSIGN` | Automatically unassign agent after successful task completion or manual kill when triggered by agent assignment. | No | `false` |
+| `ENABLE_ASSIGN_ON_ISSUE_CREATION` | Dispatch an agent's read-write `assign_work` route immediately when an issue is created with that agent already assigned, instead of first running readonly triage. The assign route takes precedence over `issue-triage` on `open`, so it is an either/or (pre-assigned agent skips triage). When `false`, creation events fall through to triage; assigning to an existing issue via `/assign` (`action: update`) is unaffected. | No | `true` |
 | `ENABLE_BACKUP_NOTIFICATIONS` | Post a GitLab comment on the issue/MR when an auto-backup branch is created during branch resolution. | No | `true` |
 | `MENTION_HOLD_SECONDS` | Seconds to hold mention-triggered dispatches before promoting to the queue. If an assignment webhook for the same agent+project+IID arrives within this window, the mention is suppressed. Set to `0` to disable. | No | `3.0` |
 
@@ -76,13 +77,19 @@ Model variables follow a naming convention: for any agent named `<agent>`, set `
 
 | Variable | Description | Required | Default |
 | --- | --- | --- | --- |
-| `CLAUDE_MODEL` | Model identifier for `${CLAUDE_MODEL}` placeholders. | Yes (when referenced in `routes.yaml`) | _(none)_ |
-| `GEMINI_MODEL` | Model identifier for `${GEMINI_MODEL}` placeholders. | Yes (when referenced in `routes.yaml`) | _(none)_ |
-| `CODEX_MODEL` | Model identifier for `${CODEX_MODEL}` placeholders. | Yes (when referenced in `routes.yaml`) | _(none)_ |
+| `CLAUDE_MODEL` | Model identifier for `${CLAUDE_MODEL}` placeholders, passed to `claude --model` (e.g. `claude-opus-5`). | Yes (when referenced in `routes.yaml`) | _(none)_ |
+| `GEMINI_MODEL` | Model identifier for `${GEMINI_MODEL}` placeholders. Use a stable model slug from `agy models` (e.g. `gemini-3.6-flash-high`); the slug encodes the reasoning-effort tier and needs no quoting. Slugs require `agy` >= 1.1.5; the older friendly form (`"Gemini 3.6 Flash (High)"`, quoted because it contains spaces) still works on newer builds and is the only form builds before 1.1.5 accept. List the names your account can use with `docker compose exec -u appuser app agy models` -- `agy` runs inside the container, so it is normally not on the host `PATH`. **`agy` validates this value**: an unrecognized name aborts the run with exit 1 and prints the available models. Referenced model variables must be set and non-empty or startup fails. | Yes (when referenced in `routes.yaml`) | _(none)_ |
+| `CODEX_MODEL` | Model identifier for `${CODEX_MODEL}` placeholders, passed to `codex --model` (e.g. `gpt-5.6-sol`). The bare `gpt-5.6` alias currently routes to Sol; prefer the explicit ID so a future alias change cannot silently move the agent to another model. | Yes (when referenced in `routes.yaml`) | _(none)_ |
+| `OPENCODE_KIMI_MODEL` | Model slug for the optional `opencode-kimi` instance's `${OPENCODE_KIMI_MODEL}` placeholder (e.g. `openrouter/moonshotai/kimi-k2.6`). Only needed if the commented OpenCode routes are enabled. | No (optional agent) | _(none)_ |
+| `GOOSE_GEMMA_MODEL` | Model name for the optional `goose-gemma` instance's `${GOOSE_GEMMA_MODEL}` placeholder, passed to `goose run --model`. Must name a model the mounted Goose config's active provider serves. Note a llama.cpp server ignores the requested model and serves whatever is loaded, so against a local backend this is effectively a label for the run logs. Only needed if the commented Goose routes are enabled. | No (optional agent) | _(none)_ |
+| `GROK_MODEL` | Model ID for the optional `grok` agent's `${GROK_MODEL}` placeholder, passed to `grok --model` (e.g. `grok-4.5`). Run `grok models` to list the IDs your account can use. Only needed if the commented Grok routes are enabled. | No (optional agent) | _(none)_ |
+| `PI_NEMOTRON_MODEL` | Model ID for the optional `pi-nemotron` instance's `${PI_NEMOTRON_MODEL}` placeholder, passed to `pi --model` (e.g. `nvidia/nemotron-3-ultra-550b-a55b`). Must name a model the mounted Pi config's active provider serves (the default is routed via OpenRouter). Only needed if the commented Pi route is enabled. | No (optional agent) | _(none)_ |
 
-Custom agents follow the same convention. For example, an agent named `qwen-code` would use `QWEN_CODE_MODEL`.
+Custom agents follow the same convention. For example, an agent named `qwen-code` would use `QWEN_CODE_MODEL`. Grok Build is the simple case: one `grok` binary backs one logical agent, so the agent slug, the GitLab username, and the env prefix are all plain `grok` (`GROK_MODEL`, `GROK_AGENT_GITLAB_TOKEN`). Because OpenCode and Goose are provider-agnostic, their logical agents are named per model -- `opencode-kimi` uses `OPENCODE_KIMI_MODEL` and `goose-gemma` uses `GOOSE_GEMMA_MODEL`; a second instance (`opencode-gpt`, `goose-qwen`) would use `OPENCODE_GPT_MODEL` / `GOOSE_QWEN_MODEL` -- all backed by the one shared `opencode` / `goose` binary.
 
-> **Note:** Model variables have no application-level defaults. If a `${<AGENT>_MODEL}` placeholder is referenced in `routes.yaml` but the corresponding environment variable is not set, the application will raise `ValueError` at startup. Ensure all model variables used in your routes are defined in `.env` (see `.env.example` for reference values).
+> **Note:** the agent slug and the GitLab username are independent. Routes match the *username* from the webhook payload (`kimi`, `gemma`), while the `agent:` slug selects the credentials the run dispatches under (`opencode-kimi`, `goose-gemma`). The GitLab account therefore does not need the harness prefix.
+
+> **Note:** Model variables have no application-level defaults. If a `${<AGENT>_MODEL}` placeholder is referenced in `routes.yaml` but the corresponding environment variable is not set or resolves to an empty string, the application will raise `ValueError` at startup. Ensure all model variables used in your routes are defined in `.env` (see `.env.example` for reference values).
 
 ### Log Retention
 | Variable | Description | Required | Default |
@@ -112,15 +119,52 @@ Agent tokens and identities follow a naming convention based on the agent name. 
 | --- | --- | --- | --- |
 | `<AGENT>_AGENT_GITLAB_TOKEN` | GitLab PAT for the agent. Needs `api` scope. | Yes | _(none)_ |
 | `<AGENT>_AGENT_GIT_NAME` | Display name for git commits/comments. | No | `<Agent> Agent` |
-| `<AGENT>_AGENT_GIT_EMAIL` | Email identity for git operations. | No | `<agent>@example.com` |
+| `<AGENT>_AGENT_GIT_EMAIL` | Email identity for git operations. Effectively required: the `<agent>@example.com` default is treated as a placeholder, and `glab-usr` refuses to authenticate rather than write commits with that authorship. The check fires on every invocation including read-only paths. | Yes | _(none; placeholder `<agent>@example.com` is rejected)_ |
 
-The three default agents (`claude`, `gemini`, `codex`) are pre-configured in `.env.example`. Custom agents use the same convention with no code changes required.
+The three default agents (`claude`, `gemini`, `codex`) are pre-configured in `.env.example`. Custom agents use the same convention with no code changes required. The optional `opencode-kimi` instance ships commented out in `.env.example`; enabling it means uncommenting its `OPENCODE_KIMI_AGENT_GITLAB_TOKEN` / `OPENCODE_KIMI_AGENT_GIT_NAME` / `OPENCODE_KIMI_AGENT_GIT_EMAIL` block (note the model tag precedes `_AGENT` so the token convention resolves the `opencode-kimi` name). The optional `grok` agent ships commented out the same way, using the plain `GROK_AGENT_*` forms. The optional `pi-nemotron` instance likewise ships commented out, using `PI_NEMOTRON_AGENT_*` (model tag before `_AGENT`, same as `opencode-kimi`); its GitLab username is the plain `nemotron`.
+
+### Startup Preflight (strict)
+
+The container validates this configuration before it starts, and **refuses to boot** if a route could never work. The invariant is:
+
+> Every agent named by an enabled route must have a GitLab token **and** a git identity.
+
+Concretely, for each agent in `config/routes.yaml` (or your `ROUTE_CONFIG_PATH` override):
+
+- `<AGENT>_AGENT_GITLAB_TOKEN` must be non-empty, **or** a token file must exist at `~/.<agent>/glab-token`; and
+- `<AGENT>_AGENT_GIT_EMAIL` must be a real address (the `@example.com` placeholder is rejected, matching `glab-usr`).
+
+Both are hard requirements inside `glab-usr`, so a route missing either can never dispatch. Failing at startup replaces the old behaviour, where the same misconfiguration surfaced much later and far less clearly -- mid-dispatch, after a webhook had already fired.
+
+The rule is deliberately **asymmetric**. The reverse case is only a warning:
+
+| Situation | Result |
+| --- | --- |
+| Route dispatches an agent with no token or no git email | **Fatal** -- container will not start |
+| `BRANCH_PRUNING_AGENT` lacks credentials while `BRANCH_PRUNING_ENABLED=true` | **Fatal** |
+| `ROUTE_CONFIG_PATH` points at a file that does not exist | **Fatal** -- a typo must not look like an empty config |
+| The active config yields **no dispatchable agent tasks** (empty file, or every agent entry missing its `agent:` key) | **Fatal** -- validation would be vacuous |
+| A route gives an agent an empty `command:` | **Fatal** -- dispatch would exec nothing |
+| A required harness binary is **not on PATH after the installs run** | **Fatal** -- see below |
+| Agent has a token but no route | Warning -- supported (staged rollout; pruning identities) |
+| `ALL_MENTIONS_AGENTS` names an agent no mention route matches | Warning -- `@all` silently drops it |
+| A route runs a command no install script provides | Warning -- assumed already on PATH (BYOA), then verified |
+
+There is **no escape hatch**: a bad config must be fixed, not suppressed. If a shipped route names an agent you do not run, delete that route (see "Removing an Agent" in `docs/ADDING_AN_AGENT.md`) rather than leaving it dead.
+
+The same preflight decides **which harnesses get installed**: only the binaries that a routed, credentialed agent actually needs. It then checks those binaries are on PATH once the installers finish -- credentials are validated before the installs, binaries after -- so a failed download or a mis-declared `# provides:` line stops the container instead of failing later on every dispatch. (The download *failing* is only a warning; the harness being *absent at the end* is fatal.)
+
+Run the config half by hand at any time --
+
+```bash
+python -m app.preflight     # prints the install set; exits 1 on bad config
+```
 
 ### Host Integration
 
 **LLM Provider Authentication**
 
-Agent CLIs authenticate with their respective LLM providers (Anthropic, Google, OpenAI) using the host user's personal account credentials. The `*_CONFIG_PATH` variables defined below point to the host directories containing these credentials (e.g., `~/.claude`), which are bind-mounted into the container. This allows the CLIs to reuse the same authentication session, keeping billing under the user's existing subscription plan and avoiding the cost risks of standalone API-key billing.
+Agent CLIs authenticate with their respective LLM providers (Anthropic, Google, OpenAI, and -- via OpenCode -- any provider such as OpenRouter) using the host user's personal account credentials. The `*_CONFIG_PATH` variables defined below point to the host directories containing these credentials (e.g., `~/.claude`), which are bind-mounted into the container. This allows the CLIs to reuse the same authentication session, keeping billing under the user's existing subscription plan and avoiding the cost risks of standalone API-key billing.
 
 If you prefer dedicated credentials for automation, you can override these paths to point to directories containing bot-specific authentication files.
 
@@ -128,10 +172,31 @@ If you prefer dedicated credentials for automation, you can override these paths
 | --- | --- | --- | --- |
 | `LOCAL_UID` / `LOCAL_GID` | Map the container user to the host UID/GID so mounted agent token directories remain accessible. | Recommended | `1000` (compose fallback) |
 | `CLAUDE_CONFIG_PATH` | Host directory to bind-mount for Claude CLI authentication. | No | `$HOME/.claude` |
-| `GEMINI_CONFIG_PATH` | Host directory to bind-mount for Gemini CLI authentication. | No | `$HOME/.gemini` |
+| `GEMINI_CONFIG_PATH` | Host directory to bind-mount for the Gemini agent (Antigravity CLI). Carries settings, conversation history, and the `antigravity-cli/antigravity-oauth-token` JSON file that `agy` falls back to whenever no host desktop libsecret session is present. The container always wants the file form; complete the one-time OAuth bootstrap from `docs/AGENT_ONBOARDING.md` so the file exists on the host before starting the stack. | No | `$HOME/.gemini` |
 | `CODEX_CONFIG_PATH` | Host directory to bind-mount for Codex CLI authentication. | No | `$HOME/.codex` |
+| `OPENCODE_CONFIG_PATH` | Host directory to bind-mount for OpenCode global config (`opencode.jsonc`). Only used when the optional OpenCode mounts are uncommented in `docker-compose.yml`. | No | `$HOME/.config/opencode` |
+| `OPENCODE_DATA_PATH` | Host directory to bind-mount for OpenCode data, including the `auth.json` that holds provider credentials (OpenRouter, etc.). Mounting it is how the container reuses the host's `opencode auth login` session. Only used when the optional OpenCode mounts are uncommented. | No | `$HOME/.local/share/opencode` |
+| `GOOSE_CONFIG_PATH` | Host directory to bind-mount for Goose config: the active provider, model, extensions, and any `secrets.yaml`. Only used when the optional Goose mount is uncommented in `docker-compose.yml`. Unlike the mounts above it is mounted **read-only**, onto a staging path -- see the note below. | No | `$HOME/.config/goose` |
+| `GROK_CONFIG_PATH` | Host directory to bind-mount for Grok Build config, including the `auth.json` that holds the OAuth session. Mounting it is how the container reuses the host's `grok login`. Read-write, like the Claude/Gemini/Codex mounts. Only used when the optional Grok mount is uncommented in `docker-compose.yml`. | No | `$HOME/.grok` |
+| `GROK_DEPLOYMENT_KEY` | Alternative to the `~/.grok` mount for headless hosts that cannot complete the browser OAuth flow. There is no `XAI_API_KEY` code path. | No | _(none)_ |
+| `PI_CONFIG_PATH` | Host directory to bind-mount for Pi config, including the `auth.json` that holds the provider key (OpenRouter for the default model) and `settings.json`. Mounting it is how the container reuses the host's Pi setup. Read-write, like the Claude/Gemini/Codex mounts. Points at the narrow `agent` config root (not all of `~/.pi`) on purpose. Only used when the optional Pi mount is uncommented in `docker-compose.yml`. | No | `$HOME/.pi/agent` |
 
 The GitLab CLI configuration is generated inside the container on startup using the agent tokens, so no bind mount is required for `glab-cli`.
+
+**Goose and locally served models**
+
+Goose's config is the only one the container does not use as-mounted. An operator whose Goose drives a model served on the host (llama.cpp, Ollama, LM Studio, vLLM) has a `base_url` on loopback -- `http://127.0.0.1:10000/v1` or similar. That is correct on the host, but inside the container `127.0.0.1` is the container itself.
+
+So `GOOSE_CONFIG_PATH` is mounted read-only at `~/.config/goose-host`, and on startup the entrypoint runs `python -m app.goose_config`, which copies it to `~/.config/goose` with loopback hosts (`127.0.0.0/8`, `localhost`, `::1`, `0.0.0.0`) redirected at `host.docker.internal`. Both spellings Goose accepts are handled: a full URL (a custom provider's `base_url`) and a bare `*_HOST` value with no scheme (`OLLAMA_HOST: localhost:11434`), which Goose also takes. Only the host is swapped -- scheme, port, path, and any remote host are preserved. The copy exists so the container never rewrites the host's own config, which must keep pointing at loopback to run Goose on the host.
+
+Consequences worth knowing:
+
+- Editing the host Goose config requires a container restart to take effect.
+- The model server must accept connections from the Docker host gateway. A server bound to `127.0.0.1` on the host will refuse the container even after the rewrite -- bind it to `0.0.0.0`.
+- No `GOOSE_PROVIDER` / `OPENAI_HOST` / API-key variables are needed: everything but the endpoint is taken from the mounted config as-is. A provider that *does* need a key should carry it in `~/.config/goose/secrets.yaml` on the host; it is copied into the container and Goose reads it there, with no `GOOSE_DISABLE_KEYRING` required (verified against goose 1.41.0: a key present only in `secrets.yaml`, with no keyring daemon or dbus in the container, is picked up and sent).
+- **A llama.cpp provider must set `"supports_streaming": false`.** llama.cpp does not emit valid OpenAI SSE when a response contains a tool call, and Goose masks the resulting server error as an opaque `Stream decode error` ([goose#8021](https://github.com/aaif-goose/goose/issues/8021)). The run burns minutes of GPU, llama-server logs nothing wrong, the watchdog never fires, and no comment is posted. Non-streaming shifts stdout to once per turn, so `max_inactivity_seconds` must cover a full turn of local inference (3600 is a sane start).
+- The mount carries an extension's **config, not its executable**. Builtin (`type: platform`) extensions such as `developer` work unchanged; a `type: stdio` extension launched with `npx` cannot, because the base image ships no Node.js. (The optional Pi harness bootstraps a user-local Node only when enabled, but exposes **only `node`** on the shared `PATH` -- its `npm`/`npx` stay inside Pi's versioned Node dir -- so an enabled Pi never hands Goose a runnable `npx`.) `goose_config` warns at boot when an enabled stdio extension names an executable that is not on the container's `PATH`.
+- Mount the host config **only** at the staging path. Adding a second, conventional mount onto `~/.config/goose` would point the materialization's rebuild at the real host config; `goose_config` refuses to run if its target is a mount point rather than deleting it.
 
 ## Sample `.env`
 
@@ -146,16 +211,19 @@ LIVE_DASHBOARD_ENABLED=true
 AGENT_MAX_WALL_CLOCK_SECONDS=7200
 AGENT_MAX_INACTIVITY_SECONDS=900
 ALL_MENTIONS_AGENTS=claude,gemini,codex
+RANDOMIZE_ALL_MENTIONS=true
 
+# Note: *_AGENT_GIT_EMAIL values that end in @example.com are rejected by
+# glab-usr (placeholder loud-fail). Replace the domain with your real one.
 CLAUDE_AGENT_GITLAB_TOKEN=glpat-xxx
 CLAUDE_AGENT_GIT_NAME="Claude Agent"
-CLAUDE_AGENT_GIT_EMAIL=claude@example.com
+CLAUDE_AGENT_GIT_EMAIL=claude@your-org.tld
 GEMINI_AGENT_GITLAB_TOKEN=glpat-yyy
 GEMINI_AGENT_GIT_NAME="Gemini Agent"
-GEMINI_AGENT_GIT_EMAIL=gemini@example.com
+GEMINI_AGENT_GIT_EMAIL=gemini@your-org.tld
 CODEX_AGENT_GITLAB_TOKEN=glpat-zzz
 CODEX_AGENT_GIT_NAME="Codex Agent"
-CODEX_AGENT_GIT_EMAIL=codex@example.com
+CODEX_AGENT_GIT_EMAIL=codex@your-org.tld
 
 LOCAL_UID=1000
 LOCAL_GID=1000
@@ -261,6 +329,36 @@ The termination comment uses the agent's own PAT (`*_AGENT_GITLAB_TOKEN`) so it 
 - Allows the GitLab quick action popup to show the agent again for subsequent assignments
 - Cleaner issue/MR assignee lists after tasks complete
 - Agent remains assigned when tasks fail, signaling need for human intervention
+
+### Assign on Issue Creation
+
+Enabled by default (`ENABLE_ASSIGN_ON_ISSUE_CREATION=true`). When an issue is
+**created** with an agent already populated in the assignee field, GitLab sends
+an `Issue Hook` with `action: open`. The shipped `assign-issue-*` routes match
+both `open` and `update` and are ordered above `issue-triage`, so the event
+dispatches the agent's read-write `assign_work` route immediately instead of
+running readonly triage first.
+
+**Behavior:**
+- This is deliberately **either/or**: a pre-assigned agent skips triage/review
+  and goes straight to work — there is no second-opinion review pass on creation.
+- Only affects issue **creation**. Assigning an agent to an existing issue via
+  the `/assign` quick action (`action: update`) already dispatched `assign_work`
+  and is unchanged.
+- Merge requests are **not** affected: an MR opened with an assignee still goes
+  through `default-merge-request` review.
+
+**Disabling:** Set `ENABLE_ASSIGN_ON_ISSUE_CREATION=false` to revert creation
+events to the previous behavior, where a create-with-assignee event falls
+through to `issue-triage`. Note that with `ENABLE_AUTO_UNASSIGN=true`, a triaged
+create-with-assignee issue has its pre-assigned agent unassigned once triage
+completes — the reason this feature was added.
+
+> **Local overrides:** The precedence comes from route order and the
+> `action: ["open", "update"]` field in `config/routes.yaml`. Operators using a
+> local override (`ROUTE_CONFIG_PATH=config/routes.local.yaml`) must apply the
+> same reorder and action-list change to their copy for the feature to take
+> effect, regardless of the toggle.
 
 ### Mention Hold Deduplication
 

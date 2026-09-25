@@ -9,11 +9,12 @@ Copyright (c) 2025 MCKNLY LLC
 from __future__ import annotations
 
 import os
+import random
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from string import Template
-from typing import Any, Callable, Dict, List, Optional, Pattern
+from typing import Any, Callable, Dict, Iterator, List, Optional, Pattern, Tuple
 
 import yaml
 
@@ -22,6 +23,7 @@ from app.core.logging import get_logger
 LOGGER = get_logger(__name__)
 
 MODEL_ARG_FLAG = "--model"
+PROMPT_ARG_PLACEHOLDER = "${PROMPT}"
 
 
 @dataclass
@@ -42,8 +44,8 @@ class RouteRule:
 
     name: str
     event: str
-    action: Optional[str] = None
-    author: Optional[str] = None
+    actions: List[str] = field(default_factory=list)
+    authors: List[str] = field(default_factory=list)
     labels: List[str] = field(default_factory=list)
     mentions: List[str] = field(default_factory=list)
     assignees: List[str] = field(default_factory=list)
@@ -52,6 +54,7 @@ class RouteRule:
     pattern: Optional[Pattern[str]] = None
     max_wall_clock_seconds: Optional[int] = None
     max_inactivity_seconds: Optional[int] = None
+    randomize: bool = False
 
     def matches(
         self,
@@ -65,9 +68,9 @@ class RouteRule:
     ) -> bool:
         if self.event != event_name:
             return False
-        if self.action and self.action != action:
+        if self.actions and action not in self.actions:
             return False
-        if self.author and self.author != author:
+        if self.authors and (author or "").lower() not in self.authors:
             return False
         if self.labels and not set(self.labels).issubset(set(labels)):
             return False
@@ -89,6 +92,93 @@ def _mentions_subset(required: List[str], provided: List[str]) -> bool:
     required_set = {mention.lower() for mention in required}
     provided_set = {mention.lower() for mention in provided}
     return required_set.issubset(provided_set)
+
+
+def _parse_authors(value: Any, route_name: str) -> List[str]:
+    """Normalize the ``author`` YAML value to a lowercased list of usernames.
+
+    Accepts ``None``/missing (-> ``[]``), a single non-empty string
+    (-> ``[value]``), or a list of non-empty strings. An empty list is treated
+    the same as a missing field. Entries are lowercased at load time so
+    matching is case-insensitive without per-call cost. Empty-string values
+    (scalar ``""`` or list entries) are rejected because they almost always
+    indicate a config typo rather than an intentional wildcard.
+    """
+
+    if value is None:
+        return []
+    if isinstance(value, str):
+        if value == "":
+            raise ValueError(
+                f"Invalid author '' in route '{route_name}': "
+                "use a non-empty username or omit the field to allow any author"
+            )
+        return [value.lower()]
+    if isinstance(value, list):
+        normalized: List[str] = []
+        for entry in value:
+            if not isinstance(entry, str):
+                raise ValueError(
+                    f"Invalid author entry '{entry!r}' in route '{route_name}': "
+                    "all author list items must be strings"
+                )
+            if entry == "":
+                raise ValueError(
+                    f"Invalid empty author entry in route '{route_name}': "
+                    "remove the empty string or omit the field to allow any author"
+                )
+            normalized.append(entry.lower())
+        return normalized
+    raise ValueError(
+        f"Invalid author value '{value!r}' in route '{route_name}': "
+        "must be a string or list of strings"
+    )
+
+
+def _parse_actions(value: Any, route_name: str) -> List[str]:
+    """Normalize the ``action`` YAML value to a list of action strings.
+
+    Accepts ``None``/missing (-> ``[]``), a single non-empty string
+    (-> ``[value]``), or a list of non-empty strings. An empty list is treated
+    the same as a missing field (no constraint / wildcard), mirroring the
+    empty-list convention in ``_parse_authors``. Empty-string values (scalar
+    ``""`` or list entries) are rejected because they almost always indicate a
+    config typo rather than an intentional wildcard.
+
+    Unlike ``_parse_authors``, action values are NOT lowercased: GitLab action
+    strings (``open``, ``update``, ``merge``, ...) are already canonical
+    lowercase and the matcher compares them exactly, so preserving the raw
+    value avoids a silent change to matching semantics.
+    """
+
+    if value is None:
+        return []
+    if isinstance(value, str):
+        if value == "":
+            raise ValueError(
+                f"Invalid action '' in route '{route_name}': "
+                "use a non-empty action or omit the field to allow any action"
+            )
+        return [value]
+    if isinstance(value, list):
+        normalized: List[str] = []
+        for entry in value:
+            if not isinstance(entry, str):
+                raise ValueError(
+                    f"Invalid action entry '{entry!r}' in route '{route_name}': "
+                    "all action list items must be strings"
+                )
+            if entry == "":
+                raise ValueError(
+                    f"Invalid empty action entry in route '{route_name}': "
+                    "remove the empty string or omit the field to allow any action"
+                )
+            normalized.append(entry)
+        return normalized
+    raise ValueError(
+        f"Invalid action value '{value!r}' in route '{route_name}': "
+        "must be a string or list of strings"
+    )
 
 
 @dataclass
@@ -114,6 +204,24 @@ class RouteRegistry:
         self._rules: List[RouteRule] = []
         self._last_mtime: Optional[float] = None
         self._load()
+
+    @property
+    def rules(self) -> List[RouteRule]:
+        """Return the parsed rules (a copy, so callers cannot mutate state)."""
+
+        return list(self._rules)
+
+    def iter_agent_tasks(self) -> Iterator[Tuple[RouteRule, AgentTask]]:
+        """Yield every (rule, agent task) pair in the loaded configuration.
+
+        Used by the startup preflight to validate that each dispatchable
+        agent is credentialed and to derive the set of harness binaries the
+        active configuration actually needs.
+        """
+
+        for rule in self._rules:
+            for task in rule.agents:
+                yield rule, task
 
     def refresh(self) -> None:
         """Reload rules if the file has changed and hot reload is enabled."""
@@ -160,7 +268,13 @@ class RouteRegistry:
             if rule_predicate and not rule_predicate(rule):
                 continue
             if rule.matches(event_name, action, author, labels, mentions, body=body, assignees=assignees):
-                return RouteMatch(rule=rule, agents=rule.agents)
+                # Shuffle a *copy* so the registry's stored agent order is
+                # never mutated; otherwise repeated calls would drift and the
+                # log line would not reflect the original YAML order on reload.
+                agents = list(rule.agents)
+                if rule.randomize and len(agents) > 1:
+                    random.shuffle(agents)
+                return RouteMatch(rule=rule, agents=agents)
         return None
 
     def _load(self) -> None:
@@ -206,6 +320,7 @@ class RouteRegistry:
             for agent in agents
             if agent.get("agent")
         ]
+        self._validate_prompt_arg_placeholders(parsed_agents, name)
         self._expand_model_placeholders(parsed_agents)
         labels = match.get("labels") or []
         if isinstance(labels, str):
@@ -231,11 +346,19 @@ class RouteRegistry:
                 raise ValueError(
                     f"Invalid regex pattern '{pattern_str}' in route '{name}': {exc}"
                 ) from exc
+        randomize = _parse_bool_flag(item.get("randomize", False), "randomize", name)
+        if randomize and len(parsed_agents) <= 1:
+            LOGGER.warning(
+                "Route '%s' sets randomize=true but has %d agent(s); "
+                "the flag has no effect on routes with fewer than 2 agents",
+                name,
+                len(parsed_agents),
+            )
         return RouteRule(
             name=name,
             event=match.get("event", ""),
-            action=match.get("action"),
-            author=match.get("author"),
+            actions=_parse_actions(match.get("action"), name),
+            authors=_parse_authors(match.get("author"), name),
             labels=labels,
             mentions=mentions,
             assignees=assignees,
@@ -244,6 +367,7 @@ class RouteRegistry:
             pattern=compiled_pattern,
             max_wall_clock_seconds=route_wall_clock,
             max_inactivity_seconds=route_inactivity,
+            randomize=randomize,
         )
 
     def _expand_model_placeholders(self, agents: List[AgentTask]) -> None:
@@ -261,6 +385,26 @@ class RouteRegistry:
                 if isinstance(model_value, str):
                     args[index + 1] = self._substitute_model_value(model_value)
 
+    def _validate_prompt_arg_placeholders(self, agents: List[AgentTask], route_name: str) -> None:
+        """Ensure ${PROMPT} is used only as a complete argv element."""
+
+        for agent in agents:
+            options = agent.options or {}
+            args = options.get("args")
+            if not isinstance(args, list):
+                continue
+            for arg in args:
+                if (
+                    isinstance(arg, str)
+                    and PROMPT_ARG_PLACEHOLDER in arg
+                    and arg != PROMPT_ARG_PLACEHOLDER
+                ):
+                    raise ValueError(
+                        f"Invalid {PROMPT_ARG_PLACEHOLDER} usage in route "
+                        f"'{route_name}' for agent '{agent.agent}': the "
+                        "placeholder must be its own args element"
+                    )
+
     _MODEL_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*_MODEL$")
 
     def _substitute_model_value(self, raw_value: str) -> str:
@@ -277,6 +421,8 @@ class RouteRegistry:
         """
 
         if "${" not in raw_value:
+            if raw_value == "":
+                raise ValueError("routes.yaml defines an empty --model value")
             return raw_value
         # Build a combined mapping: explicit overrides first, then env vars
         combined = dict(os.environ)
@@ -289,6 +435,8 @@ class RouteRegistry:
             raise ValueError(
                 f"routes.yaml references undefined model placeholder '${{{missing}}}'"
             ) from exc
+        if resolved == "":
+            raise ValueError("routes.yaml resolved --model placeholder to an empty value")
 
         # Warn about non-MODEL variable references that could leak secrets
         for match in re.finditer(r"\$\{([^}]+)\}", raw_value):
@@ -301,6 +449,19 @@ class RouteRegistry:
                 )
 
         return resolved
+
+
+def _parse_bool_flag(value: Any, field_name: str, route_name: str) -> bool:
+    """Validate a strictly-boolean route field. YAML truthy strings are rejected
+    on purpose so misconfigurations like ``randomize: "yes"`` fail loudly at
+    load time rather than silently behaving as ``False``.
+    """
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"Invalid {field_name} '{value!r}' in route '{route_name}': "
+            "must be a boolean (true or false)"
+        )
+    return value
 
 
 def _parse_optional_positive_int(value: Any, field_name: str, route_name: str) -> Optional[int]:
@@ -320,4 +481,4 @@ def _parse_optional_positive_int(value: Any, field_name: str, route_name: str) -
     return result
 
 
-__all__ = ["AgentTask", "RouteMatch", "RouteRegistry"]
+__all__ = ["AgentTask", "RouteMatch", "RouteRegistry", "RouteRule"]

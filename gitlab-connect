@@ -9,6 +9,30 @@
 set -euo pipefail
 
 HOST="${GLAB_HOST:-gitlab.example.com}"
+
+# Loud-fail when GLAB_HOST resolves to the placeholder so we never silently
+# target a non-existent server. Intent-based: trips even when explicitly
+# exported, and matches ported variants (e.g. gitlab.example.com:8080).
+# The hint deliberately names no example host: this file ships in the published
+# image, and the one example a reader would find obvious is the placeholder the
+# guard just rejected.
+case "${HOST%%:*}" in
+  gitlab.example.com)
+    printf 'Error: GLAB_HOST is not configured (resolves to placeholder "%s").\n' "$HOST" >&2
+    printf '       Export GLAB_HOST=<your-gitlab-host> and retry.\n' >&2
+    exit 1
+    ;;
+esac
+# Reject scheme in GLAB_HOST so we do not double-encode the protocol when
+# constructing credential URLs and glab auth flags.
+case "$HOST" in
+  *://*)
+    printf 'Error: GLAB_HOST must be a bare host (no scheme); got "%s".\n' "$HOST" >&2
+    printf '       Use GLAB_HOST=<host>[:port] and set GLAB_PROTOCOL=http when needed.\n' >&2
+    exit 1
+    ;;
+esac
+
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/glab-cli/config.yml"
 SCRIPT_NAME="$(basename "$0")"
 
@@ -69,6 +93,18 @@ die() {
 }
 
 # --- read-only repo detection and --repo injection ---
+#
+# When the project directory is mounted read-only, glab cannot mutate
+# .git/config and may struggle to auto-detect the repo from the working
+# tree. Detect that case, derive the "owner/project" from origin, and
+# inject --repo <owner/project> into every downstream glab invocation so
+# the API call still targets the right repo.
+#
+# In the read-only case we also skip re-authentication on the assumption
+# that the router has already authenticated this process (see the AUTO_AUTH
+# gate near the bottom of the script). Writes would fail anyway, and
+# re-running glab-usr would attempt .git/config mutations that error on a
+# read-only mount.
 
 REPO_FLAG=()
 READONLY_REPO=0
@@ -76,13 +112,27 @@ READONLY_REPO=0
 detect_readonly_repo() {
   local repo_root
   repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
-  if [[ -e "$repo_root/.git" ]] && ! test -w "$repo_root/.git"; then
-    return 0
+  if [[ -e "$repo_root/.git" ]]; then
+    # Root reports chmod(0555) paths as writable, which made this check depend
+    # on the caller's UID. Inspect mode bits as well so CI and local execution
+    # agree; the access check still catches read-only mounts with writable bits.
+    local mode
+    mode=$(stat -c '%a' "$repo_root/.git" 2>/dev/null || stat -f '%Lp' "$repo_root/.git" 2>/dev/null || true)
+    if [[ "$mode" =~ ^[0-7]+$ ]] && (( (8#$mode & 0222) == 0 )); then
+      return 0
+    fi
+    if ! test -w "$repo_root/.git"; then
+      return 0
+    fi
   fi
   return 1
 }
 
 extract_repo_path() {
+  # Returns the "owner/project" portion of the origin URL, with no host
+  # prefix. glab --repo resolves against the currently-authenticated host,
+  # so omitting the host makes injection robust to container-internal
+  # remotes (service names, ports) that do not match GLAB_HOST.
   local url
   url=$(git remote get-url origin 2>/dev/null) || {
     echo "[gitlab-connect] WARN: could not resolve origin remote URL" >&2
@@ -91,30 +141,25 @@ extract_repo_path() {
   local repo_path="$url"
 
   if [[ "$repo_path" =~ ^[a-zA-Z0-9_.-]+@ ]]; then
-    # SSH scp-style: git@host:ns/proj.git -> host/ns/proj.git
+    # SSH scp-style: git@host:ns/proj.git -> ns/proj.git
     repo_path="${repo_path#*@}"
-    repo_path="${repo_path/://}"
+    repo_path="${repo_path#*:}"
   elif [[ "$repo_path" == ssh://* ]]; then
-    # SSH protocol: ssh://[user@]host[:port]/ns/proj.git
-    # Strip non-standard port since glab --repo expects host/ns/proj
+    # SSH protocol: ssh://[user@]host[:port]/ns/proj.git -> ns/proj.git
     repo_path="${repo_path#*://}"
     repo_path="${repo_path#*@}"
-    local hostport="${repo_path%%/*}"
-    local path_remainder="${repo_path#*/}"
-    if [[ "$hostport" =~ ^.+:[0-9]+$ ]]; then
-      hostport="${hostport%:*}"
-    fi
-    repo_path="$hostport/$path_remainder"
+    repo_path="${repo_path#*/}"
   else
-    # HTTPS or other protocol: strip scheme and userinfo, preserve port
+    # HTTPS or other protocol with scheme: strip scheme, userinfo, host
     repo_path="${repo_path#*://}"
     repo_path="${repo_path#*@}"
+    repo_path="${repo_path#*/}"
   fi
 
   # Strip .git suffix
   repo_path="${repo_path%.git}"
 
-  if [[ -z "$repo_path" || "$repo_path" == "$url" ]]; then
+  if [[ -z "$repo_path" || "$repo_path" == "$url" || "$repo_path" != */* ]]; then
     echo "[gitlab-connect] WARN: could not parse repo path from origin URL: $url" >&2
     return 1
   fi
@@ -176,6 +221,8 @@ Actions:
   edit                Update an issue description (requires ID and --file)
   comment             Add a note to an issue (requires ID and --file)
   view                Display an issue with comments (requires ID)
+  list                List issues (pass-through to `glab issue list`; flags
+                      such as --state, --label, --author are forwarded)
 
 Options:
   -f, --file PATH     Markdown file for create/edit/comment
@@ -195,6 +242,9 @@ Actions:
   edit                Update an MR description (requires ID and --file)
   comment             Add a note to an MR (requires ID and --file)
   view                Display an MR with comments (requires ID)
+  list                List merge requests (pass-through to `glab mr list`;
+                      flags such as --source-branch, --state, --author
+                      are forwarded)
 
 Options:
   -f, --file PATH     Markdown file for create/edit/comment
@@ -207,16 +257,18 @@ USAGE
 
 normalize_issue_action() {
   case "$1" in
-    create|edit|comment|view) printf '%s' "$1" ;;
+    create|edit|comment|view|list) printf '%s' "$1" ;;
     show|get) printf 'view' ;;
+    ls) printf 'list' ;;
     *) die "Invalid issue action: $1" ;;
   esac
 }
 
 normalize_mr_action() {
   case "$1" in
-    create|edit|comment|view) printf '%s' "$1" ;;
+    create|edit|comment|view|list) printf '%s' "$1" ;;
     show|get) printf 'view' ;;
+    ls) printf 'list' ;;
     *) die "Invalid merge request action: $1" ;;
   esac
 }
@@ -440,6 +492,41 @@ issue_view() {
   "${cmd[@]}"
 }
 
+issue_list() {
+  # Thin pass-through to `glab issue list`. All args (including flags such
+  # as --state, --label, --author, --assignee) are forwarded verbatim;
+  # --repo injection is preserved in read-only mounts.
+  local -a forwarded=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        print_issue_usage
+        exit 0
+        ;;
+      --)
+        shift
+        forwarded+=("$@")
+        break
+        ;;
+      *)
+        forwarded+=("$1")
+        shift
+        ;;
+    esac
+  done
+  local -a cmd=(glab issue list)
+  [[ ${#REPO_FLAG[@]} -gt 0 ]] && cmd+=("${REPO_FLAG[@]}")
+  if [[ ${#forwarded[@]} -gt 0 ]]; then
+    cmd+=("${forwarded[@]}")
+  fi
+  local display="glab issue list"
+  if [[ ${#forwarded[@]} -gt 0 ]]; then
+    display+="$(format_args "${forwarded[@]}")"
+  fi
+  log_tool_call "$display"
+  "${cmd[@]}"
+}
+
 mr_create() {
   local title=""
   local body_file=""
@@ -645,6 +732,42 @@ mr_view() {
   "${cmd[@]}"
 }
 
+mr_list() {
+  # Thin pass-through to `glab mr list`. All args (including flags such
+  # as --source-branch, --state, --author) are forwarded verbatim; --repo
+  # injection is preserved in read-only mounts. Used by the "check for
+  # existing MR before opening" step in the GitLab workflow.
+  local -a forwarded=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        print_mr_usage
+        exit 0
+        ;;
+      --)
+        shift
+        forwarded+=("$@")
+        break
+        ;;
+      *)
+        forwarded+=("$1")
+        shift
+        ;;
+    esac
+  done
+  local -a cmd=(glab mr list)
+  [[ ${#REPO_FLAG[@]} -gt 0 ]] && cmd+=("${REPO_FLAG[@]}")
+  if [[ ${#forwarded[@]} -gt 0 ]]; then
+    cmd+=("${forwarded[@]}")
+  fi
+  local display="glab mr list"
+  if [[ ${#forwarded[@]} -gt 0 ]]; then
+    display+="$(format_args "${forwarded[@]}")"
+  fi
+  log_tool_call "$display"
+  "${cmd[@]}"
+}
+
 handle_issue() {
   local action=""
   local -a rest=()
@@ -656,7 +779,7 @@ handle_issue() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      create|edit|comment|view|get|show)
+      create|edit|comment|view|get|show|list|ls)
         if [[ -z "$action" ]]; then
           action="$(normalize_issue_action "$1")"
         else
@@ -686,6 +809,7 @@ handle_issue() {
     edit) issue_edit "${rest[@]}" ;;
     comment) issue_comment "${rest[@]}" ;;
     view) issue_view "${rest[@]}" ;;
+    list) issue_list "${rest[@]}" ;;
     *) die "Unsupported issue action: $action" ;;
   esac
 }
@@ -701,7 +825,7 @@ handle_mr() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      create|edit|comment|view|get|show)
+      create|edit|comment|view|get|show|list|ls)
         if [[ -z "$action" ]]; then
           action="$(normalize_mr_action "$1")"
         else
@@ -731,6 +855,7 @@ handle_mr() {
     edit) mr_edit "${rest[@]}" ;;
     comment) mr_comment "${rest[@]}" ;;
     view) mr_view "${rest[@]}" ;;
+    list) mr_list "${rest[@]}" ;;
     *) die "Unsupported merge request action: $action" ;;
   esac
 }

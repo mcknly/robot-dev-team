@@ -6,6 +6,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 MCKNLY LLC
 
+# provides: claude
+
 set -euo pipefail
 
 echo "[install-claude] Installing Claude Code (native installer)..."

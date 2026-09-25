@@ -22,12 +22,12 @@ class Settings(BaseSettings):
     route_config_path: str = "config/routes.yaml"
     prompt_dir: str = "prompts"
     run_logs_dir: str = "run-logs"
-    npm_cache_dir: str = "/work/.npm-cache"
     enable_auto_clone: bool = False
     auto_clone_depth: int = 0
     enable_branch_switch: bool = False
     enable_smart_branch_selection: bool = True
     enable_auto_unassign: bool = False
+    enable_assign_on_issue_creation: bool = True
     enable_backup_notifications: bool = True
     mention_hold_seconds: float = 3.0
     debug_reload_routes: bool = False
@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     agent_timeout_grace_seconds: int = 10
     live_dashboard_enabled: bool = False
     all_mentions_agents: str = "claude,gemini,codex"
+    randomize_all_mentions: bool = True
 
     # Log pruning settings
     log_pruning_enabled: bool = True

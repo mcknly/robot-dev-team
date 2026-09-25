@@ -14,9 +14,9 @@ import pytest
 
 from app.core.config import settings
 from app.services.glab import (
-    _agent_token_env_var,
     _get_agent_glab_env,
     _get_glab_env,
+    agent_token_env_var,
     notify_agent_termination,
     notify_backup_created,
     resolve_agent_token,
@@ -478,22 +478,22 @@ class TestResolveAgentToken:
 
 
 class TestAgentTokenEnvVarConvention:
-    """Tests for the _agent_token_env_var naming convention."""
+    """Tests for the agent_token_env_var naming convention."""
 
     def test_simple_agent(self):
-        assert _agent_token_env_var("claude") == "CLAUDE_AGENT_GITLAB_TOKEN"
+        assert agent_token_env_var("claude") == "CLAUDE_AGENT_GITLAB_TOKEN"
 
     def test_hyphenated_agent(self):
-        assert _agent_token_env_var("qwen-code") == "QWEN_CODE_AGENT_GITLAB_TOKEN"
+        assert agent_token_env_var("qwen-code") == "QWEN_CODE_AGENT_GITLAB_TOKEN"
 
     def test_multi_hyphen_agent(self):
-        assert _agent_token_env_var("my-cool-agent") == "MY_COOL_AGENT_AGENT_GITLAB_TOKEN"
+        assert agent_token_env_var("my-cool-agent") == "MY_COOL_AGENT_AGENT_GITLAB_TOKEN"
 
     def test_uppercase_input(self):
-        assert _agent_token_env_var("CLAUDE") == "CLAUDE_AGENT_GITLAB_TOKEN"
+        assert agent_token_env_var("CLAUDE") == "CLAUDE_AGENT_GITLAB_TOKEN"
 
     def test_mixed_case_input(self):
-        assert _agent_token_env_var("Qwen-Code") == "QWEN_CODE_AGENT_GITLAB_TOKEN"
+        assert agent_token_env_var("Qwen-Code") == "QWEN_CODE_AGENT_GITLAB_TOKEN"
 
 
 class TestNotifyBackupCreated:

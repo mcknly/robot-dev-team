@@ -85,23 +85,26 @@ async def _maybe_fetch_enrichment(event: Dict[str, Any], project_path: Optional[
             return _format_enrichment(response)
 
     if event.get("object_kind") == "note":
-        noteable_type = event.get("object_attributes", {}).get("noteable_type", "")
-        if noteable_type == "MergeRequest":
-            iid = event.get("merge_request", {}).get("iid")
-            if iid is not None:
-                response = await glab.fetch_merge_request(
-                    project_path, int(iid)
-                )
-                return _format_enrichment(response)
-        elif noteable_type == "Issue":
-            iid = event.get("issue", {}).get("iid")
-            if iid is not None:
-                response = await glab.fetch_issue(project_path, int(iid))
-                return _format_enrichment(response)
-        else:
-            LOGGER.debug(
-                "No enrichment handler for noteable_type=%s", noteable_type
-            )
+        return await _fetch_note_enrichment(event, project_path)
+
+    return None
+
+
+async def _fetch_note_enrichment(event: Dict[str, Any], project_path: str) -> Optional[str]:
+    """Fetch enrichment for a note event based on its noteable type."""
+    noteable_type = event.get("object_attributes", {}).get("noteable_type", "")
+    if noteable_type == "MergeRequest":
+        iid = event.get("merge_request", {}).get("iid")
+        if iid is not None:
+            response = await glab.fetch_merge_request(project_path, int(iid))
+            return _format_enrichment(response)
+    elif noteable_type == "Issue":
+        iid = event.get("issue", {}).get("iid")
+        if iid is not None:
+            response = await glab.fetch_issue(project_path, int(iid))
+            return _format_enrichment(response)
+    else:
+        LOGGER.debug("No enrichment handler for noteable_type=%s", noteable_type)
 
     return None
 

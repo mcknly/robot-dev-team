@@ -41,10 +41,10 @@ It is designed for local or self-hosted GitLab setups. GitHub integrations will 
 - Run multiple agents serially per trigger and log their outputs.
 - Package as a lightweight Docker container with:
   - Python backend (FastAPI)
-  - Node + NPM-installed CLIs (Claude Code, Gemini, OpenAI Codex)
+  - Native agent CLIs installed at startup (Claude Code, Antigravity for Gemini, OpenAI Codex)
   - GitLab CLI (`glab`)
   - Configuration via `.env`, bind-mounted config files, and YAML routes.
-- Agent-specific CLI configs (`~/.claude`, `~/.gemini`, `~/.codex`) bind-mounted from the host; GitLab CLI state and token files are generated inside the container at startup by `docker-entrypoint.sh`. Git credentials are configured per repository at runtime.
+- Agent-specific CLI configs (`~/.claude`, `~/.gemini`, `~/.codex`) bind-mounted from the host; GitLab CLI state and token files are generated inside the container at startup by `docker-entrypoint.sh`. Git credentials are configured per repository at runtime, via a host-scoped credential helper that resets helpers inherited from broader config scopes so the dispatched agent -- not an operator-configured global helper -- authenticates the push. The same precedence applies downward: a repository-scoped helper outranks a global one, so background services that authenticate outside a repository (the branch pruner) pin their git commands with command-scope `-c` overrides instead of rewriting a live checkout's config (see `docs/AGENT_ONBOARDING.md`).
   - Bind-mount placeholders for project repositories tied to incoming webhooks so agents work against live sources.
 
 ### Non-Goals
@@ -67,7 +67,7 @@ It is designed for local or self-hosted GitLab setups. GitHub integrations will 
                                                                                       │
                                                                                       └─────────┬─────────┐
                                                                                                 │ Claude CLI Agent │
-                                                                                                │ Gemini CLI Agent │
+                                                                                                │ Antigravity Agent│
                                                                                                 │ Codex CLI Agent  │
                                                                                                 └──────────────────┘
 ```
@@ -82,10 +82,10 @@ It is designed for local or self-hosted GitLab setups. GitHub integrations will 
 | Config Management              | `.env` via `pydantic-settings`                            |
 | Async Execution                | `asyncio.subprocess`                                      |
 | Trigger Scheduling             | In-memory FIFO queue (`TriggerQueue`)                     |
-| Agent CLIs                     | `claude` (Node), `gemini` (Node), `codex` (Node) |
+| Agent CLIs                     | `claude` (native installer), `agy` (Antigravity, used for the `gemini` agent), `codex` + `codex-code-mode-host` (paired native binaries) |
 | SCM CLIs                       | `glab` (GitLab CLI)                                        |
 | Helper Scripts                 | `gitlab-connect` (GitLab issue/MR helper) + `glab-usr` (auth switch) |
-| Container Base                 | `python:3.12-slim` + Node.js + NPM                        |
+| Container Base                 | `python:3.14-slim-trixie` (Debian 13; no Node.js / npm)   |
 | Logs                           | Persistent volume `./run-logs`                            |
 | Prompt Templates               | Plain text via `string.Template`                          |
 
@@ -111,6 +111,7 @@ It is designed for local or self-hosted GitLab setups. GitHub integrations will 
    - The queue worker executes each trigger sequentially; within a trigger the configured agents also run serially (one at a time).
   - Each agent runs GitLab operations through the `gitlab-connect` wrapper, which sets `CURRENT_AGENT` and calls `glab-usr` to ensure the correct service account is active before invoking `glab`.
    - Capture stdout (final reply) and the thinking stream (stderr) to `/work/run-logs/<uuid>-<project>-<route>-<agent>.out.json`.
+   - **Panel-aware review prompts.** The `issue_review` and `merge_request_review` prompts frame each agent as one of a serial review panel and tell later reviewers to read prior comments (via `gitlab-connect <issue|mr> view <id>`), prefer net-new findings or concise endorsements over restating the baseline, and disagree explicitly when warranted. The prompts also include a "Branch sanity check" step instructing the reviewer to run `git branch --show-current` and flag any mismatch with the resolved `${SOURCE_BRANCH}` -- a cheap redundancy guard against silent fallback paths in `app/services/branch_resolver.py`. This relies on the serial dispatch above: prior reviewer comments are only on the issue/MR thread when the next agent starts because the previous agent has already finished and posted. If this dispatch is ever parallelized (e.g. `asyncio.gather`), the review prompts must be revisited or the prompt strategy moved to dispatcher-side injection of `${PRIOR_REVIEWS}` (tracked as a follow-up; see `prompts/issue_review.txt` and `prompts/merge_request_review.txt`).
 8. Respond with HTTP 200 containing aggregated execution results plus a `triggers` array describing each processed mention-specific job (route name, mentions, status, agents).
 
 ---
@@ -137,9 +138,9 @@ GEMINI_AGENT_GITLAB_TOKEN=replace_me
 CODEX_AGENT_GITLAB_TOKEN=replace_me
 
 # Agent model identifiers (referenced via ${<AGENT>_MODEL} in routes.yaml)
-CLAUDE_MODEL=claude-opus-4-6
-GEMINI_MODEL=gemini-3.1-pro-preview
-CODEX_MODEL=gpt-5.4
+CLAUDE_MODEL=claude-opus-5
+GEMINI_MODEL=gemini-3.6-flash-high
+CODEX_MODEL=gpt-5.6-sol
 
 # Agent credential paths (bind-mounted into the container)
 CLAUDE_CONFIG_PATH=~/.claude
@@ -200,6 +201,8 @@ routes:
     match:
       event: "Merge Request Hook"
       action: "open"
+      # `author` accepts a single username or a list of usernames
+      # (e.g., ["alice", "bob"]); matching is case-insensitive in both forms.
       author: "your-username"
     agents:
       - agent: claude
@@ -265,7 +268,7 @@ ${JSON}
 
 ### `Dockerfile`
 
-The image is based on `python:3.12-slim` with Node.js, npm, Git, and the GitLab CLI (`glab`) installed at build time. Key build-time steps:
+The image is based on `python:3.14-slim-trixie` (Debian 13) with Git and the GitLab CLI (`glab`) installed at build time. Agent CLIs (Claude, Antigravity for Gemini, Codex) are installed at container start via the `scripts/install-*.sh` entrypoints rather than baked into the image. Key build-time steps:
 
 - Copies `gitlab-connect` and `glab-usr` helper scripts to `/usr/local/bin/`.
 - Installs Python dependencies via `uv` from `pyproject.toml`.
@@ -280,11 +283,10 @@ For local testing outside containers, the repository provides `./launch-uvicorn-
 
 The entrypoint performs the following steps at container start:
 
-1. **UID/GID remapping** — When running as root (the initial Docker user), remaps the `appuser` account to match `LOCAL_UID`/`LOCAL_GID` from the environment, then re-executes itself via `gosu` as the unprivileged user. This ensures bind-mounted credential directories remain accessible.
+1. **UID/GID remapping** — When running as root (the initial Docker user), remaps the `appuser` account to match `LOCAL_UID`/`LOCAL_GID` from the environment, then re-executes itself as the unprivileged user via `setpriv` (from `util-linux`). This ensures bind-mounted credential directories remain accessible. `setpriv` replaced `gosu`, whose bookworm build was a static Go binary linked against an EOL Go 1.19.8 toolchain that no snapshot bump could move. Trixie ships a `gosu` rebuilt on a current toolchain, but `setpriv` stays: it carries no Go runtime and so no Go-stdlib CVE surface at all, which is the property that does not decay as a toolchain ages, and `scripts/ci-smoke-image.sh` asserts `gosu` is absent. The invocation is `--reuid appuser --regid appuser --init-groups --inh-caps=-all`: the account is resolved **by name** (the remap passes `-o`, so a numeric lookup could return a colliding account), `--init-groups` is required rather than optional (`setpriv` rejects `--regid` without a groups flag), and the environment is deliberately inherited — `--reset-env` would break the token loop in step 2 and drop the venv from `PATH`. `HOME` comes from the image's `ENV`, not from the privilege drop. The entrypoint logs the identity it lands on, which is the only external evidence of the drop: the image has no `USER` directive, so `docker exec <container> id -u` reports the exec's own root.
 2. **Convention-based token-file generation** — Scans environment variables for any `*_AGENT_GITLAB_TOKEN` pattern and writes the value to `~/.<agent>/glab-token` (mode `0600`). The agent directory name is the lowercase, hyphen-separated form of the prefix (e.g., `QWEN_CODE_AGENT_GITLAB_TOKEN` writes to `~/.qwen-code/glab-token`). This supports arbitrary agent names without code changes.
-3. **npm cache setup** — Validates the configured cache directory is writable, falling back to `/tmp/npm-cache` if not.
-4. **Agent CLI installation** — Discovers and runs all `scripts/install-*.sh` scripts. To add a new agent CLI, drop an installer script into `scripts/` (see `docs/ADDING_AN_AGENT.md`).
-5. **Application launch** — Executes the CMD (`uvicorn app.main:app ...`).
+3. **Agent CLI installation** — Ensures `~/.local/bin` exists on the PATH, then discovers and runs all `scripts/install-*.sh` scripts. Every shipped installer uses a native (non-npm) installer that drops its binary into `~/.local/bin`. To add a new agent CLI, drop an installer script into `scripts/` (see `docs/ADDING_AN_AGENT.md`).
+4. **Application launch** — Executes the CMD (`uvicorn app.main:app ...`).
 
 ---
 
@@ -293,8 +295,8 @@ The entrypoint performs the following steps at container start:
 The Compose file defines a single `app` service with the following key bindings:
 
 - **Prompts and config** — `./prompts` and `./config` mounted read-only.
-- **Run logs and npm cache** — `./run-logs` and `./npm-cache` mounted read-write.
-- **Agent credential directories** — `~/.claude`, `~/.gemini`, `~/.codex` (configurable via `*_CONFIG_PATH` env vars) bind-mounted so CLIs reuse host authentication.
+- **Run logs** — `./run-logs` mounted read-write.
+- **Agent credential directories** — `~/.claude`, `~/.gemini`, `~/.codex` (configurable via `*_CONFIG_PATH` env vars) bind-mounted so CLIs reuse host authentication. The `~/.gemini/antigravity-cli/` subtree carries the Antigravity CLI's settings, conversation history, and (after the one-time bootstrap described in `docs/AGENT_ONBOARDING.md`) its `antigravity-oauth-token` JSON file. Antigravity falls back to that file in any environment without a host desktop libsecret session, which is always the case inside the container. The file is mode 0600 and is the only on-disk credential `agy` reads from in this deployment; the Gemini preflight in `app/services/agents.py` validates its presence before dispatch and fast-fails with a bootstrap hint if it is missing.
 - **Project repositories** — A parent `./projects` directory is mounted twice:
   - `/work/projects` (read-write) for work routes with `access: readwrite`.
   - `/work/projects-ro` (read-only) for analysis routes with `access: readonly`.
@@ -309,7 +311,7 @@ For additional per-machine customizations, create `docker-compose.override.yml` 
 ## 8. Security
 
 - Validate all webhook requests against the shared secret token.
-- Restrict command execution to a safe allowlist (`claude`, `gemini`, `codex`, `gitlab-connect`, `glab`, `glab-usr`, `python`).
+- Restrict command execution to a safe allowlist (`claude`, `agy`, `codex`, `gitlab-connect`, `glab`, `glab-usr`, `python`).
 - Enforce per-command timeout limits.
 - Run the container as a non-root `appuser`.
 - Mount configuration, prompt directories, and agent CLI token directories; these mounts remain writable so the entrypoint can refresh `glab-token` mirrors.
@@ -417,7 +419,7 @@ If the configured log directory is unwritable, the agent runner falls back to a 
 - ✅ YAML-based routing with conditions
 - ✅ Prompt rendering with Markdown extra context
 - ✅ Multi-agent execution with serial asyncio dispatch
-- ✅ Node-based agent CLIs installed at runtime
+- ✅ Native agent CLIs installed at runtime (Claude, Antigravity for Gemini, Codex)
 - ✅ GitLab CLI enrichment support
 - ✅ Dockerfile + Docker Compose for reproducible deployment
 - ✅ Logging and simple health check

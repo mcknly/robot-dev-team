@@ -1,0 +1,17 @@
+# Robot Dev Team Project
+# File: tests/fixtures/ci/routes.yaml
+# Description: Hermetic route configuration for container startup smoke tests.
+# License: MIT
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 MCKNLY LLC
+
+routes:
+  - name: ci-smoke
+    match:
+      event: "Issue Hook"
+      action: "open"
+    agents:
+      - agent: "ci-smoke"
+        task: "triage"
+        options:
+          command: "python3"

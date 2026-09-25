@@ -7,7 +7,7 @@ Copyright (c) 2025 MCKNLY LLC
 """
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -29,6 +29,9 @@ class DummyDeduplicator:
 
 def setup_common_patches(monkeypatch, should_process=True):
     monkeypatch.setattr(settings, "gitlab_webhook_secret", "top-secret")
+    # Pin to deterministic dispatch by default so unrelated tests are not
+    # coupled to @all shuffle behavior; tests that exercise issue #14 opt in.
+    monkeypatch.setattr(settings, "randomize_all_mentions", False)
     monkeypatch.setattr(webhooks, "_DEDUP", DummyDeduplicator(should_process))
 
     default_rule = SimpleNamespace(name="default-route", mentions=[], assignees=[], access="readonly")
@@ -666,6 +669,447 @@ async def test_webhook_expands_agents_alias(monkeypatch):
 
     agents = {agent["agent"] for agent in data["agents"]}
     assert agents == {"agent-claude-route", "agent-codex-route"}
+
+
+# ---------------------------------------------------------------------------
+# Issue #14 (randomize @all dispatch order) and issue #16 (author-aware @all
+# expansion, code-span stripping, self-mention filtering).
+# ---------------------------------------------------------------------------
+
+
+def _agent_route_resolver(mapping):
+    """Build a resolver mapping single-mention tuples to per-mention routes."""
+
+    def resolver(event_name, action, author, labels, mentions, body=None, assignees=None, rule_predicate=None):
+        route_name = mapping.get(tuple(m.lower() for m in mentions))
+        if not route_name:
+            return None
+        rule = SimpleNamespace(name=route_name, mentions=mentions, assignees=[], access="readonly")
+        if rule_predicate and not rule_predicate(rule):
+            return None
+        agents = [AgentTask(agent=f"agent-{route_name}", task="review")]
+        return RouteMatch(rule=rule, agents=agents)
+
+    return resolver
+
+
+async def _post_note(note, uuid, user=None):
+    payload = {
+        "object_kind": "note",
+        "object_attributes": {"action": "create", "note": note},
+    }
+    if user is not None:
+        payload["user"] = {"username": user}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        return await client.post(
+            "/webhooks/gitlab",
+            json=payload,
+            headers={
+                "X-Gitlab-Token": "top-secret",
+                "X-Gitlab-Event": "Note Hook",
+                "X-Gitlab-Event-UUID": uuid,
+            },
+        )
+
+
+_THREE_AGENT_ROUTES = {
+    ("claude",): "claude-route",
+    ("gemini",): "gemini-route",
+    ("codex",): "codex-route",
+}
+
+
+@pytest.mark.asyncio
+async def test_all_mention_randomizes_dispatch_when_enabled(monkeypatch):
+    setup_common_patches(monkeypatch)
+    monkeypatch.setattr(settings, "all_mentions_agents", "claude,gemini,codex")
+    monkeypatch.setattr(settings, "randomize_all_mentions", True)
+    monkeypatch.setattr(webhooks._ROUTES, "resolve_match", _agent_route_resolver(_THREE_AGENT_ROUTES))
+
+    shuffle_calls = []
+
+    def fake_shuffle(seq):
+        shuffle_calls.append(list(seq))
+        seq.reverse()
+
+    monkeypatch.setattr(webhooks.random, "shuffle", fake_shuffle)
+
+    response = await _post_note("@all please review", "uuid-rand-on")
+
+    assert response.status_code == 200
+    data = response.json()
+    # Shuffle is invoked once, with the fully expanded mention list.
+    assert shuffle_calls == [["claude", "gemini", "codex"]]
+    # Dispatch order follows the shuffled (reversed) list.
+    order = [trigger["route"] for trigger in data["triggers"]]
+    assert order == ["codex-route", "gemini-route", "claude-route"]
+
+
+@pytest.mark.asyncio
+async def test_all_mention_deterministic_when_disabled(monkeypatch):
+    setup_common_patches(monkeypatch)  # randomize_all_mentions pinned False
+    monkeypatch.setattr(settings, "all_mentions_agents", "claude,gemini,codex")
+    monkeypatch.setattr(webhooks._ROUTES, "resolve_match", _agent_route_resolver(_THREE_AGENT_ROUTES))
+
+    def fail_shuffle(seq):
+        raise AssertionError("shuffle must not run when RANDOMIZE_ALL_MENTIONS is false")
+
+    monkeypatch.setattr(webhooks.random, "shuffle", fail_shuffle)
+
+    response = await _post_note("@all please review", "uuid-rand-off")
+
+    assert response.status_code == 200
+    data = response.json()
+    order = [trigger["route"] for trigger in data["triggers"]]
+    assert order == ["claude-route", "gemini-route", "codex-route"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_mention_list_not_shuffled(monkeypatch):
+    """Explicit @claude @gemini @codex stays deterministic even with the flag on."""
+    setup_common_patches(monkeypatch)
+    monkeypatch.setattr(settings, "all_mentions_agents", "claude,gemini,codex")
+    monkeypatch.setattr(settings, "randomize_all_mentions", True)
+    monkeypatch.setattr(webhooks._ROUTES, "resolve_match", _agent_route_resolver(_THREE_AGENT_ROUTES))
+
+    def fail_shuffle(seq):
+        raise AssertionError("explicit mention lists must not be shuffled")
+
+    monkeypatch.setattr(webhooks.random, "shuffle", fail_shuffle)
+
+    response = await _post_note("@claude @gemini @codex please review", "uuid-explicit")
+
+    assert response.status_code == 200
+    data = response.json()
+    order = [trigger["route"] for trigger in data["triggers"]]
+    assert order == ["claude-route", "gemini-route", "codex-route"]
+
+
+@pytest.mark.asyncio
+async def test_agent_authored_all_mention_suppressed(monkeypatch):
+    """An agent authoring @all does not fan out (issue #16 self-recursion guard)."""
+    setup_common_patches(monkeypatch)
+    monkeypatch.setattr(settings, "all_mentions_agents", "claude,gemini,codex")
+    monkeypatch.setattr(settings, "randomize_all_mentions", True)
+    monkeypatch.setattr(webhooks._ROUTES, "resolve_match", _agent_route_resolver(_THREE_AGENT_ROUTES))
+
+    response = await _post_note("@all please review", "uuid-agent-all", user="gemini")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ignored"
+    assert data["reason"] == "no-routes"
+
+
+@pytest.mark.asyncio
+async def test_agent_authored_all_keeps_explicit_co_mentions(monkeypatch):
+    """@all suppression for agent authors still honors explicitly named agents."""
+    setup_common_patches(monkeypatch)
+    monkeypatch.setattr(settings, "all_mentions_agents", "claude,gemini,codex")
+    monkeypatch.setattr(webhooks._ROUTES, "resolve_match", _agent_route_resolver(_THREE_AGENT_ROUTES))
+
+    response = await _post_note("@all @claude take a look", "uuid-agent-all-explicit", user="gemini")
+
+    assert response.status_code == 200
+    data = response.json()
+    order = [trigger["route"] for trigger in data["triggers"]]
+    assert order == ["claude-route"]
+
+
+@pytest.mark.asyncio
+async def test_backticked_all_mention_not_expanded(monkeypatch):
+    """A comment that merely discusses `@all` in backticks must not fan out.
+
+    Mirrors the real incident in issue #16: a comment addressed to @codex that
+    quotes `@all` while asking a question previously dispatched all three agents.
+    """
+    setup_common_patches(monkeypatch)
+    monkeypatch.setattr(settings, "all_mentions_agents", "claude,gemini,codex")
+    monkeypatch.setattr(webhooks._ROUTES, "resolve_match", _agent_route_resolver(_THREE_AGENT_ROUTES))
+
+    response = await _post_note(
+        "@codex - what did the agent `@all` mention ignore about my guard?",
+        "uuid-backtick",
+        user="cavin",
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    order = [trigger["route"] for trigger in data["triggers"]]
+    assert order == ["codex-route"]
+
+
+@pytest.mark.asyncio
+async def test_self_mention_filtered_for_agent_author(monkeypatch):
+    """An agent is never dispatched against a comment it authored (issue #16)."""
+    setup_common_patches(monkeypatch)
+    monkeypatch.setattr(settings, "all_mentions_agents", "claude,gemini,codex")
+    monkeypatch.setattr(webhooks._ROUTES, "resolve_match", _agent_route_resolver(_THREE_AGENT_ROUTES))
+
+    response = await _post_note("@gemini @claude let's sync", "uuid-self", user="gemini")
+
+    assert response.status_code == 200
+    data = response.json()
+    order = [trigger["route"] for trigger in data["triggers"]]
+    assert order == ["claude-route"]
+
+
+def test_strip_code_spans_removes_backticked_mentions():
+    text = "@codex see `@all` and ```\n@gemini\n``` but @claude stays"
+    assert webhooks._parse_mentions_from_text(text) == ["codex", "claude"]
+
+
+def test_strip_code_spans_removes_tilde_fenced_mentions():
+    """Tilde-fenced code blocks (~~~...~~~) are stripped along with backtick fences."""
+    text = "@codex see\n~~~\n@all should be code\n~~~\nbut @claude stays"
+    assert webhooks._parse_mentions_from_text(text) == ["codex", "claude"]
+
+
+def test_strip_code_spans_removes_multi_backtick_inline_mentions():
+    """Multi-backtick inline spans (e.g. ``@all``) are stripped via paired-run matching."""
+    text = "@codex compare ``@all`` to @claude"
+    assert webhooks._parse_mentions_from_text(text) == ["codex", "claude"]
+
+
+def test_parse_mentions_ignores_email_local_part():
+    """An ``@`` glued to a preceding identifier (email local-part) is not a mention."""
+    text = "Please forward to support@all and notify @claude"
+    assert webhooks._parse_mentions_from_text(text) == ["claude"]
+
+
+def test_parse_mentions_ignores_url_path_mentions():
+    """An ``@`` after a URL path separator is not a mention."""
+    text = "Context lives at https://example.com/@all -- ping @codex when ready"
+    assert webhooks._parse_mentions_from_text(text) == ["codex"]
+
+
+def test_parse_mentions_matches_real_mention_shapes():
+    """Common real-mention prefixes still match after the boundary lookbehind."""
+    # start-of-string, after space, after comma+space, inside parentheses, after dash+space
+    text = "@cavin says: hi @claude, please ping (@gemini) - @codex confirm."
+    assert webhooks._parse_mentions_from_text(text) == ["cavin", "claude", "gemini", "codex"]
+
+
+def test_indented_code_block_strips_all_mention():
+    """Issue #17 item 1: a 4-space-indented code block is stripped.
+
+    Flips the former pin-current-behavior test: an @all shown as indented code
+    (preceded by a blank line, per CommonMark) no longer parses as a live
+    mention.
+    """
+    text = "Normal text\n\n    @all should be code\n\nback to text"
+    assert "all" not in webhooks._parse_mentions_from_text(text)
+
+
+def test_tab_indented_code_block_strips_all_mention():
+    """A tab-indented line is treated as code just like four spaces."""
+    text = "Normal text\n\n\t@all should be code\n\nback to text"
+    assert "all" not in webhooks._parse_mentions_from_text(text)
+
+
+def test_indented_line_after_paragraph_is_stripped():
+    """Every qualifying indented line is stripped, without trying to tell an
+    indented code block apart from a paragraph continuation. Dropping the
+    blank-lead-in heuristic is the over-strip-biased trade-off (issue #17
+    review): a per-line flag cannot model block containment, and the safe
+    direction is to strip."""
+    text = "Some paragraph\n    @all still indented"
+    assert "all" not in webhooks._parse_mentions_from_text(text)
+
+
+def test_list_item_continuation_mention_over_stripped():
+    """A 4-space-indented list-item continuation is over-stripped along with
+    real indented code. Per the review consensus this dropped mention is the
+    accepted, recoverable cost of remaining GLFM-parser-free while never
+    under-stripping a quoted ``@all`` (issue #17)."""
+    text = "- first item\n    @all continuation"
+    assert "all" not in webhooks._parse_mentions_from_text(text)
+
+
+def test_mixed_space_tab_indent_stripped():
+    """Up to three spaces followed by a tab reaches a CommonMark tab stop and
+    opens an indented code block, so ``@all`` there is stripped (issue #17
+    review, codex finding #1)."""
+    text = "intro\n\n  \t@all shown as code"
+    assert "all" not in webhooks._parse_mentions_from_text(text)
+
+
+def test_indented_code_after_heading_stripped():
+    """Indented code following a heading (a non-paragraph block) is stripped;
+    the old blank-lead-in heuristic under-stripped this fan-out shape (issue #17
+    review, codex finding #2)."""
+    text = "# Example\n    @all shown as code"
+    assert "all" not in webhooks._parse_mentions_from_text(text)
+
+
+def test_indented_code_after_blockquote_stripped():
+    """Indented code following a blockquote line is stripped rather than parsed
+    as a live mention (issue #17 review, codex finding #2)."""
+    text = "> context\n    @all shown as code"
+    assert "all" not in webhooks._parse_mentions_from_text(text)
+
+
+def test_lazy_blockquote_continuation_stripped():
+    """A bare mention line immediately following a ``>`` line (no blank
+    separator) is a lazy blockquote continuation -- GitLab renders it as still
+    quoted, so it is stripped too (issue #17 review, claude finding)."""
+    text = "> quoted @foo\nstill quoted @all"
+    assert webhooks._parse_mentions_from_text(text) == []
+
+
+def test_blank_line_closes_lazy_blockquote_continuation():
+    """A blank line ends the quoted paragraph, so a mention after the blank
+    still parses (guards the over-strip from spilling past the quote)."""
+    text = "> quoted @foo\n\n@claude real request"
+    assert webhooks._parse_mentions_from_text(text) == ["claude"]
+
+
+def test_single_line_fence_preserves_word_boundary():
+    """A single-line ``` fence spans no newline, so it collapses to a space
+    (not the empty string) to keep surrounding words separated (issue #17
+    review, gemini finding #1)."""
+    assert webhooks._strip_code_spans("a```b```c") == "a c"
+
+
+def test_blockquoted_all_mention_stripped():
+    """Issue #17 item 2: a blockquoted line (``> ...``) is stripped.
+
+    Flips the former pin-current-behavior test: a reply quoting a prior ``@all``
+    no longer re-expands on receipt.
+    """
+    text = "> Earlier: @all please review\n\nMy reply: thanks"
+    assert "all" not in webhooks._parse_mentions_from_text(text)
+
+
+def test_blockquote_three_space_prefix_stripped():
+    """Up to three leading spaces before ``>`` still counts as a blockquote."""
+    text = "   > quoted @all please review\n\nplain reply"
+    assert "all" not in webhooks._parse_mentions_from_text(text)
+
+
+def test_nested_blockquote_stripped():
+    """A nested blockquote (``> > ...``) is stripped."""
+    text = "> > deeply quoted @all\n\nplain reply"
+    assert "all" not in webhooks._parse_mentions_from_text(text)
+
+
+def test_gitlab_multiline_blockquote_stripped():
+    """A GitLab ``>>> ... >>>`` multiline blockquote strips its interior even
+    though the interior lines carry no ``>`` prefix."""
+    text = ">>>\nEarlier someone said @all please review\n>>>\n\nMy reply"
+    assert "all" not in webhooks._parse_mentions_from_text(text)
+
+
+def test_unclosed_multiline_blockquote_strips_to_end():
+    """An unclosed ``>>>`` region fails safe by stripping to end-of-text."""
+    text = ">>>\nquoted @all with no closing marker"
+    assert "all" not in webhooks._parse_mentions_from_text(text)
+
+
+def test_redirect_operator_not_treated_as_blockquote():
+    """A ``>`` appearing mid-line (shell redirect) is not a blockquote, so a
+    real mention on that line is preserved."""
+    text = "run build > out.txt and ping @claude"
+    assert webhooks._parse_mentions_from_text(text) == ["claude"]
+
+
+def test_mention_after_blockquote_block_preserved():
+    """A live mention immediately after a quoted block still parses."""
+    text = "> quoted @all please review\n\n@claude real request"
+    mentions = webhooks._parse_mentions_from_text(text)
+    assert "all" not in mentions
+    assert "claude" in mentions
+
+
+def test_mention_after_indented_code_block_preserved():
+    """A live mention immediately after an indented code block still parses."""
+    text = "intro\n\n    @all in code\n\n@claude real request"
+    mentions = webhooks._parse_mentions_from_text(text)
+    assert "all" not in mentions
+    assert "claude" in mentions
+
+
+def test_fenced_block_then_indented_line_both_stripped():
+    """Fence interaction: a fenced block and a following indented code block are
+    both stripped, and a live mention after them is preserved."""
+    text = "```\n@gemini in fence\n```\n\n    @all indented\n\n@claude stays"
+    mentions = webhooks._parse_mentions_from_text(text)
+    assert "gemini" not in mentions
+    assert "all" not in mentions
+    assert mentions == ["claude"]
+
+
+def test_filter_self_mention_drops_author_username():
+    """An agent author is removed from their own dispatch list."""
+    assert webhooks._filter_self_mention("claude", ["claude", "gemini"]) == ["gemini"]
+
+
+def test_filter_self_mention_case_insensitive():
+    """Author-vs-mention match is case-insensitive."""
+    assert webhooks._filter_self_mention("Claude", ["claude", "gemini"]) == ["gemini"]
+
+
+def test_filter_self_mention_noop_for_human_author():
+    """A human author leaves the mention list untouched."""
+    assert webhooks._filter_self_mention("cavin", ["claude", "gemini"]) == ["claude", "gemini"]
+
+
+def test_filter_self_mention_noop_for_empty_author():
+    """An empty author short-circuits before any filtering."""
+    assert webhooks._filter_self_mention("", ["claude", "gemini"]) == ["claude", "gemini"]
+
+
+@pytest.mark.asyncio
+async def test_base_match_receives_unshuffled_mention_list(monkeypatch):
+    """The multi-agent base_match sees the unshuffled list even when the
+    per-mention dispatch is shuffled. Locks the diagnostic contract called out
+    in MR #10 review (#14 randomization should not leak into base_match logs).
+    """
+    setup_common_patches(monkeypatch)
+    monkeypatch.setattr(settings, "all_mentions_agents", "claude,gemini,codex")
+    monkeypatch.setattr(settings, "randomize_all_mentions", True)
+
+    base_observed = {"mentions": None}
+    per_mention_observed = []
+
+    def resolver(event_name, action, author, labels, mentions, body=None, assignees=None, rule_predicate=None):
+        if rule_predicate is webhooks._exclude_single_mention_rules:
+            # The base_match path. Record what was handed in and decline to
+            # match so we do not need to mock a multi-agent route.
+            base_observed["mentions"] = list(mentions)
+            return None
+        per_mention_observed.append(list(mentions))
+        route_name = _THREE_AGENT_ROUTES.get(tuple(m.lower() for m in mentions))
+        if not route_name:
+            return None
+        rule = SimpleNamespace(name=route_name, mentions=mentions, assignees=[], access="readonly")
+        agents = [AgentTask(agent=f"agent-{route_name}", task="review")]
+        return RouteMatch(rule=rule, agents=agents)
+
+    monkeypatch.setattr(webhooks._ROUTES, "resolve_match", resolver)
+    monkeypatch.setattr(webhooks.random, "shuffle", lambda seq: seq.reverse())
+
+    response = await _post_note("@all please review", "uuid-base-unshuffled")
+
+    assert response.status_code == 200
+    # base_match resolver call observed the unshuffled, fully expanded list.
+    assert base_observed["mentions"] == ["claude", "gemini", "codex"]
+    # Per-mention dispatch followed the shuffled (reversed) order.
+    assert per_mention_observed == [["codex"], ["gemini"], ["claude"]]
+
+
+def test_expand_all_mention_reports_expansion_flag():
+    mentions, expanded = webhooks._expand_all_mention(["all"], author="cavin")
+    assert expanded is True
+    mentions2, expanded2 = webhooks._expand_all_mention(["claude", "gemini"], author="cavin")
+    assert expanded2 is False
+    assert mentions2 == ["claude", "gemini"]
+
+
+def test_expand_all_mention_suppressed_for_agent_author():
+    mentions, expanded = webhooks._expand_all_mention(["all", "claude"], author="gemini")
+    assert expanded is False
+    assert mentions == ["claude"]
 
 
 @pytest.mark.asyncio
@@ -1835,8 +2279,6 @@ async def test_self_unassign_does_not_suppress_genuine_assign(monkeypatch):
     """A genuine assignment webhook is NOT suppressed by the self-unassign tracker."""
     webhooks._RECENT_UNASSIGNS.clear()
 
-    dispatch_called = []
-
     def resolver(event_name, action, author, labels, mentions, body=None, assignees=None, rule_predicate=None):
         if assignees and "claude" in assignees:
             rule = SimpleNamespace(name="assign-mr-claude", mentions=[], assignees=["claude"], access="readwrite")
@@ -2194,8 +2636,6 @@ async def test_system_unassign_note_with_registry_match(monkeypatch):
 async def test_non_system_note_not_suppressed(monkeypatch):
     """A regular (non-system) note mentioning @claude is NOT suppressed."""
     webhooks._RECENT_UNASSIGNS.clear()
-
-    dispatch_called = []
 
     def resolver(event_name, action, author, labels, mentions, body=None, assignees=None, rule_predicate=None):
         if mentions and "claude" in mentions:
@@ -2670,3 +3110,512 @@ async def test_backup_notification_posts_for_each_backup(monkeypatch):
         "backup/claude/main-commits-20260314-120000",
         backup_reason="local_commits",
     )
+
+
+# ---- Issue #1: Auto-unassign on timeout (parity with manual-kill path) ----
+
+
+def _make_timeout_assigned_resolver():
+    """Return a resolver that produces an 'assigned claude' route for tests."""
+
+    def resolver(event_name, action, author, labels, mentions, body=None, assignees=None, rule_predicate=None):
+        if assignees and "claude" in assignees:
+            rule = SimpleNamespace(name="assign-claude", mentions=[], assignees=["claude"], access="readwrite")
+            agents = [AgentTask(agent="claude", task="work", prompt="work.txt", options={})]
+            return RouteMatch(rule=rule, agents=agents)
+        return None
+
+    return resolver
+
+
+def _make_timed_out_dispatch(reason="wall_clock", agent="claude", returncode=-1):
+    async def fake_dispatch(event_uuid, tasks, context):
+        return [
+            {
+                "agent": agent,
+                "task": "work",
+                "status": "error",
+                "returncode": returncode,
+                "timed_out": reason,
+                "log_file": "/tmp/run-logs/timeout.out.json",
+                "event_id": event_uuid,
+            }
+        ]
+
+    return fake_dispatch
+
+
+def _assigned_issue_payload(iid=42):
+    return {
+        "object_kind": "issue",
+        "object_attributes": {"action": "update", "iid": iid},
+        "assignees": [{"username": "claude"}],
+        "changes": {
+            "assignees": {
+                "previous": [],
+                "current": [{"username": "claude"}],
+            }
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_timeout_auto_unassign_when_enabled(monkeypatch):
+    """Timed-out assigned agent is unassigned when enable_auto_unassign=True."""
+    webhooks._RECENT_UNASSIGNS.clear()
+
+    setup_common_patches(monkeypatch)
+    monkeypatch.setattr(settings, "enable_auto_unassign", True)
+    monkeypatch.setattr(settings, "all_mentions_agents", "claude,gemini,codex")
+    monkeypatch.setattr(webhooks._ROUTES, "resolve_match", _make_timeout_assigned_resolver())
+
+    async def fake_build_context(payload):
+        return {"payload": payload, "title": "Dummy", "project": "namespace/project"}
+
+    monkeypatch.setattr(webhooks, "build_context", fake_build_context)
+    monkeypatch.setattr(webhooks, "dispatch_agents", _make_timed_out_dispatch())
+
+    mock_notify = AsyncMock(return_value=True)
+    monkeypatch.setattr(webhooks, "notify_agent_termination", mock_notify)
+    mock_unassign = AsyncMock(return_value=True)
+    monkeypatch.setattr(webhooks, "unassign_agent", mock_unassign)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/webhooks/gitlab",
+            json=_assigned_issue_payload(42),
+            headers={
+                "X-Gitlab-Token": "top-secret",
+                "X-Gitlab-Event": "Issue Hook",
+                "X-Gitlab-Event-UUID": "uuid-timeout-unassign-enabled",
+            },
+        )
+
+    assert response.status_code == 200
+    mock_notify.assert_called_once()
+    assert mock_notify.call_args.kwargs["reason"] == "Timeout"
+    mock_unassign.assert_called_once_with("namespace/project", 42, "issue", "claude")
+    # Self-unassign suppression should be recorded so the echo webhook is ignored.
+    assert ("namespace/project", 42, "claude") in webhooks._RECENT_UNASSIGNS
+
+
+@pytest.mark.asyncio
+async def test_timeout_auto_unassign_when_disabled(monkeypatch):
+    """When enable_auto_unassign=False, timeout notification is posted but no unassign occurs."""
+    webhooks._RECENT_UNASSIGNS.clear()
+
+    setup_common_patches(monkeypatch)
+    monkeypatch.setattr(settings, "enable_auto_unassign", False)
+    monkeypatch.setattr(settings, "all_mentions_agents", "claude,gemini,codex")
+    monkeypatch.setattr(webhooks._ROUTES, "resolve_match", _make_timeout_assigned_resolver())
+
+    async def fake_build_context(payload):
+        return {"payload": payload, "title": "Dummy", "project": "namespace/project"}
+
+    monkeypatch.setattr(webhooks, "build_context", fake_build_context)
+    monkeypatch.setattr(webhooks, "dispatch_agents", _make_timed_out_dispatch())
+
+    mock_notify = AsyncMock(return_value=True)
+    monkeypatch.setattr(webhooks, "notify_agent_termination", mock_notify)
+    mock_unassign = AsyncMock(return_value=True)
+    monkeypatch.setattr(webhooks, "unassign_agent", mock_unassign)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/webhooks/gitlab",
+            json=_assigned_issue_payload(43),
+            headers={
+                "X-Gitlab-Token": "top-secret",
+                "X-Gitlab-Event": "Issue Hook",
+                "X-Gitlab-Event-UUID": "uuid-timeout-unassign-disabled",
+            },
+        )
+
+    assert response.status_code == 200
+    mock_notify.assert_called_once()
+    mock_unassign.assert_not_called()
+    assert ("namespace/project", 43, "claude") not in webhooks._RECENT_UNASSIGNS
+
+
+@pytest.mark.asyncio
+async def test_timeout_auto_unassign_inactivity_reason(monkeypatch):
+    """Inactivity timeouts trigger unassign as well as wall_clock timeouts."""
+    webhooks._RECENT_UNASSIGNS.clear()
+
+    setup_common_patches(monkeypatch)
+    monkeypatch.setattr(settings, "enable_auto_unassign", True)
+    monkeypatch.setattr(settings, "all_mentions_agents", "claude,gemini,codex")
+    monkeypatch.setattr(webhooks._ROUTES, "resolve_match", _make_timeout_assigned_resolver())
+
+    async def fake_build_context(payload):
+        return {"payload": payload, "title": "Dummy", "project": "namespace/project"}
+
+    monkeypatch.setattr(webhooks, "build_context", fake_build_context)
+    monkeypatch.setattr(webhooks, "dispatch_agents", _make_timed_out_dispatch(reason="inactivity"))
+
+    mock_notify = AsyncMock(return_value=True)
+    monkeypatch.setattr(webhooks, "notify_agent_termination", mock_notify)
+    mock_unassign = AsyncMock(return_value=True)
+    monkeypatch.setattr(webhooks, "unassign_agent", mock_unassign)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/webhooks/gitlab",
+            json=_assigned_issue_payload(44),
+            headers={
+                "X-Gitlab-Token": "top-secret",
+                "X-Gitlab-Event": "Issue Hook",
+                "X-Gitlab-Event-UUID": "uuid-timeout-unassign-inactivity",
+            },
+        )
+
+    assert response.status_code == 200
+    assert "inactivity" in mock_notify.call_args.kwargs["details"]
+    mock_unassign.assert_called_once_with("namespace/project", 44, "issue", "claude")
+
+
+@pytest.mark.asyncio
+async def test_timeout_does_not_unassign_non_assigned_agent(monkeypatch):
+    """A timed-out agent that is not the originally-assigned agent must not be unassigned."""
+    webhooks._RECENT_UNASSIGNS.clear()
+
+    setup_common_patches(monkeypatch)
+    monkeypatch.setattr(settings, "enable_auto_unassign", True)
+    monkeypatch.setattr(settings, "all_mentions_agents", "claude,gemini,codex")
+    monkeypatch.setattr(webhooks._ROUTES, "resolve_match", _make_timeout_assigned_resolver())
+
+    async def fake_build_context(payload):
+        return {"payload": payload, "title": "Dummy", "project": "namespace/project"}
+
+    monkeypatch.setattr(webhooks, "build_context", fake_build_context)
+    # dispatch returns a timed-out result for a *different* agent (codex)
+    monkeypatch.setattr(webhooks, "dispatch_agents", _make_timed_out_dispatch(agent="codex"))
+
+    mock_notify = AsyncMock(return_value=True)
+    monkeypatch.setattr(webhooks, "notify_agent_termination", mock_notify)
+    mock_unassign = AsyncMock(return_value=True)
+    monkeypatch.setattr(webhooks, "unassign_agent", mock_unassign)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/webhooks/gitlab",
+            json=_assigned_issue_payload(45),
+            headers={
+                "X-Gitlab-Token": "top-secret",
+                "X-Gitlab-Event": "Issue Hook",
+                "X-Gitlab-Event-UUID": "uuid-timeout-mismatched-agent",
+            },
+        )
+
+    assert response.status_code == 200
+    mock_notify.assert_called_once()
+    mock_unassign.assert_not_called()
+    assert ("namespace/project", 45, "claude") not in webhooks._RECENT_UNASSIGNS
+
+
+@pytest.mark.asyncio
+async def test_timeout_unassign_still_fires_when_notification_fails(monkeypatch):
+    """If notify_agent_termination returns False, unassign still runs."""
+    webhooks._RECENT_UNASSIGNS.clear()
+
+    setup_common_patches(monkeypatch)
+    monkeypatch.setattr(settings, "enable_auto_unassign", True)
+    monkeypatch.setattr(settings, "all_mentions_agents", "claude,gemini,codex")
+    monkeypatch.setattr(webhooks._ROUTES, "resolve_match", _make_timeout_assigned_resolver())
+
+    async def fake_build_context(payload):
+        return {"payload": payload, "title": "Dummy", "project": "namespace/project"}
+
+    monkeypatch.setattr(webhooks, "build_context", fake_build_context)
+    monkeypatch.setattr(webhooks, "dispatch_agents", _make_timed_out_dispatch())
+
+    mock_notify = AsyncMock(return_value=False)  # notification posting failed
+    monkeypatch.setattr(webhooks, "notify_agent_termination", mock_notify)
+    mock_unassign = AsyncMock(return_value=True)
+    monkeypatch.setattr(webhooks, "unassign_agent", mock_unassign)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/webhooks/gitlab",
+            json=_assigned_issue_payload(46),
+            headers={
+                "X-Gitlab-Token": "top-secret",
+                "X-Gitlab-Event": "Issue Hook",
+                "X-Gitlab-Event-UUID": "uuid-timeout-notify-failed",
+            },
+        )
+
+    assert response.status_code == 200
+    mock_notify.assert_called_once()
+    mock_unassign.assert_called_once_with("namespace/project", 46, "issue", "claude")
+    assert ("namespace/project", 46, "claude") in webhooks._RECENT_UNASSIGNS
+
+
+@pytest.mark.asyncio
+async def test_timeout_failed_unassign_does_not_record_self_unassign(monkeypatch):
+    """If unassign_agent returns False during the timeout path, no self-unassign is recorded."""
+    webhooks._RECENT_UNASSIGNS.clear()
+
+    setup_common_patches(monkeypatch)
+    monkeypatch.setattr(settings, "enable_auto_unassign", True)
+    monkeypatch.setattr(settings, "all_mentions_agents", "claude,gemini,codex")
+    monkeypatch.setattr(webhooks._ROUTES, "resolve_match", _make_timeout_assigned_resolver())
+
+    async def fake_build_context(payload):
+        return {"payload": payload, "title": "Dummy", "project": "namespace/project"}
+
+    monkeypatch.setattr(webhooks, "build_context", fake_build_context)
+    monkeypatch.setattr(webhooks, "dispatch_agents", _make_timed_out_dispatch())
+
+    mock_notify = AsyncMock(return_value=True)
+    monkeypatch.setattr(webhooks, "notify_agent_termination", mock_notify)
+    mock_unassign = AsyncMock(return_value=False)  # glab call failed
+    monkeypatch.setattr(webhooks, "unassign_agent", mock_unassign)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/webhooks/gitlab",
+            json=_assigned_issue_payload(47),
+            headers={
+                "X-Gitlab-Token": "top-secret",
+                "X-Gitlab-Event": "Issue Hook",
+                "X-Gitlab-Event-UUID": "uuid-timeout-unassign-failed",
+            },
+        )
+
+    assert response.status_code == 200
+    mock_unassign.assert_called_once_with("namespace/project", 47, "issue", "claude")
+    assert ("namespace/project", 47, "claude") not in webhooks._RECENT_UNASSIGNS
+
+
+@pytest.mark.asyncio
+async def test_timeout_unassign_suppresses_success_block_skip_log(monkeypatch, caplog):
+    """Once the timeout path unassigns, the success-completion block must not log its skip message."""
+    import logging
+
+    webhooks._RECENT_UNASSIGNS.clear()
+
+    setup_common_patches(monkeypatch)
+    monkeypatch.setattr(settings, "enable_auto_unassign", True)
+    monkeypatch.setattr(settings, "all_mentions_agents", "claude,gemini,codex")
+    monkeypatch.setattr(webhooks._ROUTES, "resolve_match", _make_timeout_assigned_resolver())
+
+    async def fake_build_context(payload):
+        return {"payload": payload, "title": "Dummy", "project": "namespace/project"}
+
+    monkeypatch.setattr(webhooks, "build_context", fake_build_context)
+    monkeypatch.setattr(webhooks, "dispatch_agents", _make_timed_out_dispatch())
+
+    mock_notify = AsyncMock(return_value=True)
+    monkeypatch.setattr(webhooks, "notify_agent_termination", mock_notify)
+    mock_unassign = AsyncMock(return_value=True)
+    monkeypatch.setattr(webhooks, "unassign_agent", mock_unassign)
+
+    # Capture INFO logs from the webhook logger (which uses structlog->stdlib bridge).
+    monkeypatch.setattr(webhooks.LOGGER, "propagate", True)
+    caplog.set_level(logging.INFO, logger=webhooks.LOGGER.name)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/webhooks/gitlab",
+            json=_assigned_issue_payload(48),
+            headers={
+                "X-Gitlab-Token": "top-secret",
+                "X-Gitlab-Event": "Issue Hook",
+                "X-Gitlab-Event-UUID": "uuid-timeout-suppresses-skip-log",
+            },
+        )
+
+    assert response.status_code == 200
+    mock_unassign.assert_called_once()  # exactly one call -- success block did not re-run
+    skip_msg = "Auto-unassign skipped: agent task did not succeed"
+    for record in caplog.records:
+        assert skip_msg not in record.getMessage(), (
+            "Success block should not log the skip message when timeout path already unassigned"
+        )
+
+
+@pytest.mark.asyncio
+async def test_timeout_unassign_only_once_for_multiple_timed_out_results(monkeypatch):
+    """If multiple results time out for the assigned agent, only one unassign call should fire."""
+    webhooks._RECENT_UNASSIGNS.clear()
+
+    setup_common_patches(monkeypatch)
+    monkeypatch.setattr(settings, "enable_auto_unassign", True)
+    monkeypatch.setattr(settings, "all_mentions_agents", "claude,gemini,codex")
+    monkeypatch.setattr(webhooks._ROUTES, "resolve_match", _make_timeout_assigned_resolver())
+
+    async def fake_build_context(payload):
+        return {"payload": payload, "title": "Dummy", "project": "namespace/project"}
+
+    monkeypatch.setattr(webhooks, "build_context", fake_build_context)
+
+    async def fake_dispatch(event_uuid, tasks, context):
+        return [
+            {
+                "agent": "claude",
+                "task": "first",
+                "status": "error",
+                "returncode": -1,
+                "timed_out": "wall_clock",
+                "log_file": "/tmp/run-logs/a.out.json",
+                "event_id": event_uuid,
+            },
+            {
+                "agent": "claude",
+                "task": "second",
+                "status": "error",
+                "returncode": -1,
+                "timed_out": "inactivity",
+                "log_file": "/tmp/run-logs/b.out.json",
+                "event_id": event_uuid,
+            },
+        ]
+
+    monkeypatch.setattr(webhooks, "dispatch_agents", fake_dispatch)
+
+    mock_notify = AsyncMock(return_value=True)
+    monkeypatch.setattr(webhooks, "notify_agent_termination", mock_notify)
+    mock_unassign = AsyncMock(return_value=True)
+    monkeypatch.setattr(webhooks, "unassign_agent", mock_unassign)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/webhooks/gitlab",
+            json=_assigned_issue_payload(49),
+            headers={
+                "X-Gitlab-Token": "top-secret",
+                "X-Gitlab-Event": "Issue Hook",
+                "X-Gitlab-Event-UUID": "uuid-timeout-multiple-results",
+            },
+        )
+
+    assert response.status_code == 200
+    # Both timeout comments should still be posted (one per timed-out result)
+    assert mock_notify.call_count == 2
+    # But only one unassign call for the assigned agent
+    mock_unassign.assert_called_once_with("namespace/project", 49, "issue", "claude")
+
+
+# ---------------------------------------------------------------------------
+# Assign on issue creation (issue #31)
+# ---------------------------------------------------------------------------
+#
+# These tests drive the webhook end-to-end against the REAL shipped
+# config/routes.yaml (not a mocked resolver), so they exercise both the
+# action-list matching and the route ordering that make assign-on-creation
+# work, plus the ENABLE_ASSIGN_ON_ISSUE_CREATION gate in handle_event.
+
+
+def _setup_real_shipped_registry(monkeypatch):
+    """Patch webhook dependencies but keep a real RouteRegistry over the shipped
+    config so route order and action-list matching are exercised for real."""
+    from pathlib import Path
+
+    from app.services.routes import RouteRegistry
+
+    monkeypatch.setattr(settings, "gitlab_webhook_secret", "top-secret")
+    monkeypatch.setattr(settings, "randomize_all_mentions", False)
+    monkeypatch.setattr(settings, "all_mentions_agents", "claude,gemini,codex")
+    monkeypatch.setattr(webhooks, "_DEDUP", DummyDeduplicator(True))
+
+    shipped = Path(__file__).resolve().parents[1] / "config" / "routes.yaml"
+    registry = RouteRegistry(
+        str(shipped),
+        reload_on_change=False,
+        model_variables={
+            "CLAUDE_MODEL": "claude-model",
+            "GEMINI_MODEL": "Gemini 3.1 Pro (High)",
+            "CODEX_MODEL": "codex-model",
+        },
+    )
+    monkeypatch.setattr(webhooks, "_ROUTES", registry)
+    _patch_build_context(monkeypatch)
+    _patch_dispatch(monkeypatch)
+    _patch_trigger_queue(monkeypatch)
+    return registry
+
+
+def _open_issue_assignee_payload(iid=71):
+    """Issue Hook/open with the shipped author and an agent pre-assigned via the
+    top-level assignees list (the shape GitLab sends on creation)."""
+    return {
+        "object_kind": "issue",
+        "user": {"username": "your-username"},
+        "object_attributes": {"action": "open", "iid": iid},
+        "assignees": [{"username": "claude"}],
+        "project": {"path_with_namespace": "namespace/project"},
+    }
+
+
+def _update_issue_assignee_payload(iid=72):
+    """Issue Hook/update (the /assign-on-existing-issue path)."""
+    return {
+        "object_kind": "issue",
+        "user": {"username": "your-username"},
+        "object_attributes": {"action": "update", "iid": iid},
+        "assignees": [{"username": "claude"}],
+        "changes": {"assignees": {"previous": [], "current": [{"username": "claude"}]}},
+        "project": {"path_with_namespace": "namespace/project"},
+    }
+
+
+async def _post_issue(payload, uuid_suffix):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        return await client.post(
+            "/webhooks/gitlab",
+            json=payload,
+            headers={
+                "X-Gitlab-Token": "top-secret",
+                "X-Gitlab-Event": "Issue Hook",
+                "X-Gitlab-Event-UUID": f"uuid-{uuid_suffix}",
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_assign_on_issue_creation_enabled_dispatches_assign_route(monkeypatch):
+    """Default (enabled): creating an issue with claude assigned dispatches the
+    read-write assign route, not readonly triage."""
+    webhooks._RECENT_UNASSIGNS.clear()
+    _setup_real_shipped_registry(monkeypatch)
+    monkeypatch.setattr(settings, "enable_assign_on_issue_creation", True)
+
+    response = await _post_issue(_open_issue_assignee_payload(71), "assign-create-on")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["triggers"][0]["route"] == "assign-issue-claude"
+
+
+@pytest.mark.asyncio
+async def test_assign_on_issue_creation_disabled_falls_through_to_triage(monkeypatch):
+    """Toggle off: the same create-with-assignee event falls through to
+    issue-triage (pre-#31 behavior)."""
+    webhooks._RECENT_UNASSIGNS.clear()
+    _setup_real_shipped_registry(monkeypatch)
+    monkeypatch.setattr(settings, "enable_assign_on_issue_creation", False)
+
+    response = await _post_issue(_open_issue_assignee_payload(73), "assign-create-off")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["triggers"][0]["route"] == "issue-triage"
+
+
+@pytest.mark.asyncio
+async def test_assign_on_existing_issue_unaffected_by_toggle(monkeypatch):
+    """The /assign-on-existing-issue path (action=update) resolves the assign
+    route regardless of the toggle -- the gate only applies to open events."""
+    webhooks._RECENT_UNASSIGNS.clear()
+    _setup_real_shipped_registry(monkeypatch)
+    monkeypatch.setattr(settings, "enable_assign_on_issue_creation", False)
+
+    response = await _post_issue(_update_issue_assignee_payload(75), "assign-update-off")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["triggers"][0]["route"] == "assign-issue-claude"

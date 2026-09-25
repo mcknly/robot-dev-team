@@ -200,6 +200,53 @@ async def test_dispatch_agents_fails_when_project_not_found(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_execute_agent_error_path_finalizes_dashboard_once(tmp_path, monkeypatch):
+    """A pre-dispatch failure must preserve the full error lifecycle: a text run
+    log, an error result with rc=-1, the structured finish log, and exactly-once
+    dashboard completion. Regression guard for the _finalize_error extraction
+    (issue #37) -- the four early-error paths must not double- or skip-complete
+    the dashboard run."""
+    monkeypatch.setattr(settings, "run_logs_dir", str(tmp_path))
+    monkeypatch.setattr(settings, "enable_branch_switch", False)
+    monkeypatch.setenv("CLAUDE_AGENT_GITLAB_TOKEN", "claude-pat-test")
+    monkeypatch.setattr(agents, "render_prompt", lambda _name, _context: "prompt text")
+
+    async def fake_ensure_project_exists(project_path, access="readonly", clone_url=None, agent=None):
+        return None
+
+    monkeypatch.setattr(agents.PROJECT_PATHS, "ensure_project_exists", fake_ensure_project_exists)
+
+    started_keys: list[str] = []
+    finished_keys: list[str] = []
+    real_started = agents.dashboard_manager.agent_started
+
+    def spy_started(event_id, agent, task):
+        key = real_started(event_id, agent, task)
+        started_keys.append(key)
+        return key
+
+    monkeypatch.setattr(agents.dashboard_manager, "agent_started", spy_started)
+    monkeypatch.setattr(agents.dashboard_manager, "agent_finished", finished_keys.append)
+
+    task = AgentTask(agent="claude", task="review", prompt="review.txt", options={"command": "claude", "args": []})
+    results = await agents.dispatch_agents(
+        "evt-finalize",
+        [task],
+        {"payload": {}, "project": "group/missing", "route": "review", "base_event_uuid": "evt-finalize"},
+    )
+
+    result = results[0]
+    assert result["status"] == "error"
+    assert result["returncode"] == -1
+    assert "Project path not found" in result["error"]
+    # The text run log is written and referenced by the result.
+    assert os.path.exists(result["log_file"])
+    # Exactly-once dashboard completion for the single dispatched agent.
+    assert len(started_keys) == 1
+    assert finished_keys == started_keys
+
+
+@pytest.mark.asyncio
 async def test_dispatch_agents_updates_log_path_on_fallback(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "run_logs_dir", str(tmp_path))
     monkeypatch.setattr(settings, "enable_branch_switch", False)
@@ -1077,6 +1124,7 @@ async def test_each_agent_gets_own_token(tmp_path, monkeypatch):
     monkeypatch.setenv("GEMINI_AGENT_GITLAB_TOKEN", "gemini-pat")
     monkeypatch.setenv("CODEX_AGENT_GITLAB_TOKEN", "codex-pat")
     monkeypatch.setattr(agents, "render_prompt", lambda _name, _context: "prompt text")
+    monkeypatch.setattr(agents, "_antigravity_preflight", lambda: None)
 
     async def fake_ensure_project_exists(project_path, access="readonly", clone_url=None, agent=None):
         return "/work/projects/group/project"
@@ -1246,7 +1294,8 @@ async def test_authenticate_agent_timeout_returns_error():
         return 0
     mock_proc.wait = _wait
 
-    from unittest.mock import patch, AsyncMock
+    from unittest.mock import AsyncMock, patch
+
     from app.services.git_runtime import git_auth_lock
 
     # Ensure the lock is free before the test
@@ -1265,7 +1314,7 @@ async def test_authenticate_agent_timeout_returns_error():
 @pytest.mark.asyncio
 async def test_authenticate_agent_normal_completes():
     """A fast glab-usr call completes normally with the timeout in place."""
-    from unittest.mock import patch, AsyncMock
+    from unittest.mock import AsyncMock, patch
 
     mock_proc = AsyncMock()
     mock_proc.communicate.return_value = (b"authenticated\n", b"")
@@ -1276,3 +1325,241 @@ async def test_authenticate_agent_normal_completes():
 
     assert rc == 0
     assert stdout == "authenticated\n"
+
+
+# -----------------------------------------------------------------------------
+# Antigravity preflight (issue #11). The `gemini` agent's CLI harness (`agy`)
+# expects an OAuth credential file at ~/.gemini/antigravity-cli/
+# antigravity-oauth-token. The preflight check guards against the agent
+# silently waiting 30s for OAuth callback when the file is missing, and must
+# never trigger for non-Gemini agents.
+# -----------------------------------------------------------------------------
+
+
+def test_antigravity_preflight_passes_with_valid_token(tmp_path):
+    token = tmp_path / "antigravity-oauth-token"
+    token.write_text(json.dumps({"token": {"access_token": "ya29.dummy"}, "auth_method": "oauth"}))
+
+    assert agents._antigravity_preflight(token) is None
+
+
+def test_antigravity_preflight_fails_when_file_missing(tmp_path):
+    token = tmp_path / "antigravity-oauth-token"
+
+    result = agents._antigravity_preflight(token)
+
+    assert result is not None
+    assert "not bootstrapped" in result
+    assert "docker compose run" in result
+
+
+def test_antigravity_preflight_fails_when_file_empty(tmp_path):
+    token = tmp_path / "antigravity-oauth-token"
+    token.write_text("")
+
+    assert agents._antigravity_preflight(token) == agents.ANTIGRAVITY_BOOTSTRAP_HINT
+
+
+def test_antigravity_preflight_fails_on_invalid_json(tmp_path):
+    token = tmp_path / "antigravity-oauth-token"
+    token.write_text("this is not json at all")
+
+    assert agents._antigravity_preflight(token) == agents.ANTIGRAVITY_BOOTSTRAP_HINT
+
+
+def test_antigravity_preflight_fails_when_token_key_missing(tmp_path):
+    token = tmp_path / "antigravity-oauth-token"
+    token.write_text(json.dumps({"auth_method": "oauth", "other_field": "value"}))
+
+    assert agents._antigravity_preflight(token) == agents.ANTIGRAVITY_BOOTSTRAP_HINT
+
+
+def test_antigravity_preflight_fails_when_root_is_not_object(tmp_path):
+    token = tmp_path / "antigravity-oauth-token"
+    token.write_text(json.dumps(["a", "list", "not", "an", "object"]))
+
+    assert agents._antigravity_preflight(token) == agents.ANTIGRAVITY_BOOTSTRAP_HINT
+
+
+def test_antigravity_preflight_message_never_includes_token_contents(tmp_path):
+    """Failure message is a fixed constant; it must not interpolate the
+    on-disk credential bytes even on the JSON-decode failure path. This is
+    a regression guard against accidentally f-stringing the file body into
+    the user-facing error."""
+    sentinel = "REDACTED_SHOULD_NOT_APPEAR_IN_LOGS"
+    token = tmp_path / "antigravity-oauth-token"
+    token.write_text(sentinel)
+
+    result = agents._antigravity_preflight(token)
+
+    assert result is not None
+    assert sentinel not in result
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_gemini_preflight_blocks_when_token_missing(tmp_path, monkeypatch):
+    """When the gemini agent is dispatched and the credential file is
+    missing, _execute_agent must short-circuit with the bootstrap hint as
+    the error -- not call subprocess, not call PROJECT_PATHS, not let
+    `agy` print its OAuth URL and time out."""
+    monkeypatch.setattr(settings, "run_logs_dir", str(tmp_path))
+    monkeypatch.setattr(settings, "enable_branch_switch", False)
+    monkeypatch.setenv("GEMINI_AGENT_GITLAB_TOKEN", "g-pat")
+    # Point the module-level constant at a guaranteed-missing path so the
+    # real preflight runs without depending on the host filesystem.
+    monkeypatch.setattr(agents, "ANTIGRAVITY_TOKEN_PATH", tmp_path / "definitely-not-here")
+
+    async def _should_not_be_called(*args, **kwargs):
+        raise AssertionError("project mount must not be touched on preflight failure")
+
+    monkeypatch.setattr(agents.PROJECT_PATHS, "ensure_project_exists", _should_not_be_called)
+
+    task = AgentTask(agent="gemini", task="review", options={"command": "agy", "args": ["-p", ""]})
+    results = await agents.dispatch_agents(
+        "evt-preflight",
+        [task],
+        {"payload": {}, "project": "group/project", "route": "test", "base_event_uuid": "evt-preflight"},
+    )
+
+    assert len(results) == 1
+    result = results[0]
+    assert result["status"] == "error"
+    assert result["returncode"] == -1
+    assert "not bootstrapped" in result["error"]
+    assert "docker compose run" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_non_gemini_agents_skip_antigravity_preflight(tmp_path, monkeypatch):
+    """Claude/Codex dispatch must not be blocked by a missing Antigravity
+    credential file. Regression guard against turning the gemini-specific
+    bootstrap requirement into a global startup precondition."""
+    monkeypatch.setattr(settings, "run_logs_dir", str(tmp_path))
+    monkeypatch.setattr(settings, "enable_branch_switch", False)
+    monkeypatch.setenv("CLAUDE_AGENT_GITLAB_TOKEN", "c-pat")
+    monkeypatch.setattr(agents, "ANTIGRAVITY_TOKEN_PATH", tmp_path / "definitely-not-here")
+
+    def _preflight_should_not_run(*args, **kwargs):
+        raise AssertionError("preflight must not be invoked for non-gemini agents")
+
+    monkeypatch.setattr(agents, "_antigravity_preflight", _preflight_should_not_run)
+
+    async def fake_ensure(*_args, **_kwargs):
+        return str(tmp_path)
+
+    monkeypatch.setattr(agents.PROJECT_PATHS, "ensure_project_exists", fake_ensure)
+    monkeypatch.setattr(agents, "render_prompt", lambda _name, _ctx: "prompt text")
+
+    async def fake_auth(*_args, **_kwargs):
+        return "", "", 0
+
+    monkeypatch.setattr(agents, "_authenticate_agent", fake_auth)
+
+    async def fake_run_subprocess(*_args, **_kwargs):
+        return "ok output", "", 0, None
+
+    monkeypatch.setattr(agents, "_run_subprocess", fake_run_subprocess)
+
+    task = AgentTask(agent="claude", task="review", options={"command": "claude", "args": ["-p"]})
+    results = await agents.dispatch_agents(
+        "evt-claude-pass",
+        [task],
+        {"payload": {}, "project": "group/project", "route": "test", "base_event_uuid": "evt-claude-pass"},
+    )
+
+    assert len(results) == 1
+    assert results[0]["status"] == "ok"
+
+
+# -----------------------------------------------------------------------------
+# ${PROMPT} argv placeholder (issue #19).
+#
+# Antigravity (`agy`) takes the prompt as the *value* of --print/-p and never
+# reads stdin, so routes can request argv delivery with the ${PROMPT} token.
+# Agents whose CLI reads stdin must be left on the stdin path untouched.
+# -----------------------------------------------------------------------------
+
+
+def test_inject_prompt_arg_substitutes_placeholder():
+    args = ["--model", "Gemini 3.1 Pro (High)", "-p", "${PROMPT}"]
+
+    launch_args, injected = agents._inject_prompt_arg(args, "review this diff")
+
+    assert injected is True
+    assert launch_args == ["--model", "Gemini 3.1 Pro (High)", "-p", "review this diff"]
+    # The caller's list must not be mutated -- the run log reports the original.
+    assert args[-1] == "${PROMPT}"
+
+
+def test_inject_prompt_arg_leaves_stdin_agents_untouched():
+    args = ["exec", "--yolo", "--skip-git-repo-check"]
+
+    launch_args, injected = agents._inject_prompt_arg(args, "review this diff")
+
+    assert injected is False
+    assert launch_args == args
+
+
+def test_inject_prompt_arg_rejects_oversized_prompt():
+    oversized = "x" * (agents.MAX_PROMPT_ARG_BYTES + 1)
+
+    with pytest.raises(agents.PromptTooLargeError) as excinfo:
+        agents._inject_prompt_arg(["-p", "${PROMPT}"], oversized)
+
+    assert str(agents.MAX_PROMPT_ARG_BYTES) in str(excinfo.value)
+
+
+def test_inject_prompt_arg_measures_size_in_bytes_not_characters():
+    """A multi-byte prompt that fits in characters can still bust the byte cap."""
+
+    # 3 bytes per character in UTF-8, so this is ~1.5x the byte limit.
+    multibyte = "中" * (agents.MAX_PROMPT_ARG_BYTES // 2)
+
+    with pytest.raises(agents.PromptTooLargeError):
+        agents._inject_prompt_arg(["-p", "${PROMPT}"], multibyte)
+
+
+@pytest.mark.asyncio
+async def test_run_subprocess_passes_prompt_via_argv_not_stdin():
+    """The prompt must reach the CLI as argv, and must not be duplicated on stdin."""
+
+    task = AgentTask(agent="gemini", task="review", options={})
+    # Echo argv[1] to stdout and whatever arrived on stdin to stderr, so the
+    # test can assert the prompt took exactly one path.
+    script = "import sys; sys.stdout.write(sys.argv[1]); sys.stderr.write(sys.stdin.read())"
+
+    stdout, stderr, returncode, timed_out = await agents._run_subprocess(
+        sys.executable,
+        ["-c", script, "${PROMPT}"],
+        "reply with hello world",
+        dict(os.environ),
+        None,
+        "evt-prompt-argv",
+        task,
+    )
+
+    assert returncode == 0
+    assert timed_out is None
+    assert stdout == "reply with hello world"
+    assert stderr == ""
+
+
+@pytest.mark.asyncio
+async def test_run_subprocess_still_uses_stdin_without_placeholder():
+    """Agents that omit ${PROMPT} keep the existing stdin handoff."""
+
+    task = AgentTask(agent="claude", task="review", options={})
+    script = "import sys; sys.stdout.write(sys.stdin.read())"
+
+    stdout, _stderr, returncode, _timed_out = await agents._run_subprocess(
+        sys.executable,
+        ["-c", script],
+        "reply with hello world",
+        dict(os.environ),
+        None,
+        "evt-prompt-stdin",
+        task,
+    )
+
+    assert returncode == 0
+    assert stdout == "reply with hello world"
