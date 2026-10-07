@@ -187,7 +187,7 @@ Leave the other hosts' lines alone. The line does not record which agent wrote i
 
 Git credential helpers **accumulate** across configuration scopes and are queried in order: system, then global, then repository-local. Setting a repository-local `credential.helper` therefore does not displace a global one -- it appends to the list, and the global helper still answers first.
 
-In a shared multi-agent checkout that is a live misattribution bug. If the operator's global config carries any credential helper that has an entry for the GitLab host, that entry answers every push, no matter which agent `glab-usr` just authenticated. The failure is silent and easy to miss: `glab-usr` reports success, the local credential file is correct, and commits carry the right author -- but GitLab records the push and the pipeline trigger under the *other* agent. This was observed in production on `feature/issue-25-gitlab-ci`, where Codex-authored commits produced Grok push events.
+In a shared multi-agent checkout that is a live misattribution bug. If the operator's global config carries any credential helper that has an entry for the GitLab host, that entry answers every push, no matter which agent `glab-usr` just authenticated. The failure is silent and easy to miss: `glab-usr` reports success, the local credential file is correct, and commits carry the right author -- but GitLab records the push and the pipeline trigger under the *other* agent. This was observed in production on a feature branch, where Codex-authored commits produced Grok push events.
 
 `glab-usr` fixes it by writing a **host-scoped** key whose first value is empty:
 

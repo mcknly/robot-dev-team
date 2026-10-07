@@ -268,12 +268,14 @@ ${JSON}
 
 ### `Dockerfile`
 
-The image is based on `python:3.14-slim-trixie` (Debian 13) with Git and the GitLab CLI (`glab`) installed at build time. Agent CLIs (Claude, Antigravity for Gemini, Codex) are installed at container start via the `scripts/install-*.sh` entrypoints rather than baked into the image. Key build-time steps:
+The image is based on `python:3.14-slim-trixie` (Debian 13) with Git and the GitLab CLI (`glab`) installed at build time. It is built and published for `linux/amd64` only; multi-architecture support is deferred. Agent harness CLIs are **not** in the image: the `scripts/install-*.sh` installers are, and the entrypoint runs the ones the enabled routes need at container start (see [Harness install model](#harness-install-model-decision-record) below). Key build-time steps:
 
 - Copies `gitlab-connect` and `glab-usr` helper scripts to `/usr/local/bin/`.
+- Copies the committed license notices for `glab` and `uv` from `notices/` into `/usr/share/doc/glab/` and `/usr/share/doc/uv/`, since neither upstream package ships the notices of what it compiles in (see `docs/DEPENDENCY_MANAGEMENT.md`).
 - Installs Python dependencies via `uv` from `pyproject.toml`.
 - Creates a non-root `appuser` (UID 10001) that is remapped at runtime.
 - Uses `tini` as PID 1 and delegates to `docker-entrypoint.sh`.
+- Sets OCI labels naming the public source repository and the pinned Debian snapshot (`DEBIAN_SNAPSHOT`), so a consumer can find the corresponding source for the image's Debian packages from the image itself (see `docs/LICENSE_REVIEW.md` section 6).
 
 For local testing outside containers, the repository provides `./launch-uvicorn-dev`, which sources `.env` plus the compose environment defaults before starting `uvicorn` from `.venv` with reload enabled.
 
@@ -285,8 +287,36 @@ The entrypoint performs the following steps at container start:
 
 1. **UID/GID remapping** — When running as root (the initial Docker user), remaps the `appuser` account to match `LOCAL_UID`/`LOCAL_GID` from the environment, then re-executes itself as the unprivileged user via `setpriv` (from `util-linux`). This ensures bind-mounted credential directories remain accessible. `setpriv` replaced `gosu`, whose bookworm build was a static Go binary linked against an EOL Go 1.19.8 toolchain that no snapshot bump could move. Trixie ships a `gosu` rebuilt on a current toolchain, but `setpriv` stays: it carries no Go runtime and so no Go-stdlib CVE surface at all, which is the property that does not decay as a toolchain ages, and `scripts/ci-smoke-image.sh` asserts `gosu` is absent. The invocation is `--reuid appuser --regid appuser --init-groups --inh-caps=-all`: the account is resolved **by name** (the remap passes `-o`, so a numeric lookup could return a colliding account), `--init-groups` is required rather than optional (`setpriv` rejects `--regid` without a groups flag), and the environment is deliberately inherited — `--reset-env` would break the token loop in step 2 and drop the venv from `PATH`. `HOME` comes from the image's `ENV`, not from the privilege drop. The entrypoint logs the identity it lands on, which is the only external evidence of the drop: the image has no `USER` directive, so `docker exec <container> id -u` reports the exec's own root.
 2. **Convention-based token-file generation** — Scans environment variables for any `*_AGENT_GITLAB_TOKEN` pattern and writes the value to `~/.<agent>/glab-token` (mode `0600`). The agent directory name is the lowercase, hyphen-separated form of the prefix (e.g., `QWEN_CODE_AGENT_GITLAB_TOKEN` writes to `~/.qwen-code/glab-token`). This supports arbitrary agent names without code changes.
-3. **Agent CLI installation** — Ensures `~/.local/bin` exists on the PATH, then discovers and runs all `scripts/install-*.sh` scripts. Every shipped installer uses a native (non-npm) installer that drops its binary into `~/.local/bin`. To add a new agent CLI, drop an installer script into `scripts/` (see `docs/ADDING_AN_AGENT.md`).
-4. **Application launch** — Executes the CMD (`uvicorn app.main:app ...`).
+3. **Preflight** — Runs `python3 -m app.preflight`, which refuses to start when an enabled route dispatches an agent with no GitLab token or git identity, and otherwise emits the installers (and the binaries they provide, from each script's `# provides:` line) that the enabled, credentialed routes need. Nothing is downloaded before this passes.
+4. **Agent CLI installation** — Ensures `~/.local/bin` is on the PATH, then runs **only** the installers preflight selected, in order. A download failure is a warning, not a stop. The default harnesses (Claude, Antigravity, Codex) and the optional OpenCode, Goose, and Grok harnesses use native binaries; the optional Pi harness is an npm package on a pinned, user-local Node runtime that its installer bootstraps. To add a new agent CLI, drop an installer script with a `# provides:` line into `scripts/` (see `docs/ADDING_AN_AGENT.md`).
+5. **Post-install check** — If any binary preflight required is still missing from `PATH`, exits 1 with `harness binaries not on PATH after install`, before the port opens.
+6. **Application launch** — Executes the CMD (`uvicorn app.main:app ...`).
+
+---
+
+### Harness install model (decision record)
+
+**Decision: harness CLIs are installed at container start, not baked into the image.** The question "bake at build time vs. install at runtime" came up while planning Docker Hub publication and was left open. It is recorded here so it is not re-litigated from scratch.
+
+**Rationale.**
+
+- **Install only what is routed.** Preflight installs a harness only when an enabled route dispatches it and the agent is credentialed. A baked image would carry every supported harness -- seven today -- whether or not the operator uses any of them, along with each one's attack surface, size, and license terms.
+- **Harnesses are meant to track latest.** Vendor CLIs change weekly and their model catalogues move with them (see `docs/DEPENDENCY_MANAGEMENT.md`). A baked CLI freezes at the image's build date, and a release cadence would become the harness upgrade cadence.
+- **It is already fail-closed.** Credentials are checked before any download and binaries after, so a misconfiguration or a failed download refuses the boot rather than failing a webhook later.
+
+**Consequences a consumer must be told.** These are stated in the README Quick Start, `SECURITY.md`, and the documents linked below, which the Docker Hub overview (`docs/RELEASING.md`) links to; they are not left to discovery:
+
+- **Network egress on every start.** A pulled image is not self-contained. Every container start needs HTTPS egress to the vendor hosts of the enabled harnesses; an air-gapped or egress-restricted host fails to start those routes. The per-harness host list is the [boot-time egress table](DEPENDENCY_MANAGEMENT.md#boot-time-egress) -- this record deliberately does not duplicate it.
+- **SBOM and vulnerability-gate scope is the built image.** The SBOM a release publishes and the scan that gates it both describe the image as built. The harness CLIs that end up in a running container are in neither, and `docs/LICENSE_REVIEW.md` excludes them for the same reason: an operator who enables a harness receives it from its vendor, under the vendor's terms.
+- **The trust boundary moves to the vendor at boot.** The snapshot pin, the digest-scoped scan, and the SBOM all stop at the entrypoint. After that, nothing this project pins verifies what is installed. `claude`, `agy`, and `opencode` are `curl | bash` of a vendor script; the Claude and Antigravity scripts check the binary against a checksum from a manifest on the same vendor host, which catches corruption, not a compromised host. The Codex, Goose, and Grok binaries are downloaded with no checksum. Pi's Node tarball is checked against a `SHASUMS256.txt` from the same host, and Pi's npm tree resolves to latest with no lockfile; `--ignore-scripts` is the one real mitigation there. On every start, each enabled harness therefore runs vendor-served code as `appuser`, holding that agent's GitLab token and its read-write credential mount. Claude's vendor script also stages its download in that mount (the host's `~/.claude/downloads`) on every start. That is the accepted cost of tracking latest, and `SECURITY.md` states it.
+- **There is no offline mode, and a derived "air-gap" image is unsupported.** A `FROM` image with harnesses pre-placed on `PATH` would boot today, because an installer failure is only a warning and the post-install check tests only that the binary name exists. That is an accident of the warning path, not a feature, and it is unsupported until the air-gap trigger below fires and the design says otherwise.
+
+**Revisit when** any of these becomes true -- the change would be its own issue:
+
+- An air-gapped or egress-restricted deployment becomes a requirement.
+- A release is required to SBOM, scan, or license-review the harness CLIs themselves.
+- Multi-architecture images are added, and the per-architecture install paths need to be qualified.
+- A vendor host change breaks the published egress table in a way the table cannot keep up with.
 
 ---
 

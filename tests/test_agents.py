@@ -204,7 +204,7 @@ async def test_execute_agent_error_path_finalizes_dashboard_once(tmp_path, monke
     """A pre-dispatch failure must preserve the full error lifecycle: a text run
     log, an error result with rc=-1, the structured finish log, and exactly-once
     dashboard completion. Regression guard for the _finalize_error extraction
-    (issue #37) -- the four early-error paths must not double- or skip-complete
+    -- the four early-error paths must not double- or skip-complete
     the dashboard run."""
     monkeypatch.setattr(settings, "run_logs_dir", str(tmp_path))
     monkeypatch.setattr(settings, "enable_branch_switch", False)
@@ -671,7 +671,7 @@ async def test_inactivity_timeout(tmp_path, monkeypatch):
 async def test_stderr_only_triggers_inactivity_timeout(tmp_path, monkeypatch):
     """Continuous stderr with zero stdout must trigger the inactivity watchdog.
 
-    Reproduces the failure mode from issue #87: an agent CLI in an infinite
+    Reproduces a real failure mode: an agent CLI in an infinite
     retry loop produces only stderr (stack traces, error bodies). Previously
     this reset the activity tracker and the agent hung until the 2-hour
     wall-clock limit. With the fix, only stdout resets the watchdog.
@@ -1328,7 +1328,7 @@ async def test_authenticate_agent_normal_completes():
 
 
 # -----------------------------------------------------------------------------
-# Antigravity preflight (issue #11). The `gemini` agent's CLI harness (`agy`)
+# Antigravity preflight. The `gemini` agent's CLI harness (`agy`)
 # expects an OAuth credential file at ~/.gemini/antigravity-cli/
 # antigravity-oauth-token. The preflight check guards against the agent
 # silently waiting 30s for OAuth callback when the file is missing, and must
@@ -1472,7 +1472,7 @@ async def test_execute_agent_non_gemini_agents_skip_antigravity_preflight(tmp_pa
 
 
 # -----------------------------------------------------------------------------
-# ${PROMPT} argv placeholder (issue #19).
+# ${PROMPT} argv placeholder.
 #
 # Antigravity (`agy`) takes the prompt as the *value* of --print/-p and never
 # reads stdin, so routes can request argv delivery with the ${PROMPT} token.

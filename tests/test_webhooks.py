@@ -30,7 +30,7 @@ class DummyDeduplicator:
 def setup_common_patches(monkeypatch, should_process=True):
     monkeypatch.setattr(settings, "gitlab_webhook_secret", "top-secret")
     # Pin to deterministic dispatch by default so unrelated tests are not
-    # coupled to @all shuffle behavior; tests that exercise issue #14 opt in.
+    # coupled to @all shuffle behavior; tests that exercise the shuffle opt in.
     monkeypatch.setattr(settings, "randomize_all_mentions", False)
     monkeypatch.setattr(webhooks, "_DEDUP", DummyDeduplicator(should_process))
 
@@ -380,7 +380,7 @@ class TestExtractAssignees:
 async def test_unassign_webhook_does_not_retrigger_agent(monkeypatch):
     """An unassign event must NOT match assignment routes.
 
-    Reproduces the bug from issue #63: auto-unassign fires a webhook
+    Reproduces the bug where auto-unassign fires a webhook
     where payload.assignees still lists the removed agent, but
     changes.assignees.current is empty.  The route resolver should
     receive an empty assignees list and therefore not match.
@@ -672,8 +672,8 @@ async def test_webhook_expands_agents_alias(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Issue #14 (randomize @all dispatch order) and issue #16 (author-aware @all
-# expansion, code-span stripping, self-mention filtering).
+# Randomized @all dispatch order, and author-aware @all expansion, code-span
+# stripping, and self-mention filtering.
 # ---------------------------------------------------------------------------
 
 
@@ -787,7 +787,7 @@ async def test_explicit_mention_list_not_shuffled(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_agent_authored_all_mention_suppressed(monkeypatch):
-    """An agent authoring @all does not fan out (issue #16 self-recursion guard)."""
+    """An agent authoring @all does not fan out (self-recursion guard)."""
     setup_common_patches(monkeypatch)
     monkeypatch.setattr(settings, "all_mentions_agents", "claude,gemini,codex")
     monkeypatch.setattr(settings, "randomize_all_mentions", True)
@@ -820,7 +820,7 @@ async def test_agent_authored_all_keeps_explicit_co_mentions(monkeypatch):
 async def test_backticked_all_mention_not_expanded(monkeypatch):
     """A comment that merely discusses `@all` in backticks must not fan out.
 
-    Mirrors the real incident in issue #16: a comment addressed to @codex that
+    Mirrors a real incident: a comment addressed to @codex that
     quotes `@all` while asking a question previously dispatched all three agents.
     """
     setup_common_patches(monkeypatch)
@@ -841,7 +841,7 @@ async def test_backticked_all_mention_not_expanded(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_self_mention_filtered_for_agent_author(monkeypatch):
-    """An agent is never dispatched against a comment it authored (issue #16)."""
+    """An agent is never dispatched against a comment it authored."""
     setup_common_patches(monkeypatch)
     monkeypatch.setattr(settings, "all_mentions_agents", "claude,gemini,codex")
     monkeypatch.setattr(webhooks._ROUTES, "resolve_match", _agent_route_resolver(_THREE_AGENT_ROUTES))
@@ -891,7 +891,7 @@ def test_parse_mentions_matches_real_mention_shapes():
 
 
 def test_indented_code_block_strips_all_mention():
-    """Issue #17 item 1: a 4-space-indented code block is stripped.
+    """A 4-space-indented code block is stripped.
 
     Flips the former pin-current-behavior test: an @all shown as indented code
     (preceded by a blank line, per CommonMark) no longer parses as a live
@@ -910,8 +910,7 @@ def test_tab_indented_code_block_strips_all_mention():
 def test_indented_line_after_paragraph_is_stripped():
     """Every qualifying indented line is stripped, without trying to tell an
     indented code block apart from a paragraph continuation. Dropping the
-    blank-lead-in heuristic is the over-strip-biased trade-off (issue #17
-    review): a per-line flag cannot model block containment, and the safe
+    blank-lead-in heuristic is the over-strip-biased trade-off: a per-line flag cannot model block containment, and the safe
     direction is to strip."""
     text = "Some paragraph\n    @all still indented"
     assert "all" not in webhooks._parse_mentions_from_text(text)
@@ -921,30 +920,28 @@ def test_list_item_continuation_mention_over_stripped():
     """A 4-space-indented list-item continuation is over-stripped along with
     real indented code. Per the review consensus this dropped mention is the
     accepted, recoverable cost of remaining GLFM-parser-free while never
-    under-stripping a quoted ``@all`` (issue #17)."""
+    under-stripping a quoted ``@all``."""
     text = "- first item\n    @all continuation"
     assert "all" not in webhooks._parse_mentions_from_text(text)
 
 
 def test_mixed_space_tab_indent_stripped():
     """Up to three spaces followed by a tab reaches a CommonMark tab stop and
-    opens an indented code block, so ``@all`` there is stripped (issue #17
-    review, codex finding #1)."""
+    opens an indented code block, so ``@all`` there is stripped."""
     text = "intro\n\n  \t@all shown as code"
     assert "all" not in webhooks._parse_mentions_from_text(text)
 
 
 def test_indented_code_after_heading_stripped():
     """Indented code following a heading (a non-paragraph block) is stripped;
-    the old blank-lead-in heuristic under-stripped this fan-out shape (issue #17
-    review, codex finding #2)."""
+    the old blank-lead-in heuristic under-stripped this fan-out shape."""
     text = "# Example\n    @all shown as code"
     assert "all" not in webhooks._parse_mentions_from_text(text)
 
 
 def test_indented_code_after_blockquote_stripped():
     """Indented code following a blockquote line is stripped rather than parsed
-    as a live mention (issue #17 review, codex finding #2)."""
+    as a live mention."""
     text = "> context\n    @all shown as code"
     assert "all" not in webhooks._parse_mentions_from_text(text)
 
@@ -952,7 +949,7 @@ def test_indented_code_after_blockquote_stripped():
 def test_lazy_blockquote_continuation_stripped():
     """A bare mention line immediately following a ``>`` line (no blank
     separator) is a lazy blockquote continuation -- GitLab renders it as still
-    quoted, so it is stripped too (issue #17 review, claude finding)."""
+    quoted, so it is stripped too."""
     text = "> quoted @foo\nstill quoted @all"
     assert webhooks._parse_mentions_from_text(text) == []
 
@@ -966,13 +963,12 @@ def test_blank_line_closes_lazy_blockquote_continuation():
 
 def test_single_line_fence_preserves_word_boundary():
     """A single-line ``` fence spans no newline, so it collapses to a space
-    (not the empty string) to keep surrounding words separated (issue #17
-    review, gemini finding #1)."""
+    (not the empty string) to keep surrounding words separated."""
     assert webhooks._strip_code_spans("a```b```c") == "a c"
 
 
 def test_blockquoted_all_mention_stripped():
-    """Issue #17 item 2: a blockquoted line (``> ...``) is stripped.
+    """A blockquoted line (``> ...``) is stripped.
 
     Flips the former pin-current-behavior test: a reply quoting a prior ``@all``
     no longer re-expands on receipt.
@@ -1062,8 +1058,8 @@ def test_filter_self_mention_noop_for_empty_author():
 @pytest.mark.asyncio
 async def test_base_match_receives_unshuffled_mention_list(monkeypatch):
     """The multi-agent base_match sees the unshuffled list even when the
-    per-mention dispatch is shuffled. Locks the diagnostic contract called out
-    in MR #10 review (#14 randomization should not leak into base_match logs).
+    per-mention dispatch is shuffled. Locks the diagnostic contract that
+    randomization must not leak into base_match logs.
     """
     setup_common_patches(monkeypatch)
     monkeypatch.setattr(settings, "all_mentions_agents", "claude,gemini,codex")
@@ -2227,7 +2223,7 @@ class TestSelfUnassignSuppression:
 async def test_self_unassign_suppresses_echo_webhook(monkeypatch):
     """An unassign webhook triggered by the app's own auto-unassign is suppressed.
 
-    This is the core regression test for issue #63: after auto-unassign fires,
+    This is the core regression test for auto-unassign retriggering: after it fires,
     the resulting webhook must NOT retrigger the agent, regardless of whether
     the webhook payload includes changes.assignees or not.
     """
@@ -2436,7 +2432,7 @@ async def test_failed_unassign_does_not_record_self_unassign(monkeypatch):
     assert ("namespace/project", 37, "claude") not in webhooks._RECENT_UNASSIGNS
 
 
-# ---- Issue #72: Self-unassign suppression with empty assignees ----
+# ---- Self-unassign suppression with empty assignees ----
 
 
 @pytest.mark.asyncio
@@ -2444,7 +2440,7 @@ async def test_self_unassign_suppresses_when_assignees_empty(monkeypatch):
     """An unassign webhook with empty assignees list is suppressed when the
     agent was recently self-unassigned.
 
-    This is the core regression test for issue #72: when auto-unassign fires,
+    This is the core regression test for empty-assignee unassigns: when auto-unassign fires,
     the resulting webhook has assignees=[] (via changes.assignees.current=[]).
     The guard must still detect the removed agent from changes.assignees.previous.
     """
@@ -2539,7 +2535,7 @@ async def test_self_unassign_no_false_positive_on_unrelated_update(monkeypatch):
     assert data["reason"] == "no-routes"
 
 
-# ---- Issue #72: System note suppression for unassign actions ----
+# ---- System note suppression for unassign actions ----
 
 
 @pytest.mark.asyncio
@@ -2718,7 +2714,7 @@ async def test_system_note_non_unassign_not_suppressed(monkeypatch):
     assert data["reason"] == "no-routes"
 
 
-# ---- Issue #72: Unit tests for _is_unassign_system_note ----
+# ---- Unit tests for _is_unassign_system_note ----
 
 
 class TestIsUnassignSystemNote:
@@ -2772,7 +2768,7 @@ class TestIsUnassignSystemNote:
         assert webhooks._is_unassign_system_note(payload) is True
 
 
-# ---- Issue #85: Webhook secret bypass when secret is empty/unset ----
+# ---- Webhook secret bypass when secret is empty/unset ----
 
 
 @pytest.mark.asyncio
@@ -2812,7 +2808,7 @@ async def test_webhook_allows_request_when_secret_is_empty(monkeypatch):
     assert data["status"] == "ok"
 
 
-# ---- Issue #85: /health endpoint smoke test ----
+# ---- /health endpoint smoke test ----
 
 
 @pytest.mark.asyncio
@@ -2825,7 +2821,7 @@ async def test_health_endpoint():
     assert response.json() == {"status": "ok"}
 
 
-# ---- Issue #80: Backup notification tests ----
+# ---- Backup notification tests ----
 
 
 @pytest.mark.asyncio
@@ -3112,7 +3108,7 @@ async def test_backup_notification_posts_for_each_backup(monkeypatch):
     )
 
 
-# ---- Issue #1: Auto-unassign on timeout (parity with manual-kill path) ----
+# ---- Auto-unassign on timeout (parity with manual-kill path) ----
 
 
 def _make_timeout_assigned_resolver():
@@ -3498,7 +3494,7 @@ async def test_timeout_unassign_only_once_for_multiple_timed_out_results(monkeyp
 
 
 # ---------------------------------------------------------------------------
-# Assign on issue creation (issue #31)
+# Assign on issue creation
 # ---------------------------------------------------------------------------
 #
 # These tests drive the webhook end-to-end against the REAL shipped
@@ -3592,7 +3588,7 @@ async def test_assign_on_issue_creation_enabled_dispatches_assign_route(monkeypa
 @pytest.mark.asyncio
 async def test_assign_on_issue_creation_disabled_falls_through_to_triage(monkeypatch):
     """Toggle off: the same create-with-assignee event falls through to
-    issue-triage (pre-#31 behavior)."""
+    issue-triage (the behavior before the feature)."""
     webhooks._RECENT_UNASSIGNS.clear()
     _setup_real_shipped_registry(monkeypatch)
     monkeypatch.setattr(settings, "enable_assign_on_issue_creation", False)

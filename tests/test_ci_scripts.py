@@ -29,13 +29,13 @@ PROTECTED_DEFAULT_BRANCH_RULE = (
 DOCKERHUB_ENVIRONMENT = "dockerhub-publication"
 GITHUB_ENVIRONMENT = "github-publication"
 # Every environment any job declares, and the only jobs allowed to declare it -- and therefore to
-# receive its scoped credentials. The #8 publish and #53 yank jobs must be added deliberately.
+# receive its scoped credentials. A new holder must be added here deliberately.
 SCOPED_ENVIRONMENT_JOBS = {
-    DOCKERHUB_ENVIRONMENT: {"dockerhub_credential_probe"},
+    DOCKERHUB_ENVIRONMENT: {"dockerhub_credential_probe", "release_publish", "release_yank"},
     GITHUB_ENVIRONMENT: {"github_release_publish", "github_release_withdraw"},
 }
 # The jobs that install packages from the live Debian mirrors at job time. Snapshot
-# enforcement is scoped to the shipped image and does not cover these (#65), so a job
+# enforcement is scoped to the shipped image and does not cover these, so a job
 # added here is a deliberate extension of that boundary rather than an oversight.
 APT_CONSUMER_JOBS = {"validate", "compat_python_floor", "release_contract", "github_release_publish"}
 APT_INSTALL_STEP = "apt-get install --yes --no-install-recommends git"
@@ -187,6 +187,33 @@ def test_release_publish_retains_the_released_sbom() -> None:
     assert "artifacts/sbom.spdx.json" in ci_config()["release_publish"]["artifacts"]["paths"]
 
 
+def test_release_publish_receives_docker_hub_credentials_only_on_protected_stable_tags() -> None:
+    """The publish job is the second holder of the account-wide Docker Hub token.
+
+    The environment scope is what delivers the token, so the job's admission rule is the whole
+    boundary: a protected exact `vX.Y.Z` push, never a yank tag, an MR, or a manual ref.
+    """
+    job = _job("release_publish")
+
+    assert job["environment"] == {"name": DOCKERHUB_ENVIRONMENT, "action": "prepare"}
+    assert job["tags"] == ["rdt"]
+    assert job["interruptible"] is False
+    assert job["rules"] == [
+        {
+            "if": (
+                '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+$/ '
+                '&& $CI_COMMIT_REF_PROTECTED == "true"'
+            )
+        },
+        {"when": "never"},
+    ]
+    # The promotion only reads staged evidence, so it never needs the scanner.
+    assert job["script"] == [
+        "python scripts/release_tools.py install-tools --tools crane",
+        "python scripts/release_tools.py publish",
+    ]
+
+
 def test_dockerhub_probe_is_manual_and_protected() -> None:
     config = ci_config()
     job = config["dockerhub_credential_probe"]
@@ -292,6 +319,33 @@ def test_every_release_writer_shares_one_resource_group() -> None:
         )
     }
     assert set(groups.values()) == {"release-publication"}, groups
+
+
+def test_release_yank_receives_docker_hub_credentials_only_on_protected_yank_tags() -> None:
+    """The third holder of the Docker Hub token, admitted only by a protected `-yank` tag.
+
+    It still installs crane alone: withdrawal must work during the outage that fails a scan.
+    """
+    job = _job("release_yank")
+
+    assert job["environment"] == {"name": DOCKERHUB_ENVIRONMENT, "action": "prepare"}
+    assert job["tags"] == ["rdt"]
+    assert job["interruptible"] is False
+    assert job["resource_group"] == "release-publication"
+    assert job["rules"] == [
+        {
+            "if": (
+                '$CI_PIPELINE_SOURCE == "push" '
+                "&& $CI_COMMIT_TAG =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+-yank$/ "
+                '&& $CI_COMMIT_REF_PROTECTED == "true"'
+            )
+        },
+        {"when": "never"},
+    ]
+    assert job["script"] == [
+        "python scripts/release_tools.py install-tools --tools crane",
+        "python scripts/release_tools.py yank",
+    ]
 
 
 def test_github_withdrawal_follows_the_yank_without_a_scanner() -> None:
@@ -400,7 +454,7 @@ def test_apt_consumers_are_scoped_and_record_the_git_build() -> None:
         assert before.index("git --version") > before.index(APT_INSTALL_STEP), (
             f"{name} records its git build before installing git"
         )
-        # No second home for DEBIAN_SNAPSHOT: that duplication is what #65 declined to pay.
+        # No second home for DEBIAN_SNAPSHOT: that duplication is what scoping the guarantee to the image declined to pay.
         assert not any("snapshot.debian.org" in step for step in steps)
 
     assert consumers == APT_CONSUMER_JOBS

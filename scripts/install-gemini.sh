@@ -25,7 +25,7 @@ echo "[install-gemini] Installing Antigravity CLI (agy) for the gemini agent..."
 # per-platform binary (verified via SHA512) and drops it into --dir. We
 # pipe through `bash -s --` so we can pin the install target to a path
 # that is already on the appuser PATH without editing upstream.
-if ! curl -fsSL "https://antigravity.google/cli/install.sh" \
+if ! curl -fsSL --connect-timeout 30 "https://antigravity.google/cli/install.sh" \
      | bash -s -- --dir "$INSTALL_DIR"; then
   echo "[install-gemini] WARN: failed to install Antigravity CLI; continuing without it" >&2
   exit 0

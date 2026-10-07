@@ -51,7 +51,7 @@ CHANGELOG_FILENAME = "changelog.md"
 MANIFEST_FILENAME = "release-manifest.json"
 YANK_RECORD_FILENAME = "yank-record.json"
 # Pinned by hash in the receipt and deliberately not uploaded: each carries a canonical host by
-# construction (docs/MIRRORING.md section 2). A sanitized public variant is #81.
+# construction (docs/MIRRORING.md section 2). A sanitized public variant is future work.
 DEFERRED_EVIDENCE = (
     MANIFEST_FILENAME,
     release_tools.SBOM_FILENAME,
@@ -606,9 +606,12 @@ def build_receipt(
         },
         "image": {
             "qualified_digest": release_tools.validated_manifest_digest(manifest, release.version),
-            # Public registry references arrive with Docker Hub promotion (#8). Until then the list
-            # is empty rather than absent, so the schema does not change when it fills.
-            "public_references": [],
+            # Copied from the durable manifest, which release_publish writes only after verifying
+            # each public tag by digest. A release from before Docker Hub promotion authorized no
+            # public image, so its list stays empty and its receipt bytes do not change.
+            "public_references": release_tools.validated_public_references(
+                manifest, release.version
+            ),
         },
         "evidence": {
             filename: {
@@ -1033,6 +1036,7 @@ def publish_to_github(
         raise ReleaseError(
             f"durable changelog for {version} differs from the tagged tree's changelog section"
         )
+    refuse_private_references(version, notes.decode("utf-8"))
 
     with tempfile.TemporaryDirectory(prefix="github-publication-") as scratch:
         scratch_dir = Path(scratch)
@@ -1079,6 +1083,63 @@ def publish_to_github(
 
 
 WITHHELD_REASON = "withheld from the public record; it names the canonical instance"
+# A second placeholder rather than a reworded first one: the audit rebuilds every notice with the
+# current text, so changing what a host-bearing reason becomes would report drift on a release
+# withdrawn before the change.
+WITHHELD_REFERENCE_REASON = "withheld from the public record; it cites the private tracker"
+# Stands in for the changelog section in a withdrawal notice when that section cites the tracker.
+# Only a release published before publication checked its notes can reach this (`v0.3.0` is one).
+WITHHELD_NOTES = (
+    "Release notes withheld from this notice; they cite the private tracker. The `changelog.md` "
+    "asset is the record of what was published.\n"
+)
+
+# Pointers into the canonical instance's tracker: shorthand issue and merge request references,
+# note anchors, pipeline and job citations, `issue-N` branch names, and tracker URL paths. None of
+# them resolves for a public reader -- on GitHub a bare issue shorthand links to an unrelated
+# issue of the public repository, or to nothing -- so the published tree carries none
+# (`test_no_tracked_file_cites_the_private_tracker`), and a yank reason carrying one is withheld
+# like a reason naming a host. A tracker path on gitlab.com is public upstream work and allowed.
+# Project-qualified shorthand is matched separately and only in its slash-shaped form, because the
+# bare patterns' lookbehinds exist to pass `name#N` tokens (upstream `goose#N`, hostname tokens);
+# `gitlab-org/` shorthand is exempt, but upstream records are still written as full URLs. The
+# trailing `(?![\w-])` keeps a numbered heading anchor (`FILE.md#7-...`) out of it.
+# Written without a literal example on purpose: this file is in the guard's scope.
+PRIVATE_REFERENCE_PATTERNS = (
+    re.compile(r"(?<![\w:&])#\d{1,5}\b"),
+    re.compile(r"(?<![\w/\[])!\d+\b"),
+    re.compile(r"(?<![\w./:-])(?!(?i:gitlab-org)/)[\w.-]+(?:/[\w.-]+)+[#!]\d+(?![\w-])"),
+    re.compile(r"\bnote_\d+\b"),
+    re.compile(r"(?i)\b(?:pipeline|job)s?\s+#?\d+\b"),
+    re.compile(r"(?i)\b(?:issue|mr|merge\s+request)s?\s+#?\d+\b"),
+    re.compile(r"(?i)\bissue-\d+\b"),
+    re.compile(
+        r"(?<![^\s(<\[`'\"])(?!https://gitlab\.com/)[^\s()<>\[\]`'\"]*"
+        r"/-/(?:issues|merge_requests|work_items|pipelines|jobs|packages)/\d+"
+    ),
+)
+
+
+def private_references(text: str) -> list[str]:
+    """Every private-tracker pointer in `text`, in pattern order."""
+    return [match.group() for pattern in PRIVATE_REFERENCE_PATTERNS for match in pattern.finditer(text)]
+
+
+def refuse_private_references(version: Version, notes: str) -> None:
+    """Fail closed when the release notes cite the private tracker.
+
+    The tree guard protects a tag only if it ran on that tag's commit, so a release cut before the
+    rule still carries its old changelog section, durably and in the tagged tree. Unlike the yank
+    reason, the notes are fixed by cutting a new release, so publication fails rather than
+    withholds. Withdrawal never calls this: see `public_withdrawal_notes()`.
+    """
+    found = sorted(set(private_references(notes)))
+    if found:
+        raise ReleaseError(
+            f"the changelog section for {version} cites the private tracker ({', '.join(found)}); "
+            "it cannot be made public -- cut a new release from a tree that passes "
+            "test_no_tracked_file_cites_the_private_tracker"
+        )
 
 
 def withdrawal_body(reason: str, notes: str) -> str:
@@ -1100,7 +1161,10 @@ def release_presentation(
     if not withdrawn:
         return release_name(version), notes
     reason = public_withdrawal_reason(gate, durable_yank_reason(gitlab, version))
-    return WITHDRAWN_PREFIX + release_name(version), withdrawal_body(reason, notes)
+    return (
+        WITHDRAWN_PREFIX + release_name(version),
+        withdrawal_body(reason, public_withdrawal_notes(notes)),
+    )
 
 
 def durable_yank_reason(gitlab: release_tools.GitLabApi, yanked: Version) -> str:
@@ -1151,8 +1215,7 @@ def withdraw_from_github(
     if notes is None:
         raise ReleaseError(f"release {yanked} has no durable changelog")
     name, body = release_presentation(gitlab, gate, yanked, notes.decode("utf-8"), True)
-    if f"Reason: {WITHHELD_REASON}" in body:
-        print("[github] WARNING: the yank reason names a canonical host; withholding it publicly")
+    warn_withheld(body)
 
     tag = f"v{yanked}"
     all_releases = github.list_releases()
@@ -1173,6 +1236,18 @@ def withdraw_from_github(
     if latest is not None and latest.get("id") == record.get("id"):
         move_latest(github, all_releases, exclude=tag)
     return record
+
+
+def warn_withheld(body: str) -> None:
+    if f"Reason: {WITHHELD_REASON}" in body:
+        print("[github] WARNING: the yank reason names a canonical host; withholding it publicly")
+    elif f"Reason: {WITHHELD_REFERENCE_REASON}" in body:
+        print("[github] WARNING: the yank reason cites the private tracker; withholding it publicly")
+    if body.endswith(WITHHELD_NOTES):
+        print(
+            "[github] WARNING: the release notes cite the private tracker; withholding them from "
+            "the notice (the published changelog.md asset is unchanged)"
+        )
 
 
 def published_release_to_withdraw(
@@ -1200,11 +1275,13 @@ def published_release_to_withdraw(
 
 
 def public_withdrawal_reason(gate: HostGate, reason: str) -> str:
-    """The reason as published, or a placeholder when it names a canonical host.
+    """The reason as published, or a placeholder when it names a host or cites the private tracker.
 
     The reason is the one free-text input on this path, and the yank tag that carries it cannot be
     re-cut. Failing on it would make the public withdrawal impossible, which is the one thing this
-    path must never be; so a reason naming a canonical host is withheld, not published.
+    path must never be; so a reason naming a canonical host is withheld, not published. The same
+    goes for a reason citing the canonical tracker: the tree guard never sees this text, because it
+    lives in a tag annotation and then in the yank record, so this is the only check it gets.
 
     The audit rebuilds the expected notice with this same rule against the hosts it runs with. If
     the canonical registry host is ever renamed, a reason withheld under the old name may no
@@ -1214,7 +1291,23 @@ def public_withdrawal_reason(gate: HostGate, reason: str) -> str:
     """
     if gate.roles_in(reason.encode()):
         return WITHHELD_REASON
+    if private_references(reason):
+        return WITHHELD_REFERENCE_REASON
     return reason
+
+
+def public_withdrawal_notes(notes: str) -> str:
+    """The changelog section as a withdrawal notice appends it, or a placeholder if it cites the tracker.
+
+    Publication refuses such notes (`refuse_private_references()`), so only a release published
+    before that check can get here -- and `v0.3.0` did. Its body already carries the citations, so
+    failing would leave them public *and* the release un-withdrawn, the worse of the two. Rewriting
+    the body to the notice drops them from it. The `changelog.md` asset and the tag are not touched:
+    they are already public, the receipt hashes the asset, and a published release is never
+    repaired. As with the reason, the audit rebuilds this with the current matcher, so a pattern
+    added later can report drift on a notice written before it; that false positive is accepted.
+    """
+    return WITHHELD_NOTES if private_references(notes) else notes
 
 
 def move_latest(

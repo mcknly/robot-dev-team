@@ -1,6 +1,6 @@
 """Robot Dev Team Project
 File: tests/test_mention_hold.py
-Description: Tests for mention hold buffer deduplication (issue #69).
+Description: Tests for mention hold buffer deduplication.
 License: MIT
 SPDX-License-Identifier: MIT
 Copyright (c) 2025 MCKNLY LLC
@@ -226,7 +226,7 @@ class TestMentionHoldBuffer:
         assert buf.cancel_for_item(item) == []
 
     # -------------------------------------------------------------------
-    # Recent-assignment memory tests (issue #75)
+    # Recent-assignment memory tests
     # -------------------------------------------------------------------
 
     @pytest.mark.asyncio
@@ -464,7 +464,7 @@ class TestTriggerQueueMentionHold:
 
     @pytest.mark.asyncio
     async def test_assignment_before_mention_suppresses_immediately(self):
-        """An assignment enqueued before a mention suppresses the mention immediately (issue #75)."""
+        """An assignment enqueued before a mention suppresses the mention immediately."""
         queue = TriggerQueue(hold_seconds=10.0)
         loop = asyncio.get_event_loop()
 
@@ -742,7 +742,7 @@ async def test_mention_hold_end_to_end_suppression(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_assignment_before_mention_e2e_suppression(monkeypatch):
-    """End-to-end test: assignment arrives first, then mention is suppressed immediately (issue #75)."""
+    """End-to-end test: assignment arrives first, then mention is suppressed immediately."""
     _setup_mention_hold_patches(monkeypatch, hold_seconds=10.0)
 
     queue = TriggerQueue(hold_seconds=10.0)

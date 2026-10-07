@@ -56,6 +56,13 @@ image. It is not reachable from the internet, so a URL serves no reader, and a l
 grep-driven scraper a resolvable endpoint, a registry, and an API base already assembled.
 `tests/test_public_surface.py` enforces zero occurrences across every tracked file.
 
+The same tree cites nothing in the private tracker: no issue or merge-request shorthand, note
+anchor, pipeline or job number, or package page. On GitHub the shorthand resolves to an unrelated
+issue of the public repository or to nothing, so where a reference stood in for a reason, the file
+states the reason. `test_no_tracked_file_cites_the_private_tracker` enforces it, with a reviewed
+exact-line allowlist for fixture data that only looks like a reference. `prompts/` is exempt,
+because it instructs agents working in an operator's own GitLab projects.
+
 Be precise about what that buys, because over-claiming it would make this document wrong in the way
 it exists to prevent. The GitHub organisation is `mcknly`, the image is `mcknly/robot-dev-team`, and
 the canonical namespace path appears throughout these runbooks -- the hostname is a short guess from
@@ -156,14 +163,59 @@ identities are pinned by the job, and checking the author alone is not sufficien
 `github_release_publish` implements this gate. It checks every path and blob of the tagged tree
 before it fetches anything, and the commit and tag objects, release body, receipt, and every
 asset before its first public write. The withdrawal job holds the notice it writes to the same
-gate, with one deliberate difference: a yank reason naming a canonical host is withheld from the
-notice instead of failing the job, because withdrawal must never become impossible. The four deferred evidence assets pass through it only as SHA-256 values in the receipt,
-which is why their embedded host never trips it.
+gate, with one deliberate difference in how it treats the yank reason: a reason naming a canonical
+host is withheld from the notice as `WITHHELD_REASON`, and a reason citing the private tracker as
+`WITHHELD_REFERENCE_REASON`, instead of failing the job, because withdrawal must never become
+impossible. The four deferred evidence assets pass through it only as SHA-256 values in the
+receipt, which is why their embedded host never trips it.
+
+The release notes get a second check alongside the gate, using the same matcher as the tree guard.
+`github_release_publish` fails closed, before any public write, when the version's changelog section
+cites the private tracker. The tree guard protects a tag only if it ran on that tag's commit, so
+this check is what stops any further tag cut before the rule, whose section still carries `Closes`
+tags, from being projected. Unlike the yank reason, those notes are not withheld: they are fixed by
+cutting a new release, so the job names the references and stops.
+
+That check cannot reach back. `v0.3.0` was projected before the check existed, so its public
+release body and `changelog.md` asset already carry those citations, and they stay there, since a
+published release is never rewritten except to withdraw it. Withdrawal therefore does not fail on
+the notes, because failing would leave the citations public and the release looking current.
+Instead, the notice replaces a changelog section that cites the tracker with `WITHHELD_NOTES`. The
+`changelog.md` asset, which the receipt hashes, is left as published. The audit rebuilds the notice
+through the same `release_presentation()`, so it expects the placeholder too.
 
 ### Verifying what you pulled
 
 What you can check today is on the GitHub Release for that version, and none of it requires access
-to the canonical instance:
+to the canonical instance.
+
+**The images are not signed.** There is no cosign signature or signed attestation to verify, and
+that is deliberate, not missing. Verification is by digest against the release's publication
+receipt, as below. `SECURITY.md` records why, and when signing will be revisited.
+
+**Before you pull, check that the release has a public image.** Its receipt is the release asset
+`https://github.com/mcknly/robot-dev-team/releases/download/vX.Y.Z/public-release-receipt.json`.
+The image references that release authorized are in `image.public_references`, one entry per
+reference:
+
+```json
+{"reference": "docker.io/mcknly/robot-dev-team:X.Y.Z", "digest": "sha256:<64 hex>"}
+```
+
+The pipeline wrote each entry only after resolving that tag back to the release digest, and
+`digest` always equals `image.qualified_digest`. Only the version tag is listed. The moving tags
+`X.Y`, `X`, and `latest` move to newer releases, so a permanent receipt cannot vouch for them. An
+empty list means no image was published for that version; build it from source instead. Releases
+from before Docker Hub promotion have an empty list.
+
+A listed reference records what was published, not a current endorsement. A withdrawn release keeps
+its receipt and its `X.Y.Z` reference, because the receipt is never rewritten and the version tag
+stays on Docker Hub as the record of what shipped. Check the release first: a GitHub Release named
+`[WITHDRAWN] ...` carries the withdrawal reason, and its version should not be pulled. The moving
+tags move to the newest compatible release that is still published and has a different image, or
+are removed when there is none. One exception: if a newer release that is still published ships
+the very same image, the tags stay with that release, because a withdrawal applies to a version,
+not an image. Compare digests, not version numbers.
 
 1. **Get the digest you are actually running**, not the tag you asked for:
    `docker inspect --format '{{index .RepoDigests 0}}' docker.io/mcknly/robot-dev-team:X.Y.Z`.
@@ -189,6 +241,13 @@ the tree for convenience, it describes no particular published image, and it can
 branch. It is not the authoritative SBOM for any release; the authoritative document is the
 digest-keyed one the canonical release produced, which is the one not yet published.
 
+**None of these documents covers the agent CLIs.** The image does not contain them: each container
+start downloads the harnesses its enabled routes use, from their vendors, under the vendors' terms
+(`SYSTEM_DESIGN.md` section 7 records why). So the release SBOM, when it is published, will describe
+the image as built, and the vulnerability verdict covers the same digest; neither can say anything
+about the harnesses in your running container. They track latest, so no inventory of them is
+published.
+
 ### Not published
 
 - GitLab issues, merge requests, comments, and review history.
@@ -198,6 +257,10 @@ digest-keyed one the canonical release produced, which is the one not yet publis
   the canonical hostname by construction. Their SHA-256 values are in the receipt; the documents
   themselves are deferred until sanitized public variants exist.
 - The canonical hostname, in any file, commit object, identity, release body, or asset.
+- References into the canonical tracker, in any tracked file, release notes, or withdrawal reason.
+  The one exception is `v0.3.0`, projected before the rule existed. Its tagged tree, release body,
+  and `changelog.md` asset already carry such references and stay as published (see "The outbound host
+  gate").
 - Any branch other than `main` and `rc`, and any tag other than stable `vX.Y.Z`.
 
 ## 3. Branch and tag rules on the public repository
@@ -420,7 +483,10 @@ Credentials and egress:
       carry a workflow file is rejected, which keeps section 1's prohibition enforced by GitHub
       rather than by review.
 - [ ] Docker Hub repository metadata links to the public source repository, so the source is one
-      click from the registry page.
+      click from the registry page. The overview carries the block in `RELEASING.md` ("Docker Hub
+      repository overview"), which also says to verify by digest because images are not signed,
+      and gives the corresponding-source pointer. Platform, boot-time egress, and SBOM scope are
+      left to the source it links to.
 - [ ] Runner egress to `github.com`, `api.github.com`, and `uploads.github.com` (release asset
       uploads use their own host) confirmed.
 - [ ] A pipeline schedule on canonical `main` for the drift audit, owned by the maintainer who

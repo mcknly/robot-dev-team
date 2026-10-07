@@ -52,7 +52,7 @@ validate:
     paths:
       - .uv-cache/
   # `git` here comes from the live Debian mirrors, not the `Dockerfile`'s `DEBIAN_SNAPSHOT`, and
-  # that is a recorded decision (#65): snapshot enforcement is scoped to the shipped image, the
+  # that is a recorded decision: snapshot enforcement is scoped to the shipped image, the
   # only artifact that carries a digest, an SBOM, and digest-keyed scan evidence for a
   # reproducibility claim to bind to. This job contributes no package and no layer to that
   # image, so nothing it installs can reach what ships. The claim is scoped to package contents
@@ -90,15 +90,15 @@ compat_python_floor:
   # `python_version = 3.12` catches syntax and typing, not imports, runtime behaviour, or the
   # `python_full_version < '3.13'` markers the lock selects only on this interpreter.
   #
-  # `tests/test_release_contract.py` excludes this pin from the runtime equality set by design;
-  # it must not be moved when PYTHON_IMAGE moves. Its *minor* follows `requires-python`; its
-  # *patch* follows 3.12 security maintenance on its own schedule, so the floor lane does not
-  # sit on a knowingly vulnerable interpreter between floor moves. Its *distro*, by contrast,
-  # does follow the runtime's: the version axes encode a support policy, the codename encodes
-  # nothing about the floor, and leaving this lane behind on an EOL Debian would keep exactly
-  # the condition #59 exists to end. That last part is asserted rather than left to this
-  # comment -- `test_runtime_python_image_pins_agree` requires this pin's codename to equal
-  # PYTHON_IMAGE's and its version to differ. See docs/DEPENDENCY_MANAGEMENT.md.
+  # `tests/test_release_contract.py` excludes this pin from the runtime equality set by design; it
+  # must not be moved when PYTHON_IMAGE moves. Its *minor* follows `requires-python`; its *patch*
+  # follows 3.12 security maintenance on its own schedule, so the floor lane does not sit on a
+  # knowingly vulnerable interpreter between floor moves. Its *distro*, by contrast, does follow the
+  # runtime's: the version axes encode a support policy, the codename encodes nothing about the
+  # floor, and leaving this lane behind on an EOL Debian would keep exactly the condition the move
+  # to Debian 13 exists to end. That last part is asserted rather than left to this comment --
+  # `test_runtime_python_image_pins_agree` requires this pin's codename to equal PYTHON_IMAGE's and
+  # its version to differ. See docs/DEPENDENCY_MANAGEMENT.md.
   image: python:3.12.14-slim-trixie@sha256:e5c9fa26ffb76e11e0f054f30dc2523a2f9693f0c36c0cf1e39b27e152d899fc
   # Merge requests and default-branch pushes only. Nothing `needs:` this job, so on a `v*` tag
   # it could not stop `release_publish` or `release_yank` from acting -- both start as soon as
@@ -124,7 +124,7 @@ compat_python_floor:
       - "uv-floor-${CI_DEFAULT_BRANCH}"
     paths:
       - .uv-cache/
-  # `git` is unpinned by the same recorded decision as `validate` (#65), and logged for the
+  # `git` is unpinned by the same recorded decision as `validate`, and logged for the
   # same reason. See the comment on that job.
   before_script:
     - apt-get update
@@ -294,7 +294,7 @@ release_contract:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v/'
     - when: never
-  # `git` is unpinned by the same recorded decision as `validate` (#65), and logged for the
+  # `git` is unpinned by the same recorded decision as `validate`, and logged for the
   # same reason. See the comment on that job -- with one qualification that does not apply
   # there: this job *does* declare a release artifact (`artifacts/release-context.json` below,
   # consumed by `release_publish` and `release_yank`), and on the yank path the annotated tag
@@ -330,6 +330,12 @@ release_publish:
     # it never produces a non-deterministic document of its own.
     - job: security_scan_release
       artifacts: false
+  # The Docker Hub promotion runs inside this job, so it receives DOCKERHUB_USERNAME/DOCKERHUB_TOKEN
+  # through the environment scope; tests/test_ci_scripts.py pins which jobs may declare it.
+  # `prepare`, like the probe: the deployment record would add nothing the release manifest lacks.
+  environment:
+    name: dockerhub-publication
+    action: prepare
   rules:
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ && $CI_COMMIT_REF_PROTECTED == "true"'
     - when: never
@@ -361,6 +367,12 @@ release_yank:
     - job: validate
     - job: release_contract
       artifacts: true
+  # Reconciles Docker Hub's moving aliases after the private ones, so it receives the scoped
+  # Docker Hub credentials; tests/test_ci_scripts.py pins which jobs may declare the environment.
+  # The token still cannot delete: an alias with no public fallback is named for the owner.
+  environment:
+    name: dockerhub-publication
+    action: prepare
   rules:
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+-yank$/ && $CI_COMMIT_REF_PROTECTED == "true"'
     - when: never
@@ -402,7 +414,7 @@ github_release_publish:
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ && $CI_COMMIT_REF_PROTECTED == "true"'
       when: manual
     - when: never
-  # `git` is unpinned by the same recorded decision as `validate` (#65), and logged for the same
+  # `git` is unpinned by the same recorded decision as `validate`, and logged for the same
   # reason. It builds the public commit and tag objects; it contributes no package contents to
   # the shipped image. The tag is re-fetched so its annotation, which dates the public objects,
   # is present whatever the runner's fetch refspec.

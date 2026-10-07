@@ -42,24 +42,25 @@ SCAN_EVALUATION_FILENAME = "vulnerability-evaluation.json"
 SCAN_EVALUATION_SCHEMA = 1
 SCAN_POLICY_VERSION = 1
 EXCEPTIONS_PATH = Path("security/vulnerability-exceptions.yaml")
-# Day-one blocking rule (#50): a High or Critical finding blocks when a fix exists. Unfixed and
-# wont-fix High/Critical are recorded and do not block; tightening is tracked with a date in #60.
+# Day-one blocking rule: a High or Critical finding blocks when a fix exists. Unfixed and
+# wont-fix High/Critical are recorded and do not block; tightening that is planned with a date.
 # This is deliberately not `--only-fixed` on the scanner -- the report keeps every match and only
-# the blocking decision reads fix state, so the evidence for #60 survives in the durable record.
+# the blocking decision reads fix state, so the evidence for tightening it survives in the durable
+# record.
 BLOCKING_SEVERITIES = ("Critical", "High")
 BLOCKING_FIX_STATES = ("fixed",)
 MAX_DB_BUILT_AGE = dt.timedelta(hours=48)
 # Grype reports that an EOL distro's vulnerability data "may be incomplete or outdated". That is
 # the one failure mode a CVE gate cannot detect on its own, so it is recorded in the durable
 # evaluation rather than swallowed. Derived from the report's own distro block instead of scraped
-# from stderr, so it is deterministic and testable. The runtime left Debian 12 in #59; the entry
+# from stderr, so it is deterministic and testable. The runtime has left Debian 12; the entry
 # stays because the table is knowledge about distributions, not a description of what this image
 # currently ships. Reports are digest-keyed evidence that outlives the image they describe -- a
 # yank or a forensic re-evaluation can hand this evaluator a report against an older release, and
 # an entry deleted the moment it stopped matching would make that report read as clean.
 EOL_DISTRO_RELEASES = {
     ("debian", "12"): (
-        "Debian 12 (bookworm) is end-of-life; the runtime migrated to Debian 13 (trixie) in #59"
+        "Debian 12 (bookworm) is end-of-life; the runtime migrated to Debian 13 (trixie)"
     ),
 }
 IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
@@ -101,7 +102,7 @@ TOOL_RELEASES = {
 YANK_TOOLS = ("crane",)
 DOCKERHUB_REGISTRY = "index.docker.io"
 # Crane resolves docker.io to index.docker.io for credentials; the docker.io form is what the
-# evidence records and what docs/RELEASING.md and #52 compare by hand.
+# evidence records and what docs/RELEASING.md compares by hand.
 DOCKERHUB_REPOSITORY = "docker.io/mcknly/robot-dev-team"
 DOCKERHUB_PROBE_TAG_PREFIX = "ci-credential-probe-"
 
@@ -741,7 +742,17 @@ def apply_alias(
     alias: str,
     *,
     immutable: bool,
+    copy_from: str | None = None,
 ) -> dict[str, str]:
+    """Point `repository:alias` at `source_digest`, writing only when it does not already.
+
+    `copy_from` is the digest-pinned source in another registry. `crane tag` only retags within
+    one repository, so a cross-registry alias is written with `crane copy` instead. Without
+    `--platform`, the copy pushes the source manifest or index unchanged, which is what lets the
+    verification below compare digests across registries.
+    """
+    if copy_from is not None and not copy_from.endswith(f"@{source_digest}"):
+        raise ReleaseError(f"alias source {copy_from} is not pinned to {source_digest}")
     destination = f"{repository}:{alias}"
     existing = crane_digest_if_exists(crane, destination)
     if immutable and existing is not None and existing != source_digest:
@@ -749,7 +760,11 @@ def apply_alias(
             f"immutable release alias {destination} already points to {existing}, "
             f"not {source_digest}"
         )
-    if existing != source_digest:
+    # An exact match is never written again. Besides saving a push, that is what keeps a retry
+    # independent of how Docker Hub's immutable-tag rule treats a same-digest re-push.
+    if existing != source_digest and copy_from is not None:
+        run((str(crane), "copy", copy_from, destination))
+    elif existing != source_digest:
         run((str(crane), "tag", f"{repository}@{source_digest}", alias))
     verified = crane_digest(crane, destination)
     if verified != source_digest:
@@ -760,6 +775,93 @@ def apply_alias(
         "digest": verified,
         "kind": "immutable" if immutable else "moving",
     }
+
+
+def preflight_public_release(
+    crane: Path,
+    version: Version,
+    source_digest: str,
+    *,
+    private_repository: str,
+) -> None:
+    """Refuse a Docker Hub `X.Y.Z` that already names another digest, before anything moves.
+
+    `apply_alias` would refuse it too, but only after the private aliases had moved -- and the
+    private `X.Y.Z` is immutable, so that release could then never complete.
+
+    On a retry the conflict may be this release's own doing: an earlier attempt that copied
+    `X.Y.Z` and then failed to verify it also left the private aliases moved. The private alias
+    tells the two cases apart, so the error says which one the operator is looking at.
+    """
+    destination = f"{DOCKERHUB_REPOSITORY}:{version}"
+    existing = crane_digest_if_exists(crane, destination)
+    if existing is None or existing == source_digest:
+        return
+    message = (
+        f"public release alias {destination} already points to {existing}, not {source_digest}; "
+        "this attempt mutated nothing"
+    )
+    try:
+        private = crane_digest_if_exists(crane, f"{private_repository}:{version}")
+    except ReleaseError:
+        # Only a hint depends on it; the conflict above is the error that matters.
+        private = None
+    if private == source_digest:
+        message += (
+            f". The private {version} alias already names {source_digest}, so an earlier attempt "
+            "of this release moved the private aliases: read that attempt's log for an 'alias "
+            "verification failed' on this tag before assuming the public tag was written by hand"
+        )
+    raise ReleaseError(message)
+
+
+def public_references_for(aliases: Iterable[Mapping[str, str]]) -> list[dict[str, str]]:
+    """The public references a release authorizes: its immutable tag and verified digest.
+
+    Moving aliases are deliberately not references. The receipt is a permanent record, and
+    `latest` or `X.Y` stop naming this release as soon as a newer one ships.
+    """
+    return [
+        {"reference": alias["reference"], "digest": alias["digest"]}
+        for alias in aliases
+        if alias["kind"] == "immutable"
+    ]
+
+
+def validated_public_references(
+    manifest: Mapping[str, Any],
+    version: Version,
+) -> list[dict[str, str]]:
+    """Read a manifest's public references strictly, for a consumer-facing receipt.
+
+    A manifest written before Docker Hub promotion has no such field and authorized no public
+    image, so an absent field is an empty list. Anything present must be exactly the version's
+    Docker Hub tag at the release digest: the receipt is what consumers check a pull against.
+    """
+    references = manifest.get("public_references", [])
+    if not isinstance(references, list):
+        raise ReleaseError(f"release manifest {version} public_references must be an array")
+    # publish_release writes exactly one reference, the version tag. A duplicate would pass the
+    # per-entry check below, so the count is checked too.
+    if len(references) > 1:
+        raise ReleaseError(
+            f"release manifest {version} lists {len(references)} public references, not at most one"
+        )
+    digest = validated_manifest_digest(manifest, version)
+    expected = f"{DOCKERHUB_REPOSITORY}:{version}"
+    validated: list[dict[str, str]] = []
+    for entry in references:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"reference", "digest"}
+            or entry["reference"] != expected
+            or entry["digest"] != digest
+        ):
+            raise ReleaseError(
+                f"release manifest {version} carries an invalid public reference: {entry!r}"
+            )
+        validated.append({"reference": entry["reference"], "digest": entry["digest"]})
+    return validated
 
 
 def load_context(path: Path) -> dict[str, Any]:
@@ -897,7 +999,7 @@ class ScanException:
     vulnerability id. The `class` form names a root cause instead, and exists because a single
     remediation can produce dozens of ids -- but it is unbounded over ids for that artifact, so
     it silently absorbs anything new disclosed against the same build. Prefer `exact` unless the
-    package is on its way out of the image (#58's gosu case, not #66's CPython case).
+    package is on its way out of the image (as `gosu` was, not as CPython 3.12 was).
     """
 
     kind: str
@@ -1429,7 +1531,7 @@ def evaluate_scan(
             "unfixed_high_or_critical": len(unfixed),
         },
         "blocking_findings": [finding.record() for finding in blocking],
-        # Recorded, never removed from the report: the evidence for tightening the rule in #60
+        # Recorded, never removed from the report: the evidence for tightening the rule later
         # has to survive the release that accepted it.
         "unfixed_high_or_critical": unfixed,
         "exceptions_applied": [
@@ -1508,7 +1610,7 @@ def grype_config(path: Path) -> Path:
 
     A config file rather than environment variables for non-secret settings, because a mistyped
     `GRYPE_*` name is a silent no-op -- the failure mode that made an earlier ownership-filter
-    experiment in #61 look like evidence when it had never bound. Credentials never appear here
+    experiment look like evidence when it had never bound. Credentials never appear here
     or in argv; they are passed through the environment and their resolved binding is checked
     separately before the scan.
     """
@@ -2234,6 +2336,10 @@ def publish_release(
             "CI_REGISTRY_PASSWORD",
             "CI_PIPELINE_URL",
             "CI_JOB_URL",
+            # Every stable release is promoted to Docker Hub. Required up front so a job that
+            # does not declare the dockerhub-publication environment fails before any login.
+            "DOCKERHUB_USERNAME",
+            "DOCKERHUB_TOKEN",
         ),
         source_env,
     )
@@ -2288,6 +2394,15 @@ def publish_release(
         exceptions_path=exceptions_path,
     )
     moving_aliases = desired_moving_aliases(version, non_yanked_release_versions(api))
+    # Still inside the pre-mutation window: a conflicting public X.Y.Z stops the release here,
+    # with no private alias moved.
+    crane_login(crane, DOCKERHUB_REGISTRY, env["DOCKERHUB_USERNAME"], env["DOCKERHUB_TOKEN"])
+    preflight_public_release(
+        crane,
+        version,
+        source_digest,
+        private_repository=env["CI_REGISTRY_IMAGE"],
+    )
 
     aliases = [
         apply_alias(
@@ -2308,6 +2423,22 @@ def publish_release(
         )
         for alias in moving_aliases
     )
+    # The same digest and the same alias set, copied from the private registry. Written before
+    # the manifest so the manifest records the public references -- release_publish runs before
+    # github_release_publish can be played, which is how the receipt gets them.
+    source_reference = f"{env['CI_REGISTRY_IMAGE']}@{source_digest}"
+    public_aliases = [
+        apply_alias(
+            crane,
+            DOCKERHUB_REPOSITORY,
+            source_digest,
+            alias,
+            immutable=alias == str(version),
+            copy_from=source_reference,
+        )
+        for alias in (str(version), *moving_aliases)
+    ]
+    public_references = public_references_for(public_aliases)
 
     existing_manifest = api.package_file(str(version), "release-manifest.json")
     released_at = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
@@ -2318,6 +2449,7 @@ def publish_release(
             "git_tag": env["CI_COMMIT_TAG"],
             "source_commit": env["CI_COMMIT_SHA"],
             "image_digest": source_digest,
+            "public_references": public_references,
         }
         for key, value in expected.items():
             if existing.get(key) != value:
@@ -2334,8 +2466,10 @@ def publish_release(
             "source_commit": env["CI_COMMIT_SHA"],
             "source_image": source_image,
             "image_digest": source_digest,
-            "image_reference": f"{env['CI_REGISTRY_IMAGE']}@{source_digest}",
+            "image_reference": source_reference,
             "aliases": aliases,
+            "public_aliases": public_aliases,
+            "public_references": public_references,
             "pipeline_url": env["CI_PIPELINE_URL"],
             "job_url": env["CI_JOB_URL"],
             "released_at": released_at,
@@ -2403,26 +2537,48 @@ def validated_manifest_digest(manifest: Mapping[str, Any], version: Version) -> 
     return digest
 
 
-def target_version_for_alias(
-    alias: str,
-    released: Iterable[Version],
-) -> Version | None:
+def compatible_versions(alias: str, released: Iterable[Version]) -> tuple[Version, ...]:
+    """The releases a moving alias may name: every release for `latest`, a major line for `X`."""
     versions = tuple(released)
     if alias == "latest":
-        eligible = versions
-    elif re.fullmatch(r"(0|[1-9][0-9]*)", alias):
+        return versions
+    if re.fullmatch(r"(0|[1-9][0-9]*)", alias):
         major = int(alias)
-        eligible = tuple(version for version in versions if version.major == major)
-    elif re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", alias):
+        return tuple(version for version in versions if version.major == major)
+    if re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", alias):
         major, minor = (int(part) for part in alias.split("."))
-        eligible = tuple(
-            version
-            for version in versions
-            if (version.major, version.minor) == (major, minor)
+        return tuple(
+            version for version in versions if (version.major, version.minor) == (major, minor)
         )
-    else:
-        raise ReleaseError(f"release manifest contains invalid moving alias: {alias}")
-    return max(eligible, default=None)
+    raise ReleaseError(f"release manifest contains invalid moving alias: {alias}")
+
+
+def select_fallback(
+    alias: str,
+    *,
+    yanked: Version,
+    bad_digest: str,
+    candidates: Mapping[Version, str],
+) -> tuple[str, Version | None]:
+    """Decide what a moving alias should name once `yanked` is withdrawn.
+
+    `candidates` maps every non-yanked release other than `yanked` to its digest. Two releases
+    can share a digest, so the version alone is not enough:
+
+    - `keep`: the newest compatible release is newer than the yanked one and publishes the same
+      image. The alias is that live release's, and the yank withdraws a version, not an image.
+    - `repoint`: the newest compatible release with a *different* digest. Retagging to a release
+      of the same image would report a rollback while still serving the yanked bytes.
+    - `none`: every compatible release publishes the yanked image, or there is none.
+    """
+    eligible = compatible_versions(alias, candidates)
+    newest = max(eligible, default=None)
+    if newest is not None and newest > yanked and candidates[newest] == bad_digest:
+        return "keep", newest
+    distinct = [version for version in eligible if candidates[version] != bad_digest]
+    if distinct:
+        return "repoint", max(distinct)
+    return "none", None
 
 
 def moving_alias_names(manifest: Mapping[str, Any], version: Version) -> tuple[str, ...]:
@@ -2441,46 +2597,203 @@ def moving_alias_names(manifest: Mapping[str, Any], version: Version) -> tuple[s
     return tuple(names)
 
 
-def reconcile_moving_aliases(
+@dataclass
+class AliasPlan:
+    """What one registry's moving aliases need after a yank, decided before any write."""
+
+    repository: str
+    writes: list[tuple[str, Version, str]]
+    repointed: dict[str, Version]
+    kept: dict[str, Version]
+    skipped: list[str]
+    removed: list[str]
+    unresolved: list[str]
+
+
+def plan_alias_reconciliation(
     *,
     crane: Path,
     repository: str,
-    aliases: Iterable[str],
+    yanked: Version,
     bad_digest: str,
-    targets: Mapping[str, tuple[Version, str]],
-) -> tuple[dict[str, str], list[str]]:
-    observed: dict[str, str] = {}
-    for alias in aliases:
-        observed[alias] = crane_digest(crane, f"{repository}:{alias}")
+    candidates: Mapping[Version, str],
+    recorded: Iterable[str],
+) -> AliasPlan:
+    """Look up every moving alias the yanked version could hold, and decide each one.
 
-    unsafe = sorted(
-        alias for alias, current in observed.items() if current == bad_digest and alias not in targets
-    )
-    if unsafe:
-        joined = ", ".join(unsafe)
-        raise ReleaseError(
-            f"cannot yank while aliases lack a compatible non-yanked release: {joined}"
+    The aliases come from the live registry, not from the manifest: the manifest lists what the
+    release took when it was published, but a release also inherits aliases afterwards -- above
+    all through an earlier yank that fell back to it. So all three of `X.Y`, `X`, and `latest`
+    are resolved, and only one that names the yanked digest is ever written.
+
+    `recorded` only decides what an absent alias means. One the release took and that has a
+    fallback is recreated there; one with no fallback counts as removed, which is what the
+    Docker Hub owner is asked to do. One whose newest compatible release is a newer release of
+    the same image belongs to that release, so it is recorded as skipped and not recreated: the
+    yank is not authorized to republish a tag for a release it is not withdrawing. An absent
+    alias the release never took is not this yank's.
+    """
+    recorded_names = set(recorded)
+    plan = AliasPlan(repository, [], {}, {}, [], [], [])
+    for alias in yanked.aliases:
+        current = crane_digest_if_exists(crane, f"{repository}:{alias}")
+        action, target = select_fallback(
+            alias, yanked=yanked, bad_digest=bad_digest, candidates=candidates
         )
-
-    repointed: dict[str, str] = {}
-    skipped: list[str] = []
-    for alias, current in observed.items():
-        reference = f"{repository}:{alias}"
-        target = targets.get(alias)
-        if target is None:
-            skipped.append(alias)
-            continue
-        target_version, target_digest = target
-        if current == bad_digest:
-            run((str(crane), "tag", f"{repository}@{target_digest}", alias))
-            if crane_digest(crane, reference) != target_digest:
-                raise ReleaseError(f"rollback verification failed for {reference}")
-            repointed[alias] = str(target_version)
-        elif current == target_digest:
-            repointed[alias] = str(target_version)
+        target_digest = candidates[target] if target is not None else None
+        if current is None:
+            if alias not in recorded_names:
+                continue
+            if action == "keep":
+                plan.skipped.append(alias)
+            elif action == "repoint" and target is not None and target_digest is not None:
+                plan.writes.append((alias, target, target_digest))
+                plan.repointed[alias] = target
+            else:
+                plan.removed.append(alias)
+        elif current == bad_digest:
+            if action == "keep" and target is not None:
+                plan.kept[alias] = target
+            elif action == "repoint" and target is not None and target_digest is not None:
+                plan.writes.append((alias, target, target_digest))
+                plan.repointed[alias] = target
+            else:
+                plan.unresolved.append(alias)
+        elif target is not None and action == "repoint" and current == target_digest:
+            plan.repointed[alias] = target
         else:
-            skipped.append(alias)
-    return repointed, skipped
+            plan.skipped.append(alias)
+    return plan
+
+
+def apply_alias_plan(crane: Path, plan: AliasPlan) -> None:
+    """Write a plan's retags, each inside its own repository, and verify every one by digest."""
+    for alias, _, target_digest in plan.writes:
+        reference = f"{plan.repository}:{alias}"
+        run((str(crane), "tag", f"{plan.repository}@{target_digest}", alias))
+        if crane_digest(crane, reference) != target_digest:
+            raise ReleaseError(f"rollback verification failed for {reference}")
+
+
+def alias_outcome(plan: AliasPlan, prefix: str = "") -> dict[str, Any]:
+    """The yank record's view of a plan. `prefix` separates the Docker Hub fields."""
+    return {
+        f"{prefix}alias_targets": {alias: str(version) for alias, version in sorted(plan.repointed.items())},
+        f"{prefix}aliases_kept": {alias: str(version) for alias, version in sorted(plan.kept.items())},
+        f"{prefix}aliases_skipped": sorted(plan.skipped),
+        f"{prefix}aliases_removed": sorted(plan.removed),
+    }
+
+
+def validated_public_aliases(
+    manifest: Mapping[str, Any],
+    version: Version,
+) -> list[dict[str, str]]:
+    """Read the Docker Hub tags a release verified, strictly, before a yank acts on them.
+
+    This is durable package state, not a trusted input. An absent field means the release was
+    never promoted to Docker Hub. Every record must be one of this version's tags in the public
+    repository, at the release digest, with the kind `publish_release` gives that tag.
+    """
+    records = manifest.get("public_aliases", [])
+    if not isinstance(records, list):
+        raise ReleaseError(f"release manifest {version} public_aliases must be an array")
+    digest = validated_manifest_digest(manifest, version)
+    validated: list[dict[str, str]] = []
+    names: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {"name", "reference", "digest", "kind"}:
+            raise ReleaseError(f"release manifest {version} carries an invalid public alias: {record!r}")
+        name = record["name"]
+        if (
+            not isinstance(name, str)
+            or name in names
+            or (name != str(version) and name not in version.aliases)
+            or record["kind"] != ("immutable" if name == str(version) else "moving")
+            or record["reference"] != f"{DOCKERHUB_REPOSITORY}:{name}"
+            or record["digest"] != digest
+        ):
+            raise ReleaseError(f"release manifest {version} carries an invalid public alias: {record!r}")
+        names.add(name)
+        validated.append(dict(record))
+    return validated
+
+
+def public_release_digests(released: Mapping[Version, Mapping[str, Any]]) -> dict[Version, str]:
+    """The releases a Docker Hub alias may fall back to: those actually published there.
+
+    A release from before promotion has a private image only. Copying it to Docker Hub during a
+    yank would publish an image the public-surface checks never covered, so it is never a
+    fallback, however compatible its version.
+    """
+    digests: dict[Version, str] = {}
+    for version, manifest in released.items():
+        try:
+            references = validated_public_references(manifest, version)
+        except ReleaseError as exc:
+            print(f"[release] WARNING: ignoring unreadable public record {version}: {exc}", file=sys.stderr)
+            continue
+        if references:
+            digests[version] = references[0]["digest"]
+    return digests
+
+
+def yank_public_aliases(
+    *,
+    crane: Path,
+    bad_manifest: Mapping[str, Any],
+    yanked: Version,
+    released: Mapping[Version, Mapping[str, Any]],
+    environ: Mapping[str, str],
+) -> dict[str, Any]:
+    """The Docker Hub half of a yank. It runs only after the private aliases are reconciled.
+
+    Everything here, the credential check included, can fail without holding the private
+    withdrawal back: a Docker Hub outage or misconfiguration leaves the private side done and
+    the job red, and a retry finishes this half. Whether Docker Hub is involved at all is decided
+    by `public_references`, so a release never promoted needs no login and makes no lookup.
+
+    With no compatible public release for an alias that still names the yanked digest, the CI
+    token cannot finish the job -- it deliberately cannot delete -- so every other alias is
+    reconciled first and the job then fails naming the exact tags, and a retry after the owner
+    deletes them converges.
+    """
+    bad_digest = validated_manifest_digest(bad_manifest, yanked)
+    promoted = bool(validated_public_references(bad_manifest, yanked))
+    records = validated_public_aliases(bad_manifest, yanked)
+    # The two public fields are written together, so one without the other is unexplained state.
+    if promoted != any(record["kind"] == "immutable" for record in records):
+        raise ReleaseError(
+            f"release manifest {yanked} public_references and public_aliases disagree about "
+            "whether it was promoted to Docker Hub"
+        )
+    empty = AliasPlan(DOCKERHUB_REPOSITORY, [], {}, {}, [], [], [])
+    if not promoted:
+        return alias_outcome(empty, "public_")
+    credentials = require_env(("DOCKERHUB_USERNAME", "DOCKERHUB_TOKEN"), environ)
+    crane_login(
+        crane,
+        DOCKERHUB_REGISTRY,
+        credentials["DOCKERHUB_USERNAME"],
+        credentials["DOCKERHUB_TOKEN"],
+    )
+    plan = plan_alias_reconciliation(
+        crane=crane,
+        repository=DOCKERHUB_REPOSITORY,
+        yanked=yanked,
+        bad_digest=bad_digest,
+        candidates=public_release_digests(released),
+        recorded=[record["name"] for record in records if record["kind"] == "moving"],
+    )
+    apply_alias_plan(crane, plan)
+    if plan.unresolved:
+        tags = ", ".join(f"{DOCKERHUB_REPOSITORY}:{alias}" for alias in plan.unresolved)
+        raise ReleaseError(
+            "Docker Hub aliases still name the yanked digest and no compatible public release "
+            "with a different image exists to repoint them to. The CI token cannot delete tags: "
+            f"delete these in Docker Hub, then retry release_yank: {tags}"
+        )
+    return alias_outcome(plan, "public_")
 
 
 def existing_yank_record(
@@ -2529,17 +2842,10 @@ def yank_release(
     bad_digest = validated_manifest_digest(bad_manifest, yanked)
     released = successful_releases(api)
     released.pop(yanked, None)
-    aliases = moving_alias_names(bad_manifest, yanked)
-    targets: dict[str, tuple[Version, str]] = {}
-    for alias in aliases:
-        target_version = target_version_for_alias(alias, released)
-        if target_version is None:
-            continue
-        target_manifest = released[target_version]
-        targets[alias] = (
-            target_version,
-            validated_manifest_digest(target_manifest, target_version),
-        )
+    recorded = moving_alias_names(bad_manifest, yanked)
+    private_candidates = {
+        version: validated_manifest_digest(manifest, version) for version, manifest in released.items()
+    }
     operator = api.current_job_user()
     # Resolved before the aliases move so a conflicting release record fails the yank
     # while it is still reversible. The SBOM link is gated on the file actually existing:
@@ -2566,12 +2872,33 @@ def yank_release(
         env["CI_REGISTRY_USER"],
         env["CI_REGISTRY_PASSWORD"],
     )
-    repointed, skipped = reconcile_moving_aliases(
+    private_plan = plan_alias_reconciliation(
         crane=crane,
         repository=env["CI_REGISTRY_IMAGE"],
-        aliases=aliases,
+        yanked=yanked,
         bad_digest=bad_digest,
-        targets=targets,
+        candidates=private_candidates,
+        recorded=recorded,
+    )
+    # Refused before any write: the private registry holds every earlier release, so an alias
+    # with no fallback there means no compatible release with another image exists at all.
+    if private_plan.unresolved:
+        joined = ", ".join(sorted(private_plan.unresolved))
+        raise ReleaseError(
+            "cannot yank while aliases lack a compatible non-yanked release with a different "
+            f"image: {joined}"
+        )
+    apply_alias_plan(crane, private_plan)
+    private = alias_outcome(private_plan)
+    # After the private side, never before it: Docker Hub must not hold the private withdrawal
+    # back. The yank record is written only once both halves agree, so a failure here leaves no
+    # record, keeps github_release_withdraw from running, and a retry converges.
+    public = yank_public_aliases(
+        crane=crane,
+        bad_manifest=bad_manifest,
+        yanked=yanked,
+        released=released,
+        environ=source_env,
     )
 
     if record is None:
@@ -2584,8 +2911,8 @@ def yank_release(
                 "username": operator["username"],
             },
             "yanked_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(),
-            "alias_targets": dict(sorted(repointed.items())),
-            "aliases_skipped": sorted(skipped),
+            **private,
+            **public,
             "pipeline_url": env["CI_PIPELINE_URL"],
             "job_url": env["CI_JOB_URL"],
         }
@@ -2599,12 +2926,22 @@ def yank_release(
     record_path = artifacts_dir / "yank-record.json"
     notes_path = artifacts_dir / "yanked-release-notes.md"
     record_path.write_bytes(record_bytes)
-    target_lines = "\n".join(
-        f"- `{alias}` now tracks v{target_version}"
-        for alias, target_version in sorted(repointed.items())
-    )
-    if not target_lines:
-        target_lines = "- No moving alias still referenced this release."
+    lines: list[str] = []
+    for label, prefix, outcome in (("", "", private), ("Docker Hub ", "public_", public)):
+        lines += [
+            f"- {label}`{alias}` now tracks v{target}"
+            for alias, target in outcome[f"{prefix}alias_targets"].items()
+        ]
+        lines += [
+            f"- {label}`{alias}` stays with v{target}, a newer release of the same image"
+            for alias, target in outcome[f"{prefix}aliases_kept"].items()
+        ]
+        lines += [
+            f"- {label}`{alias}` is no longer published: no compatible release with a different "
+            "image exists"
+            for alias in outcome[f"{prefix}aliases_removed"]
+        ]
+    target_lines = "\n".join(lines) or "- No moving alias still referenced this release."
     notes = (
         "> **YANKED:** This release was withdrawn.\n\n"
         f"Reason: {reason}\n\n"
@@ -2814,6 +3151,8 @@ def main() -> int:
             print(
                 f"[release] published v{manifest['release_version']} at {manifest['image_digest']}"
             )
+            for reference in manifest["public_references"]:
+                print(f"[release] public reference {reference['reference']} ({reference['digest']})")
         elif args.command == "yank":
             record = yank_release(
                 context_path=args.context,

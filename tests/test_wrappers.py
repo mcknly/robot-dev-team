@@ -245,7 +245,7 @@ class TestMissingTokenError:
 
 # ---------------------------------------------------------------------------
 # Self-defense against root-owned ~/.config (regression test for the
-# "MR !7 dispatch silently failed" incident: a `docker exec` as root left
+# "dispatch silently failed" incident: a `docker exec` as root left
 # /home/appuser/.config/glab-cli/ root-owned, after which every appuser
 # call hit "permission denied" creating the config dir).
 # ---------------------------------------------------------------------------
@@ -612,7 +612,7 @@ class TestCredentialHostFix:
 
 
 # ---------------------------------------------------------------------------
-# Credential helper precedence (issue #40) and per-host global store (#42).
+# Credential helper precedence and per-host global store.
 #
 # Every assertion below reads only the `username=` line of `git credential
 # fill`, so token values never reach test output or a CI log.
@@ -643,7 +643,7 @@ def _usr_env(fake_path: Path, home: Path, **extra: str) -> dict[str, str]:
 def _seed_global_helper(home: Path, *entries: str) -> None:
     """Install a global credential.helper answering as a different agent.
 
-    This is the state that caused the misattribution in issue #40: the
+    This is the state that caused the push misattribution: the
     operator already had a global store, so it answered before any
     repository-local helper glab-usr configured.
     """
@@ -693,7 +693,7 @@ def _init_repo(path: Path) -> Path:
 
 class TestRepositoryHelperPrecedence:
     def test_repo_helper_wins_over_inherited_global_helper(self, fake_path: Path, tmp_path: Path):
-        # The exact reproduction from issue #40: a valid global credential
+        # The exact reproduction of the misattribution: a valid global credential
         # for the same host, belonging to another agent.
         _seed_global_helper(tmp_path, "https://grok:global-token@git.example.com")
         repo = _init_repo(tmp_path / "repo")
@@ -808,7 +808,7 @@ class TestRepositoryHelperPrecedence:
 
 
 class TestGlobalFallbackStore:
-    """Issue #42: the global path must not touch git's shared store."""
+    """The global path must not touch git's shared store."""
 
     def _run_outside_repo(self, fake_path: Path, tmp_path: Path, **extra: str):
         # A plain directory is not a git repo, so glab-usr takes the global
@@ -1128,7 +1128,7 @@ class TestAuthCommandConstruction:
 
 
 # ---------------------------------------------------------------------------
-# Issue #43: repository shapes where .git is a file, not a directory.
+# Repository shapes where .git is a file, not a directory.
 # ---------------------------------------------------------------------------
 
 

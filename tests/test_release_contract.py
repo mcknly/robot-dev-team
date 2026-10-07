@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -22,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 UNRELEASED_HEADING = "## [Unreleased]"
 RELOCK_HINT = "run 'uv lock' after changing [project].version"
 # A fully qualified base-image pin: readable tag *and* OCI index digest. The pattern is
-# deliberately loose about the Debian codename so #59's bookworm -> trixie move does not have to
+# deliberately loose about the Debian codename so a move like bookworm -> trixie does not have to
 # touch this file, and strict about the digest so a tag-only reference cannot pass.
 PYTHON_IMAGE_PIN = re.compile(
     r"python:(?P<version>\d+\.\d+\.\d+)-slim-(?P<codename>[a-z]+)@sha256:[0-9a-f]{64}"
@@ -43,6 +44,51 @@ TOP_LEVEL_KEY = re.compile(r"^[^\s#]")
 # The one job that is deliberately not on the runtime interpreter. It executes the
 # `requires-python` floor, so its pin must differ from the runtime's by design.
 FLOOR_JOB = "compat_python_floor:"
+# `uv` invocations that print and exit without reading or writing uv's cache.
+UV_INFORMATIONAL_ARGUMENTS = frozenset({"--version", "-V", "help", "--help", "-h"})
+# Program names that are uv. `uvx` is `uv tool run` and shares its cache.
+UV_PROGRAMS = frozenset({"uv", "uvx"})
+# BuildKit's `RUN` options (`--mount=`, `--network=`, `--security=`, `--device=`) precede the
+# command; none of them is the program.
+DOCKERFILE_RUN_OPTIONS = re.compile(r"^(?:--[a-z][a-z-]*(?:=\S*)?\s+)+")
+# A Dockerfile heredoc marker: `<<EOF`, `<<-EOF`, `<<"EOF"`, `<<'EOF'`.
+DOCKERFILE_HEREDOC = re.compile(r"<<(?P<dash>-?)(?P<quote>[\"']?)(?P<word>[A-Za-z_]\w*)(?P=quote)")
+# Shell words that precede the command they run without being it.
+SHELL_PREFIX_WORDS = frozenset(
+    {"!", "{", "}", "exec", "command", "nohup", "if", "then", "else", "elif", "while", "until", "do"}
+)
+SHELL_INTERPRETERS = frozenset({"sh", "bash", "dash", "zsh"})
+SHELL_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
+# curl's short options that take an argument. In a bundle the rest of the word is that
+# argument (`-of` writes to a file named `f`), and a bundle ending in one consumes the next word.
+CURL_SHORT_OPTIONS_WITH_ARGUMENT = frozenset("AbCcDdEeFHKmoPQrTtUuwXxYyz")
+# curl's long options that take an argument, from `curl --help all` (8.14.1, the image's curl)
+# less `--help`. The argument is always the next word: curl accepts neither `--output=f` nor
+# an abbreviated name, so `--output -f` writes to a file named `-f` and sets nothing.
+CURL_LONG_OPTIONS_WITH_ARGUMENT = frozenset(
+    f"--{name}"
+    for name in (
+        "abstract-unix-socket alt-svc aws-sigv4 cacert capath cert cert-type ciphers config "
+        "connect-timeout connect-to continue-at cookie cookie-jar create-file-mode crlfile curves "
+        "data data-ascii data-binary data-raw data-urlencode delegation dns-interface "
+        "dns-ipv4-addr dns-ipv6-addr dns-servers doh-url dump-header ech egd-file engine "
+        "etag-compare etag-save expect100-timeout form form-string ftp-account "
+        "ftp-alternative-to-user ftp-method ftp-port ftp-ssl-ccc-mode happy-eyeballs-timeout-ms "
+        "haproxy-clientip header hostpubmd5 hostpubsha256 hsts interface ip-tos ipfs-gateway json "
+        "keepalive-cnt keepalive-time key key-type krb libcurl limit-rate local-port "
+        "login-options mail-auth mail-from mail-rcpt max-filesize max-redirs max-time netrc-file "
+        "noproxy oauth2-bearer output output-dir parallel-max pass pinnedpubkey preproxy proto "
+        "proto-default proto-redir proxy proxy-cacert proxy-capath proxy-cert proxy-cert-type "
+        "proxy-ciphers proxy-crlfile proxy-header proxy-key proxy-key-type proxy-pass "
+        "proxy-pinnedpubkey proxy-service-name proxy-tls13-ciphers proxy-tlsauthtype "
+        "proxy-tlspassword proxy-tlsuser proxy-user proxy1.0 pubkey quote random-file range rate "
+        "referer request request-target resolve retry retry-delay retry-max-time sasl-authzid "
+        "service-name sigalgs socks4 socks4a socks5 socks5-gssapi-service socks5-hostname "
+        "speed-limit speed-time ssl-sessions stderr telnet-option tftp-blksize time-cond tls-max "
+        "tls13-ciphers tlsauthtype tlspassword tlsuser trace trace-ascii trace-config unix-socket "
+        "upload-file upload-flags url url-query user user-agent variable vlan-priority write-out "
+    ).split()
+)
 # The checked-in reference SBOM. Not the document a release publishes -- `sbom_publish` stages
 # the smoke-tested image's own bytes -- but the one a reader consults in the repository.
 SBOM_PATH = Path("sbom") / "sbom.spdx.json"
@@ -208,6 +254,296 @@ def _load_toml(path: Path) -> dict[str, Any]:
             return tomllib.load(stream)
     except tomllib.TOMLDecodeError as exc:
         raise AssertionError(f"release contract: {path} is not readable TOML: {exc}") from exc
+
+
+def _dockerfile_instructions(text: str) -> list[tuple[str, str, list[str]]]:
+    """Return ``(INSTRUCTION, arguments, heredoc bodies)`` for each logical instruction.
+
+    Backslash continuations are joined, including a backslash followed by trailing whitespace,
+    which BuildKit also accepts. Comment lines are dropped, including ones inside a continued
+    instruction, which is how the Dockerfile parser itself treats them. Heredoc bodies are
+    consumed verbatim, so their lines are never read as instructions.
+    """
+    instructions: list[tuple[str, str, list[str]]] = []
+    pending: list[str] = []
+    lines = iter(text.splitlines())
+    for line in lines:
+        if line.lstrip().startswith("#"):
+            continue
+        if line.rstrip().endswith("\\"):
+            pending.append(line.rstrip()[:-1])
+            continue
+        pending.append(line)
+        logical = " ".join(pending).strip()
+        pending = []
+        if not logical:
+            continue
+        keyword, _, arguments = logical.partition(" ")
+        bodies: list[str] = []
+        for marker in DOCKERFILE_HEREDOC.finditer(arguments):
+            body: list[str] = []
+            for body_line in lines:
+                candidate = body_line.lstrip("\t") if marker.group("dash") else body_line
+                if candidate == marker.group("word"):
+                    break
+                body.append(body_line)
+            bodies.append("\n".join(body))
+        instructions.append((keyword.upper(), arguments.strip(), bodies))
+    return instructions
+
+
+def _shell_commands(script: str) -> list[list[str]]:
+    """Split a shell script into simple commands at ``&&``, ``||``, ``;``, ``|``, ``&``,
+    parentheses, and newlines."""
+    lexer = shlex.shlex(script, posix=True, punctuation_chars="();<>|&\n")
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    commands: list[list[str]] = [[]]
+    for token in lexer:
+        if token and set(token) <= set("&|;()\n"):
+            commands.append([])
+        else:
+            commands[-1].append(token)
+    return [command for command in commands if command]
+
+
+def _exec_form(arguments: str) -> list[str] | None:
+    """Return the argv of an exec-form ``RUN ["prog", ...]``, or None for shell form.
+
+    Docker runs anything that is not a valid JSON array of strings as shell form.
+    """
+    if not arguments.startswith("["):
+        return None
+    try:
+        value = json.loads(arguments)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(value, list) and all(isinstance(word, str) for word in value):
+        return value
+    return None
+
+
+def _command_argv(command: list[str]) -> list[str]:
+    """Drop assignments and transparent prefixes (``exec``, ``env``, ``!``, ``if`` ...)."""
+    words = list(command)
+    while words:
+        head = words[0]
+        if SHELL_ASSIGNMENT.fullmatch(head) or head in SHELL_PREFIX_WORDS:
+            words.pop(0)
+        elif head in ("env", "time"):
+            words.pop(0)
+            while words and words[0].startswith("-"):
+                option = words.pop(0)
+                if head == "env" and option in ("-u", "-C", "--unset", "--chdir") and words:
+                    words.pop(0)
+        else:
+            break
+    return words
+
+
+def _shell_c_script(argv: list[str]) -> str | None:
+    """Return the script a ``sh -c``-style invocation runs, or None when it runs none."""
+    reads_command = False
+    words = iter(argv[1:])
+    for word in words:
+        if word == "--":
+            operand = next(words, None)
+            return operand if reads_command else None
+        if word.startswith("--"):
+            continue
+        if word.startswith(("-", "+")) and len(word) > 1:
+            reads_command = reads_command or "c" in word[1:]
+            # `-o` takes the next word as its argument, alone or bundled (`-euo pipefail`).
+            if word.endswith("o"):
+                next(words, None)
+        else:
+            return word if reads_command else None
+    return None
+
+
+def _simple_commands(commands: list[list[str]]) -> list[tuple[str, list[str]]]:
+    """Return ``(as written, argv)`` for each simple command, parsing ``sh -c`` scripts in turn."""
+    found: list[tuple[str, list[str]]] = []
+    for command in commands:
+        argv = _command_argv(command)
+        if not argv:
+            continue
+        if Path(argv[0]).name in SHELL_INTERPRETERS:
+            script = _shell_c_script(argv)
+            if script is not None:
+                found.extend(_simple_commands(_shell_commands(script)))
+            continue
+        found.append((" ".join(command), argv))
+    return found
+
+
+def _uv_commands(commands: list[list[str]]) -> list[tuple[str, list[str]]]:
+    """Return ``(as written, argv)`` for each uv invocation, looking through shell wrappers.
+
+    ``uvx`` and ``python -m uv`` are uv, and a ``sh -c`` / ``bash -c`` script is parsed in turn.
+    """
+    found: list[tuple[str, list[str]]] = []
+    for written, argv in _simple_commands(commands):
+        program = Path(argv[0]).name
+        if re.fullmatch(r"python[0-9.]*", program) and argv[1:3] == ["-m", "uv"]:
+            argv = ["uv", *argv[3:]]
+        elif program not in UV_PROGRAMS:
+            continue
+        if len(argv) > 1 and argv[1] in UV_INFORMATIONAL_ARGUMENTS:
+            continue
+        found.append((written, argv))
+    return found
+
+
+def _uv_disables_cache(argv: list[str]) -> bool:
+    """Whether uv itself, and not a tool it runs, receives ``--no-cache``.
+
+    uv reads its own options up to ``--``. A runner (``uvx``, ``uv run``, ``uv tool run``)
+    also hands everything after the tool's name to the tool, so there the flag must come before
+    that name. An option that takes a value can make a correct placement look late
+    (``uvx --with httpx --no-cache ruff``); that fails closed, and putting ``--no-cache`` first
+    satisfies it.
+    """
+    words = argv[1:]
+    if "--" in words:
+        words = words[: words.index("--")]
+    if Path(argv[0]).name == "uvx":
+        head, tail = [], words
+    elif "run" in words:
+        at = words.index("run")
+        head, tail = words[:at], words[at + 1 :]
+    else:
+        return "--no-cache" in words
+    options = list(head)
+    for word in tail:
+        if not word.startswith("-"):
+            break
+        options.append(word)
+    return "--no-cache" in options
+
+
+def _uv_build_cache_violations(dockerfile_text: str) -> tuple[int, list[str]]:
+    """Return how many ``uv`` commands the ``Dockerfile`` runs, and which of them cache.
+
+    Every ``uv`` command in a ``RUN`` must pass ``--no-cache``: without it, uv writes its
+    cache under the build user's ``$HOME`` inside that layer, and a later ``rm`` only adds a
+    whiteout over bytes the image still ships. Informational commands that never touch the
+    cache are exempt. ``UV_NO_CACHE`` in an ``ENV`` instruction is refused rather than accepted
+    as an alternative, because ``ENV`` survives into the runtime container and would disable
+    caching for every ``uv`` an agent runs in a mounted project.
+
+    A heredoc ``RUN`` that mentions uv fails closed: the body is input to whatever program the
+    instruction names, and the check cannot tell which. Commands inside a script the image
+    ``COPY``s in and then runs are out of reach; the ``Dockerfile`` has none that call uv.
+    """
+    count = 0
+    violations: list[str] = []
+    for keyword, arguments, heredocs in _dockerfile_instructions(dockerfile_text):
+        if keyword == "ENV" and re.search(r"\bUV_NO_CACHE\b", arguments):
+            violations.append("ENV " + " ".join(arguments.split()))
+        if keyword != "RUN":
+            continue
+        script = DOCKERFILE_RUN_OPTIONS.sub("", arguments)
+        if heredocs:
+            if any(re.search(r"\buvx?\b", text) for text in [script, *heredocs]):
+                count += 1
+                violations.append(f"RUN {script} (a heredoc that runs uv cannot be checked)")
+            continue
+        exec_argv = _exec_form(script)
+        commands = [exec_argv] if exec_argv is not None else _shell_commands(script)
+        for written, argv in _uv_commands(commands):
+            count += 1
+            if not _uv_disables_cache(argv):
+                violations.append(written)
+    return count, violations
+
+
+def _curl_option(word: str) -> tuple[bool, bool]:
+    """Return whether a curl word sets ``-f``, and whether it consumes the next word.
+
+    A long option takes the next word when it is in `CURL_LONG_OPTIONS_WITH_ARGUMENT`. In a
+    short-option bundle ``-f`` counts only before an option that takes an argument, since the
+    rest of the word is then that argument; a bundle that ends in such an option takes the
+    next word instead. Anything else (a URL, a lone ``-``) is neither.
+    """
+    if word.startswith("--"):
+        return False, word in CURL_LONG_OPTIONS_WITH_ARGUMENT
+    if not re.fullmatch(r"-[^-].*", word):
+        return False, False
+    fails = False
+    for index, letter in enumerate(word[1:], start=2):
+        if letter in CURL_SHORT_OPTIONS_WITH_ARGUMENT:
+            return fails, index == len(word)
+        fails = fails or letter == "f"
+    return fails, False
+
+
+def _curl_missing_options(argv: list[str]) -> list[str]:
+    """Return which of ``--fail`` and ``--retry`` a curl invocation lacks.
+
+    ``-f`` counts alone or in a bundle (``-fsSL``), ``--no-fail`` undoes it, a ``--retry``
+    whose count is not a literal positive integer does not count, and each ``--next`` group
+    must carry both on its own, because curl resets options there. A word that is another
+    option's argument (``-H -f``, ``--output -f``) is skipped, since curl never reads it as
+    an option.
+    """
+    missing: list[str] = []
+    groups: list[tuple[bool, bool]] = []
+    fails = retries = False
+    words = iter(argv[1:])
+    for word in words:
+        if word in ("--next", "-:"):
+            groups.append((fails, retries))
+            fails = retries = False
+        elif word in ("--fail", "--fail-with-body"):
+            fails = True
+        elif word == "--no-fail":
+            fails = False
+        elif word == "--retry":
+            value = next(words, "")
+            retries = value.isdigit() and int(value) > 0
+        else:
+            word_fails, takes_next = _curl_option(word)
+            fails = fails or word_fails
+            if takes_next:
+                next(words, None)
+    groups.append((fails, retries))
+    if not all(group_fails for group_fails, _ in groups):
+        missing.append("--fail")
+    if not all(group_retries for _, group_retries in groups):
+        missing.append("--retry")
+    return missing
+
+
+def _curl_download_violations(dockerfile_text: str) -> tuple[int, list[str]]:
+    """Return how many ``curl`` commands the ``Dockerfile`` runs, and which lack a flag.
+
+    Every ``curl`` in a ``RUN`` must pass ``--fail`` and ``--retry``. Without ``-f`` an
+    HTTP error body is saved as if it were the file, and the build fails later on whatever
+    reads it; without ``--retry`` a transient 429 or 5xx fails a protected build. A heredoc
+    ``RUN`` that mentions curl fails closed, as in `_uv_build_cache_violations`.
+    """
+    count = 0
+    violations: list[str] = []
+    for keyword, arguments, heredocs in _dockerfile_instructions(dockerfile_text):
+        if keyword != "RUN":
+            continue
+        script = DOCKERFILE_RUN_OPTIONS.sub("", arguments)
+        if heredocs:
+            if any(re.search(r"\bcurl\b", text) for text in [script, *heredocs]):
+                count += 1
+                violations.append(f"RUN {script} (a heredoc that runs curl cannot be checked)")
+            continue
+        exec_argv = _exec_form(script)
+        commands = [exec_argv] if exec_argv is not None else _shell_commands(script)
+        for written, argv in _simple_commands(commands):
+            if Path(argv[0]).name != "curl":
+                continue
+            count += 1
+            missing = _curl_missing_options(argv)
+            if missing:
+                violations.append(f"{written} (no {', no '.join(missing)})")
+    return count, violations
 
 
 def check_release_metadata(root: Path) -> None:
@@ -613,8 +949,8 @@ def test_runtime_python_image_pins_agree() -> None:
     # support policy, and a codename encodes nothing about it -- so the lane follows the
     # runtime's distro, as its own comment block in `.gitlab-ci.yml` states. Without this the
     # only enforcement is that someone remembers on a hop that touches nothing else about the
-    # lane, which leaves the floor lane on an end-of-life Debian: the exact condition #59
-    # exists to end, reintroduced on the one job nobody rebuilds locally.
+    # lane, which leaves the floor lane on an end-of-life Debian: the exact condition the Debian 13
+    # migration exists to end, reintroduced on the one job nobody rebuilds locally.
     assert floor_pinned.group("codename") == runtime_pinned.group("codename"), (
         f"release contract: {FLOOR_JOB[:-1]} (.gitlab-ci.yml line {floor_line}) runs "
         f"{floor_pin} while the Dockerfile's PYTHON_IMAGE is built on "
@@ -632,7 +968,7 @@ def test_apt_suites_match_the_base_image_codename() -> None:
     silently. Pointing a bookworm base at trixie suites does not fail the build: APT installs
     the named packages from the frozen archive perfectly happily, and the result is a mixed
     image nothing downstream flags. The reverse -- a base bumped to a new codename with the
-    suites left behind -- is the one #59 had to make by hand, and it is the more likely
+    suites left behind -- is the one the Debian 13 migration had to make by hand, and it is the more likely
     direction, since the base pin moves on a security cadence and the suites move only on a
     distro migration.
 
@@ -664,13 +1000,307 @@ def test_apt_suites_match_the_base_image_codename() -> None:
     )
 
 
+def test_dockerfile_uv_commands_leave_no_build_cache() -> None:
+    """No `uv` command in the `Dockerfile` leaves its cache in an image layer.
+
+    The pre-publication audit found uv's cache under /root/.cache/uv because `uv sync` lacked the flag
+    both `pip install` lines beside it already carried. The fix is one flag, so the
+    regression is one flag too; this keeps a later edit to that `RUN` from bringing the cache
+    back unnoticed. `.gitlab-ci.yml` jobs are out of scope: they cache on purpose.
+    """
+    dockerfile = REPO_ROOT / "Dockerfile"
+    count, violations = _uv_build_cache_violations(dockerfile.read_text(encoding="utf-8"))
+    assert count, (
+        f"release contract: found no uv command in {dockerfile}; the image installs its "
+        "dependencies with `uv sync`, so the parser has stopped seeing it"
+    )
+    assert not violations, (
+        f"release contract: {dockerfile} would ship uv's cache in an image layer. Pass "
+        "--no-cache on every uv and uvx command in a RUN (before the tool's name for uvx, "
+        "uv run and uv tool run), use shell or exec form rather than a heredoc for uv, and "
+        "keep UV_NO_CACHE out of ENV, which reaches the runtime container: "
+        + "; ".join(violations)
+    )
+
+
+@pytest.mark.parametrize(
+    ("dockerfile_text", "count", "violations"),
+    [
+        pytest.param(
+            'RUN pip install --no-cache-dir "uv==0.12.1" && \\\n'
+            "    uv sync --frozen --no-dev --no-install-project --no-cache\n",
+            1,
+            [],
+            id="continued-run-with-flag",
+        ),
+        pytest.param(
+            'RUN pip install --no-cache-dir "uv==0.12.1" && \\\n'
+            "    uv sync --frozen --no-dev --no-install-project\n",
+            1,
+            ["uv sync --frozen --no-dev --no-install-project"],
+            id="continued-run-without-flag",
+        ),
+        pytest.param(
+            "RUN uv sync --no-cache; /opt/venv/bin/uv pip install httpx\n",
+            2,
+            ["/opt/venv/bin/uv pip install httpx"],
+            id="second-command-by-path",
+        ),
+        pytest.param(
+            "RUN UV_NO_CACHE=1 uv sync --frozen\n",
+            1,
+            ["UV_NO_CACHE=1 uv sync --frozen"],
+            id="env-prefix-is-not-the-flag",
+        ),
+        pytest.param(
+            "RUN uv --version && \\\n# uv sync is below\n    uv sync --no-cache\n",
+            1,
+            [],
+            id="informational-and-comment-lines-ignored",
+        ),
+        pytest.param(
+            "ENV UV_PROJECT_ENVIRONMENT=/opt/venv \\\n    UV_NO_CACHE=1\nRUN uv sync --no-cache\n",
+            1,
+            ["ENV UV_PROJECT_ENVIRONMENT=/opt/venv UV_NO_CACHE=1"],
+            id="env-instruction-refused",
+        ),
+        pytest.param(
+            'RUN echo "uv sync" && pip install "uv==0.12.1"\n',
+            0,
+            [],
+            id="quoted-and-pinned-mentions-are-not-commands",
+        ),
+        # Each form below was invisible to the first version of the check once another uv
+        # command in the file satisfied the count (found in review).
+        pytest.param(
+            "RUN --network=none uv sync --frozen\n",
+            1,
+            ["uv sync --frozen"],
+            id="run-option-is-not-the-program",
+        ),
+        pytest.param(
+            "RUN --mount=type=cache,target=/cache --network=default uv sync --frozen\n",
+            1,
+            ["uv sync --frozen"],
+            id="several-run-options",
+        ),
+        pytest.param(
+            "RUN uv sync --no-cache && uvx ruff --version && /opt/venv/bin/uvx --no-cache ruff\n",
+            3,
+            ["uvx ruff --version"],
+            id="uvx-is-uv",
+        ),
+        pytest.param(
+            "RUN uvx ruff --no-cache check && uv run pytest --no-cache && "
+            "uv --no-cache tool run ruff && uv run --no-cache -- pytest\n",
+            4,
+            ["uvx ruff --no-cache check", "uv run pytest --no-cache"],
+            id="runner-flag-after-the-tool-goes-to-the-tool",
+        ),
+        pytest.param(
+            "RUN uv pip install httpx --no-cache && uv pip install -- --no-cache\n",
+            2,
+            ["uv pip install -- --no-cache"],
+            id="flag-after-double-dash-is-not-uvs",
+        ),
+        pytest.param(
+            "RUN python3 -m uv sync --frozen && /usr/local/bin/python3.14 -m uv sync --no-cache\n",
+            2,
+            ["python3 -m uv sync --frozen"],
+            id="python-dash-m-uv",
+        ),
+        pytest.param(
+            "RUN bash -euo pipefail -c \"echo hi; uv sync --frozen\" && "
+            "sh -c 'uv sync --no-cache' && sh ./install.sh\n",
+            2,
+            ["uv sync --frozen"],
+            id="shell-c-script-is-parsed",
+        ),
+        pytest.param(
+            'RUN ["uv", "sync", "--frozen"]\nRUN ["/bin/sh", "-c", "uv sync --no-cache\\nuv pip list"]\n',
+            3,
+            ["uv sync --frozen", "uv pip list"],
+            id="exec-form",
+        ),
+        pytest.param(
+            "RUN (uv sync --frozen) && exec uv sync && ! uv sync && "
+            "if true; then uv sync; fi && env -u HOME UV_X=1 uv sync && time -p uv sync\n",
+            6,
+            [
+                "uv sync --frozen",
+                "exec uv sync",
+                "! uv sync",
+                "then uv sync",
+                "env -u HOME UV_X=1 uv sync",
+                "time -p uv sync",
+            ],
+            id="shell-prefixes-are-looked-through",
+        ),
+        pytest.param(
+            "RUN <<EOF\nuv sync --no-cache\nEOF\n",
+            1,
+            ["RUN <<EOF (a heredoc that runs uv cannot be checked)"],
+            id="heredoc-with-uv-fails-closed",
+        ),
+        pytest.param(
+            "RUN <<-'EOT' bash\n\techo hi\nENV UV_NO_CACHE=1\n\tEOT\nRUN uv sync --frozen\n",
+            1,
+            ["uv sync --frozen"],
+            id="heredoc-body-is-not-an-instruction",
+        ),
+        pytest.param(
+            "RUN pip install x && \\  \n    uv sync --frozen\n",
+            1,
+            ["uv sync --frozen"],
+            id="continuation-with-trailing-whitespace",
+        ),
+    ],
+)
+def test_uv_build_cache_check(dockerfile_text: str, count: int, violations: list[str]) -> None:
+    assert _uv_build_cache_violations(dockerfile_text) == (count, violations)
+
+
+def test_dockerfile_curl_downloads_fail_on_http_errors_and_retry() -> None:
+    """Every `curl` in the `Dockerfile` fails on an HTTP error and retries.
+
+    A protected `main` image build failed on a `grep` with no match: the glab `checksums.txt`
+    download had saved an error or rate-limit page with exit 0, and a retry of the job passed.
+    `-f` makes that failure name the download and its status, and `--retry` lets a transient
+    429 or 5xx pass. `sha256sum -c` remains the integrity gate; this is diagnostics.
+    """
+    dockerfile = REPO_ROOT / "Dockerfile"
+    count, violations = _curl_download_violations(dockerfile.read_text(encoding="utf-8"))
+    assert count, (
+        f"release contract: found no curl command in {dockerfile}; the image downloads glab "
+        "with curl, so the parser has stopped seeing it"
+    )
+    assert not violations, (
+        f"release contract: {dockerfile} has a curl download that would save an HTTP error "
+        "body as the file or fail a build on a transient error. Pass -f (or --fail) and "
+        "--retry N on every curl in a RUN, and use shell or exec form rather than a heredoc: "
+        + "; ".join(violations)
+    )
+
+
+@pytest.mark.parametrize(
+    ("dockerfile_text", "count", "violations"),
+    [
+        pytest.param(
+            "RUN curl -fsSL --retry 3 https://example.invalid/a -o /tmp/a && \\\n"
+            "    curl --fail --retry 3 https://example.invalid/b -o /tmp/b\n",
+            2,
+            [],
+            id="bundled-and-long-fail",
+        ),
+        pytest.param(
+            "RUN curl -sSL https://example.invalid/a -o /tmp/a\n",
+            1,
+            ["curl -sSL https://example.invalid/a -o /tmp/a (no --fail, no --retry)"],
+            id="no-fail-no-retry",
+        ),
+        pytest.param(
+            "RUN curl -fsSL https://example.invalid/a -o /tmp/a; "
+            "curl -sSL --retry 3 https://example.invalid/b\n",
+            2,
+            [
+                "curl -fsSL https://example.invalid/a -o /tmp/a (no --retry)",
+                "curl -sSL --retry 3 https://example.invalid/b (no --fail)",
+            ],
+            id="each-flag-is-required",
+        ),
+        pytest.param(
+            "RUN curl --fail-with-body --retry 2 https://example.invalid/a && "
+            "curl -f --no-fail --retry 2 https://example.invalid/b\n",
+            2,
+            ["curl -f --no-fail --retry 2 https://example.invalid/b (no --fail)"],
+            id="fail-with-body-counts-no-fail-undoes",
+        ),
+        pytest.param(
+            "RUN curl -sof --retry 3 https://example.invalid/a && "
+            "curl -H -f --retry 3 https://example.invalid/b && "
+            "curl -sSLo /tmp/f -f --retry 3 https://example.invalid/c\n",
+            3,
+            [
+                "curl -sof --retry 3 https://example.invalid/a (no --fail)",
+                "curl -H -f --retry 3 https://example.invalid/b (no --fail)",
+            ],
+            id="option-argument-is-not-fail",
+        ),
+        pytest.param(
+            "RUN curl --output -f --retry 3 https://example.invalid/a && "
+            "curl --header -f --connect-timeout -f --retry 3 https://example.invalid/b && "
+            "curl --url -f --retry-max-time -f --retry 3 https://example.invalid/c && "
+            "curl -f --retry-delay --retry 3 https://example.invalid/d && "
+            "curl --output /tmp/f -f --retry 3 https://example.invalid/e\n",
+            5,
+            [
+                "curl --output -f --retry 3 https://example.invalid/a (no --fail)",
+                "curl --header -f --connect-timeout -f --retry 3 https://example.invalid/b "
+                "(no --fail)",
+                "curl --url -f --retry-max-time -f --retry 3 https://example.invalid/c (no --fail)",
+                "curl -f --retry-delay --retry 3 https://example.invalid/d (no --retry)",
+            ],
+            id="long-option-argument-is-not-fail-or-retry",
+        ),
+        pytest.param(
+            "RUN curl -f --retry 0 https://example.invalid/a && "
+            'curl -f --retry "${N}" https://example.invalid/b && '
+            "curl -f https://example.invalid/c --retry\n",
+            3,
+            [
+                "curl -f --retry 0 https://example.invalid/a (no --retry)",
+                "curl -f --retry ${N} https://example.invalid/b (no --retry)",
+                "curl -f https://example.invalid/c --retry (no --retry)",
+            ],
+            id="retry-needs-a-positive-literal-count",
+        ),
+        pytest.param(
+            "RUN curl -f --retry 3 https://example.invalid/a --next https://example.invalid/b\n",
+            1,
+            [
+                "curl -f --retry 3 https://example.invalid/a --next https://example.invalid/b "
+                "(no --fail, no --retry)"
+            ],
+            id="next-resets-options",
+        ),
+        pytest.param(
+            "RUN apt-get install -y curl && echo curl && /usr/bin/curl -fL --retry 3 x\n",
+            1,
+            [],
+            id="package-names-and-mentions-are-not-commands",
+        ),
+        pytest.param(
+            "RUN --network=default sh -c 'curl -sSL x | tar -x' && "
+            'DEBUG=1 exec curl -fL --retry 1 y\nRUN ["curl", "-sSL", "z"]\n',
+            3,
+            ["curl -sSL x (no --fail, no --retry)", "curl -sSL z (no --fail, no --retry)"],
+            id="wrappers-and-exec-form",
+        ),
+        pytest.param(
+            "RUN <<EOF\ncurl -fsSL --retry 3 x\nEOF\n",
+            1,
+            ["RUN <<EOF (a heredoc that runs curl cannot be checked)"],
+            id="heredoc-with-curl-fails-closed",
+        ),
+        pytest.param(
+            "RUN pip install x\n",
+            0,
+            [],
+            id="no-curl",
+        ),
+    ],
+)
+def test_curl_download_check(dockerfile_text: str, count: int, violations: list[str]) -> None:
+    assert _curl_download_violations(dockerfile_text) == (count, violations)
+
+
 def test_reference_sbom_records_the_runtime_interpreter() -> None:
     """`sbom/sbom.spdx.json` describes the interpreter `PYTHON_IMAGE` actually ships.
 
     Step 3 of the update checklist in `docs/DEPENDENCY_MANAGEMENT.md` says to regenerate the
     SBOM whenever the dependency footprint moves, and nothing enforced it: `header_guard.py`
     skips `sbom/`, and the document is not read by any other check. The artifact went stale
-    across a full runtime hop and stayed silent (#73), which is the most misleading direction
+    across a full runtime hop and stayed silent, which is the most misleading direction
     for it to drift in -- it advertised an interpreter the image no longer shipped.
 
     Scoped to the interpreter rather than the whole document on purpose. A byte-for-byte
@@ -704,8 +1334,8 @@ def test_reference_sbom_records_the_runtime_interpreter() -> None:
 def test_reference_sbom_records_the_base_image_distro() -> None:
     """`sbom/sbom.spdx.json` describes the Debian release `PYTHON_IMAGE` is built on.
 
-    The interpreter check above cannot see this MR's own class of drift. #59 is a distro-only
-    hop -- `PYTHON_VERSION` stays 3.14.7 by design -- so a reference SBOM left on the bookworm
+    The interpreter check above cannot see a distro-only hop. The Debian 13 migration was one
+    -- `PYTHON_VERSION` stayed 3.14.7 by design -- so a reference SBOM left on the bookworm
     image would satisfy it verbatim while describing 125 packages the image no longer ships.
     That is the same asymmetry `test_apt_suites_match_the_base_image_codename` exists for: the
     base pin moves on a security cadence and the codename moves only on a migration, so the

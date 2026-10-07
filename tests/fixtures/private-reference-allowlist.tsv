@@ -1,0 +1,47 @@
+# Robot Dev Team Project
+# File: tests/fixtures/private-reference-allowlist.tsv
+# Description: Reviewed lines that match the private-tracker reference patterns but cite nothing.
+# License: MIT
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 MCKNLY LLC
+#
+# Read by `test_no_tracked_file_cites_the_private_tracker` in tests/test_public_surface.py.
+# One entry per line: a tracked path, a tab, and the matching line exactly as it reads with its
+# leading and trailing whitespace removed. An entry covers that line text in that file only.
+#
+# Every entry here is data, not a citation: fake merge request and issue numbers the branch
+# resolver tests steer between, example-host webhook URLs, and the image audit's numbered
+# output format. A prose pointer into the canonical tracker never belongs here -- rewrite it as
+# the reason it stood for. An entry that no longer matches its file fails the test, so this list
+# cannot outlive the lines it reviews.
+tests/test_branch_pruning.py	assert pruner._is_protected("feature/issue-42-widgets") is False
+tests/test_branch_resolver.py	return "feature/issue-42"  # Linked MR branch
+tests/test_branch_resolver.py	assert result.branch == "feature/issue-42"
+tests/test_branch_resolver.py	{"iid": 10, "state": "opened", "source_branch": "fix/issue-5", "updated_at": "2026-01-01T00:00:00Z"},
+tests/test_branch_resolver.py	assert result == "fix/issue-5"
+tests/test_branch_resolver.py	# MR 20 closes issue 5
+tests/test_branch_resolver.py	# MR 10 does not close issue 5
+tests/test_branch_resolver.py	{"iid": 20, "state": "opened", "source_branch": "fix/issue-5", "updated_at": "2026-01-01T00:00:00Z"},
+tests/test_branch_resolver.py	# Note body explicitly mentions MR !10
+tests/test_branch_resolver.py	note_body="Please work on !10 instead",
+tests/test_branch_resolver.py	# MR 10's API call fails
+tests/test_branch_resolver.py	# MR 10 is more recent, API failure should not penalize it
+tests/test_branch_resolver.py	# "abc!10def" should not match MR !10
+tests/test_branch_resolver.py	# Should fall back to recency (MR 20)
+tests/test_branch_resolver.py	return (b'[{"iid": 5}]', b"")  # closes issue 5
+tests/test_branch_resolver.py	return (b'[{"iid": 99}]', b"")  # does not close issue 5
+tests/test_branch_resolver.py	"note": "Please work on !42 for this",
+tests/test_branch_resolver.py	assert captured_note_body["value"] == "Please work on !42 for this"
+tests/test_branch_resolver.py	# Both MRs close issue 5
+tests/test_branch_resolver.py	# MR 20 is more recent among the closing candidates
+tests/test_branch_resolver.py	# MR 10 was just mentioned, does not close the issue
+tests/test_branch_resolver.py	# MR 20 explicitly closes the issue
+tests/test_branch_resolver.py	# Should select MR 20 (explicitly closes) despite MR 10 being more recent
+tests/test_branch_resolver.py	# closes_issues for MR 20 - it closes the issue
+tests/test_branch_resolver.py	# closes_issues for MR 10 - does not close
+tests/test_branch_resolver.py	"note": "Please switch to !10 for this work",
+tests/test_branch_resolver.py	# Note mention of !10 should override the closing MR 20
+tests/test_context_builder.py	"url": "https://gitlab.example.com/group/project/-/merge_requests/42",
+tests/test_image_audit.py	assert "HOST #1: <host#1>.txt" in captured.err
+tests/test_image_audit.py	assert "HOST #1: leak.txt" in captured.err
+tests/test_review_prompts.py	"web_url": "https://example.test/group/project/-/issues/42",

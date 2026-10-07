@@ -1,0 +1,14 @@
+Credits required by the licenses of components compiled into glab
+
+glab compiles in Freetype-Go, github.com/golang/freetype v0.0.0-20170609003504-e2365dfdc4a0.
+It is licensed under your choice of the FreeType License or the GNU General
+Public License, version 2 or later. This distribution takes the FreeType
+License, whose condition for redistribution in binary form this file meets:
+
+    This software is based in part on the work of the FreeType Team.
+
+    Portions of this software are copyright (c) 1996-2010 The FreeType
+    Project (www.freetype.org). All rights reserved.
+
+The FreeType License text is in
+third-party/golang/github.com/golang/freetype@v0.0.0-20170609003504-e2365dfdc4a0/licenses/ftl.txt.

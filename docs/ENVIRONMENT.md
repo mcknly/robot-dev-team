@@ -160,6 +160,8 @@ Run the config half by hand at any time --
 python -m app.preflight     # prints the install set; exits 1 on bad config
 ```
 
+Those installs need network egress on **every** container start, to the vendor hosts listed in the [boot-time egress table](DEPENDENCY_MANAGEMENT.md#boot-time-egress). If the host reaches the internet through a forward proxy, set `HTTPS_PROXY` in `.env`; the in-repo installers' `curl` calls honour it (the vendor binaries' own fetches are unverified). The same variables reach every agent dispatch, so also set `NO_PROXY` to include your `GLAB_HOST` and `host.docker.internal`, or `glab` and `git` traffic to a private GitLab is sent through the proxy. A TLS-intercepting proxy is not supported: the image trusts only the Debian `ca-certificates` bundle.
+
 ### Host Integration
 
 **LLM Provider Authentication**

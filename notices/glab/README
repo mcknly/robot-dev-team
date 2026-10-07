@@ -1,0 +1,14 @@
+License notices for glab, the GitLab CLI, as installed in this image
+
+glab is installed from GitLab's release .deb, which carries no license text.
+This directory supplies the notices that package omits:
+
+  copyright     glab's own license: LICENSE of gitlab.com/gitlab-org/cli v1.111.0
+  CREDITS       credits a compiled-in component's license requires
+  third-party/  the license and notice files of every Go module compiled into
+                /usr/bin/glab, and of the Go standard library, one directory
+                per module: golang/<module>@<version>/
+  notices.json  the files that cover each component, where each was taken
+                from, and its SHA-256
+
+Every file other than this README and CREDITS is the unmodified upstream file.

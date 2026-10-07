@@ -11,7 +11,7 @@ FROM ${PYTHON_IMAGE}
 ARG PIP_VERSION=26.2
 ARG UV_VERSION=0.12.1
 ARG GLAB_VERSION=1.111.0
-ARG DEBIAN_SNAPSHOT=20260915T194013Z
+ARG DEBIAN_SNAPSHOT=20261006T081244Z
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -28,7 +28,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # Required-priority package and is already present, so apt reports 0 newly installed -- naming it
 # is what binds it to the snapshot and stops a base-image change from silently dropping setpriv.
 # It replaced `gosu`, whose bookworm build is statically linked against an EOL Go 1.19.8
-# toolchain that no snapshot bump could move, because Debian would not rebuild it (see #58).
+# toolchain that no snapshot bump could move, because Debian would not rebuild it.
 # Trixie does ship a gosu rebuilt on a current toolchain, but setpriv stays: it carries no Go
 # runtime and therefore no Go-stdlib CVE surface at all, which is the stronger property and
 # the one that does not decay as the new toolchain ages. `scripts/ci-smoke-image.sh` asserts
@@ -77,7 +77,12 @@ RUN set -eux; \
     rm -f /tmp/apt-sources.txt; \
     rm -rf /var/lib/apt/lists/*
 
-# Install GitLab CLI (glab)
+# Install GitLab CLI (glab). `-f` makes an HTTP error fail on the curl line with its status
+# instead of saving the error page; `--retry-all-errors` also retries a truncated body.
+# Keep `-o`: curl discards a partial body before a retry only from a file it opened itself,
+# and cannot rewind a pipe or `>` redirect, so a retry there appends a second copy. The speed
+# guard turns a stalled transfer into a retryable timeout. `sha256sum -c` stays the install
+# gate. The checksum list is fetched first so a bad response fails in seconds.
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
     case "${arch}" in \
@@ -88,13 +93,31 @@ RUN set -eux; \
       *) echo "unsupported architecture: ${arch}" >&2; exit 1 ;; \
     esac; \
     glab_deb="glab_${GLAB_VERSION}_${glab_selector}.deb"; \
-    glab_url="https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/${glab_deb}"; \
-    curl -sSL "${glab_url}" -o "/tmp/${glab_deb}"; \
-    curl -sSL "https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/checksums.txt" -o /tmp/glab_checksums.txt; \
-    (cd /tmp && grep " ${glab_deb}$" glab_checksums.txt > glab.sha256); \
+    glab_base="https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads"; \
+    curl -fsSL --retry 3 --retry-all-errors --retry-connrefused \
+      --retry-max-time 300 \
+      --connect-timeout 30 --speed-limit 1024 --speed-time 60 \
+      "${glab_base}/checksums.txt" -o /tmp/glab_checksums.txt; \
+    curl -fsSL --retry 3 --retry-all-errors --retry-connrefused \
+      --retry-max-time 300 \
+      --connect-timeout 30 --speed-limit 1024 --speed-time 60 \
+      "${glab_base}/${glab_deb}" -o "/tmp/${glab_deb}"; \
+    (cd /tmp && grep " ${glab_deb}$" glab_checksums.txt > glab.sha256) || { \
+      echo "no checksum for ${glab_deb} in glab v${GLAB_VERSION} checksums.txt; has the release asset naming changed?" >&2; \
+      exit 1; \
+    }; \
     (cd /tmp && sha256sum -c glab.sha256); \
     dpkg -i "/tmp/${glab_deb}"; \
     rm "/tmp/${glab_deb}" /tmp/glab_checksums.txt /tmp/glab.sha256
+
+# License notices for glab and for uv (installed below), neither of whose packages ships the
+# notices of the Go modules and crates compiled into it. `notices/` is the upstream files
+# for the pinned versions, collected by `scripts/third_party_notices.py` and committed, so the
+# build fetches nothing. glab's own license becomes /usr/share/doc/glab/copyright, the file its
+# .deb omits. `scripts/ci-build-image.sh` checks the installed copy against the image's SBOM, as
+# the app user, before anything is pushed.
+COPY notices/glab/ /usr/share/doc/glab/
+COPY notices/uv/ /usr/share/doc/uv/
 
 WORKDIR /work
 
@@ -112,7 +135,7 @@ COPY app/ /work/app/
 
 RUN pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}" && \
     pip install --no-cache-dir "uv==${UV_VERSION}" && \
-    uv sync --frozen --no-dev --no-install-project
+    uv sync --frozen --no-dev --no-install-project --no-cache
 
 COPY prompts/ /work/prompts/
 COPY config/ /work/config/
@@ -123,6 +146,17 @@ ENV HOME=/home/appuser \
     PATH="/opt/venv/bin:/home/appuser/.local/bin:${PATH}"
 
 RUN useradd -u 10001 -ms /bin/bash appuser && chown -R appuser:appuser /work /home/appuser
+
+# The public source repository and the Debian snapshot the APT sources above used, readable from
+# the pulled image with `docker inspect` as part of the corresponding-source pointer
+# (docs/LICENSE_REVIEW.md). The snapshot values come from the same ARG, so they cannot disagree.
+# Both archive roots are named because the timestamp alone does not say which one a security
+# update came from. Packages inherited from the base image can be newer than the snapshot, which
+# is why the labels are a record of the sources, not of every package. Never put the canonical
+# GitLab host in a label: the image is public. `tests/test_runtime_install_contract.py` pins this.
+LABEL org.opencontainers.image.source="https://github.com/mcknly/robot-dev-team" \
+      com.mcknly.robot-dev-team.debian-snapshot="${DEBIAN_SNAPSHOT}" \
+      com.mcknly.robot-dev-team.debian-source="http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/"
 
 EXPOSE 8080
 

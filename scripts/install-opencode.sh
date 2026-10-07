@@ -28,7 +28,7 @@ echo "[install-opencode] Installing OpenCode CLI (native binary)..."
 # means container rebuilds don't drift from a stock `curl | bash` install.
 # No npm fallback: the image intentionally ships without Node.js, so we
 # avoid reintroducing that dependency.
-if ! curl -fsSL "https://opencode.ai/install" | bash; then
+if ! curl -fsSL --connect-timeout 30 "https://opencode.ai/install" | bash; then
   echo "[install-opencode] WARN: failed to install OpenCode CLI; continuing without it" >&2
   exit 0
 fi

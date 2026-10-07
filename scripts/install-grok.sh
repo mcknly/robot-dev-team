@@ -67,7 +67,7 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 # download rather than an obvious problem with the version endpoint.
 downloaded=""
 for base in "$BASE_URL_PRIMARY" "$BASE_URL_FALLBACK"; do
-  version="$(curl -fsSL "${base}/${CHANNEL}" 2>/dev/null | tr -d '[:space:]')" || {
+  version="$(curl -fsSL --connect-timeout 30 "${base}/${CHANNEL}" 2>/dev/null | tr -d '[:space:]')" || {
     echo "[install-grok] ${base}/${CHANNEL} unreachable; trying next source" >&2
     continue
   }
@@ -76,7 +76,7 @@ for base in "$BASE_URL_PRIMARY" "$BASE_URL_FALLBACK"; do
     continue
   fi
   echo "[install-grok] Installing Grok Build CLI ${version} (native binary, linux-${ARCH})..."
-  if curl -fsSL "${base}/grok-${version}-linux-${ARCH}" -o "${TMP_DIR}/grok"; then
+  if curl -fsSL --connect-timeout 30 "${base}/grok-${version}-linux-${ARCH}" -o "${TMP_DIR}/grok"; then
     downloaded="yes"
     break
   fi

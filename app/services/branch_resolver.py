@@ -119,7 +119,7 @@ async def _backup_dirty_working_tree(
     Returns ``(backups, error_result)``. A non-None ``error_result`` means the
     backup failed and checkout must not proceed. submodule_only trees are
     intentionally skipped (capturing a gitlink rollback as a backup is
-    misleading -- see issue #15).
+    misleading).
     """
     if dirty_state == "submodule_only":
         sub_status = await _submodule_status(working_dir)
@@ -205,7 +205,7 @@ async def resolve_branch(
 
     # Classify working-tree state. Submodule-only dirty paths must NOT
     # trigger auto-backup: capturing a gitlink rollback as a "backup" is
-    # actively misleading (see issue #15).
+    # actively misleading.
     dirty_state = await _classify_dirty_state(working_dir)
     dirty_backups, backup_error = await _backup_dirty_working_tree(
         working_dir, current_branch, dirty_state, agent,

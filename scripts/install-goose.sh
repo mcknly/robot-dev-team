@@ -51,7 +51,7 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 # compression either way.
 downloaded=""
 for ext in tar.gz tar.bz2; do
-  if curl -fsSL "${BASE_URL}/goose-${TARGET}.${ext}" -o "${TMP_DIR}/goose.${ext}"; then
+  if curl -fsSL --connect-timeout 30 "${BASE_URL}/goose-${TARGET}.${ext}" -o "${TMP_DIR}/goose.${ext}"; then
     downloaded="${TMP_DIR}/goose.${ext}"
     break
   fi

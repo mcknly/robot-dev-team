@@ -54,6 +54,15 @@ docker buildx build \
 sh scripts/ci-smoke-image.sh "$image_ref"
 sh scripts/generate-sbom.sh "$image_ref" artifacts/sbom.spdx.json
 
+# Every Go module and crate the SBOM finds in glab, uv and uvx has its license notice installed,
+# unaltered and readable by the user the app runs as. Checked inside the built image rather
+# than against the source tree, so a dropped COPY or a wrong destination fails here, before the
+# immutable SHA tag exists. The SBOM goes in on stdin: a bind mount would name a path on the
+# Docker daemon's host, not in this job.
+echo "[ci-image] Checking the third-party license notices installed in ${image_ref}..."
+docker run --rm -i --network none --user appuser --entrypoint python3 "$image_ref" \
+  -m scripts.third_party_notices check-image --sbom - < artifacts/sbom.spdx.json
+
 printf 'IMAGE_PUBLISHED=false\n' > artifacts/image.env
 printf 'IMAGE_SHA_TAG=%s\n' "$image_ref" >> artifacts/image.env
 printf 'Not published: merge-request build %s passed smoke testing.\n' \

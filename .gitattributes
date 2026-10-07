@@ -1,1 +1,4 @@
 uv.lock linguist-generated=true
+# Upstream license notices, installed verbatim. notices.json records each file's SHA-256, so
+# no line-ending conversion may touch them on checkout.
+notices/** -text

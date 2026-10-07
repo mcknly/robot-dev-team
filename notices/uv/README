@@ -1,0 +1,15 @@
+License notices for uv and uvx, as installed in this image
+
+uv is installed from its PyPI wheel, whose dist-info carries uv's own license
+but not those of the crates compiled into it. This directory supplies them:
+
+  third-party/  the license and notice files of every crate compiled into
+                /usr/local/bin/uv and /usr/local/bin/uvx, one directory per
+                crate: cargo/<crate>@<version>/. rust/std@<version>/ holds the
+                Rust standard library's, including the crates it vendors.
+                Workspace crates that inherit uv's license list uv's own
+                files, in cargo/uv@0.12.1/.
+  notices.json  the files that cover each component, where each was taken
+                from, and its SHA-256
+
+Every file other than this README is the unmodified upstream file.

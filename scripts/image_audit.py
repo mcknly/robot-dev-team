@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Robot Dev Team Project
 File: scripts/image_audit.py
-Description: Extract a release image's raw layers and scan them for canonical hostnames (#51).
+Description: Extract a release image's raw layers and scan them for canonical hostnames.
 License: MIT
 SPDX-License-Identifier: MIT
 Copyright (c) 2025 MCKNLY LLC
@@ -10,6 +10,7 @@ Copyright (c) 2025 MCKNLY LLC
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import re
 import subprocess
@@ -154,23 +155,66 @@ def extract_image(binary: Path, image: str, destination: Path) -> list[LayerReco
 # --- Hostname scan ----------------------------------------------------------------------------
 
 
+# ASCII DNS-style labels, none empty and none starting or ending with a hyphen. An allowlist, not
+# a denylist: a typo such as `host;x` or `host.` would otherwise pass through as a literal that no
+# bare occurrence of the host contains.
+HOST_NAME = re.compile(r"[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?(?:\.[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?)*")
+
+
+def ipv6_host(text: str) -> str:
+    """The compressed form of an IPv6 address, refusing anything that is not a plain one.
+
+    A zone id is kept in the compressed form, and an IPv4-mapped address compresses differently on
+    Python 3.12 than on 3.13+, so neither is a stable literal to search for. A dotted form such as
+    NAT64's `64:ff9b::1.2.3.4` compresses to hex nobody writes, and `::` would match nearly any
+    binary, so both are refused too.
+    """
+    if "." in text:
+        raise ImageAuditError("an IPv6 host must be written in hex, without an embedded IPv4 address")
+    try:
+        address = ipaddress.IPv6Address(text)
+    except ValueError:
+        # ipaddress quotes its input; the host stays out of the message, as everywhere else here.
+        raise ImageAuditError("a bracketed or multi-colon host must be an IPv6 address") from None
+    if address.scope_id is not None or address.ipv4_mapped is not None or address.is_unspecified:
+        raise ImageAuditError("an IPv6 host must not carry a zone id, be IPv4-mapped, or be '::'")
+    return address.compressed
+
+
 def normalize_host(value: str) -> str:
     """A bare, lowercase host, from a value that may carry a port or IPv6 brackets.
 
     Anything else is refused rather than passed through: a scheme or path means the caller passed a
-    URL, and an empty port a typo, and searching for either literal would miss every bare
-    occurrence of the host.
+    URL, user info or whitespace a pasted value, and an empty port a typo, and searching for any of
+    those literals would miss every bare occurrence of the host. An IPv6 address is searched in its
+    compressed (RFC 5952) spelling only, so a file writing it out in full is not matched; the
+    canonical hosts are names, so one spelling is enough.
     """
-    host = value.strip().lower()
-    if not host:
+    if not value.strip():
         raise ImageAuditError("at least one non-empty host is required")
+    # Checked on the value as given: trimming it first would accept " host" and "host\u00a0".
+    if any(character.isspace() for character in value):
+        raise ImageAuditError("a host must not contain whitespace")
+    # Before lowercasing: str.lower() folds some non-ASCII letters into ASCII (KELVIN SIGN to "k").
+    if not value.isascii():
+        raise ImageAuditError("a host must be ASCII")
+    host = value.lower()
     if "://" in host or "/" in host:
         raise ImageAuditError("a host must be bare: no scheme and no path")
-    port_form = re.fullmatch(r"\[([^\]]+)\](?::(\d+))?|([^:\[\]]+)(?::(\d+))?", host)
-    if port_form:
-        return port_form.group(1) or port_form.group(3)
-    if host.count(":") > 1 and not host.endswith(":") and "[" not in host and "]" not in host:
-        return host  # a bare IPv6 address: its colons are not a port separator
+    if "@" in host:
+        raise ImageAuditError("a host must be bare: no user info")
+    bracketed = re.fullmatch(r"\[([^\]]+)\](?::\d+)?", host)
+    if bracketed:
+        return ipv6_host(bracketed.group(1))
+    named = re.fullmatch(r"([^:\[\]]+)(?::\d+)?", host)
+    if named:
+        if not HOST_NAME.fullmatch(named.group(1)):
+            raise ImageAuditError(
+                "a host name may hold only letters, digits, '-', '_' and '.', in non-empty labels"
+            )
+        return named.group(1)
+    if host.count(":") > 1 and "[" not in host and "]" not in host:
+        return ipv6_host(host)  # a bare IPv6 address: its colons are not a port separator
     raise ImageAuditError("a host must be bare: a name, optionally with a numeric port")
 
 
@@ -268,6 +312,59 @@ LAYER_DIR = re.compile(r"^(?:\./)?layer-\d+/")
 # hash each release. detect-secrets records the pattern in `filters_used`, which the profile binds.
 SECRETS_EXCLUDE = r"^(image-manifest|image-config|layers)\.json$"
 REGEX_EXCLUDE_FILE = "detect_secrets.filters.regex.should_exclude_file"
+REGEX_FILTER_PREFIX = "detect_secrets.filters.regex."
+EXCLUDE_FILTER: dict[str, Any] = {"path": REGEX_EXCLUDE_FILE, "pattern": [SECRETS_EXCLUDE]}
+
+# What `detect-secrets scan` with no plugin or filter options records under this version. Every
+# later release is held to a baseline's profile, so `baseline` accepts only these: a dropped or
+# retuned plugin, or any filter beyond the defaults and the metadata exclusion, suppresses hits
+# forever. Extending either list is a reviewed change made with the version pin (docs/RELEASING.md).
+DETECT_SECRETS_VERSION = "1.5.0"
+# Whole records, parameters included: `--only-verified` keeps the verification filter's path but
+# raises its `min_level`. Two more defaults, `common.is_invalid_file` and
+# `heuristic.is_non_text_file`, always run and are never serialized, so they are not listed.
+DEFAULT_FILTERS: tuple[dict[str, Any], ...] = (
+    {"min_level": 2, "path": "detect_secrets.filters.common.is_ignored_due_to_verification_policies"},
+    {"path": "detect_secrets.filters.allowlist.is_line_allowlisted"},
+    {"path": "detect_secrets.filters.heuristic.is_indirect_reference"},
+    {"path": "detect_secrets.filters.heuristic.is_likely_id_string"},
+    {"path": "detect_secrets.filters.heuristic.is_lock_file"},
+    {"path": "detect_secrets.filters.heuristic.is_not_alphanumeric_string"},
+    {"path": "detect_secrets.filters.heuristic.is_potential_uuid"},
+    {"path": "detect_secrets.filters.heuristic.is_prefixed_with_dollar_sign"},
+    {"path": "detect_secrets.filters.heuristic.is_sequential_string"},
+    {"path": "detect_secrets.filters.heuristic.is_swagger_file"},
+    {"path": "detect_secrets.filters.heuristic.is_templated_secret"},
+)
+PLUGINS: tuple[dict[str, Any], ...] = (
+    {"keyword_exclude": "", "name": "KeywordDetector"},
+    {"limit": 3.0, "name": "HexHighEntropyString"},
+    {"limit": 4.5, "name": "Base64HighEntropyString"},
+    {"name": "AWSKeyDetector"},
+    {"name": "ArtifactoryDetector"},
+    {"name": "AzureStorageKeyDetector"},
+    {"name": "BasicAuthDetector"},
+    {"name": "CloudantDetector"},
+    {"name": "DiscordBotTokenDetector"},
+    {"name": "GitHubTokenDetector"},
+    {"name": "GitLabTokenDetector"},
+    {"name": "IPPublicDetector"},
+    {"name": "IbmCloudIamDetector"},
+    {"name": "IbmCosHmacDetector"},
+    {"name": "JwtTokenDetector"},
+    {"name": "MailchimpDetector"},
+    {"name": "NpmDetector"},
+    {"name": "OpenAIDetector"},
+    {"name": "PrivateKeyDetector"},
+    {"name": "PypiTokenDetector"},
+    {"name": "SendGridDetector"},
+    {"name": "SlackDetector"},
+    {"name": "SoftlayerDetector"},
+    {"name": "SquareOAuthDetector"},
+    {"name": "StripeDetector"},
+    {"name": "TelegramBotTokenDetector"},
+    {"name": "TwilioKeyDetector"},
+)
 
 
 def secret_keys(scan: dict[str, Any]) -> set[tuple[str, str, str]]:
@@ -305,9 +402,64 @@ def scanner_profile(scan: dict[str, Any]) -> dict[str, Any]:
         raise ImageAuditError("the scan records no scanner version, plugin list, or filter list")
 
     def canonical(items: list[Any]) -> list[Any]:
-        return sorted(items, key=lambda item: json.dumps(item, sort_keys=True))
+        return sorted(items, key=record_key)
 
     return {"version": version, "plugins_used": canonical(plugins), "filters_used": canonical(filters)}
+
+
+def record_key(item: Any) -> str:
+    """A profile record as canonical JSON, so records compare exactly: `3` is not `3.0` here."""
+    return json.dumps(item, sort_keys=True)
+
+
+def check_baseline_profile(scan: dict[str, Any]) -> None:
+    """Refuse to record a scanner profile that would hold every later release to fewer hits.
+
+    The version and plugins must be exactly the pinned ones. Each filter must be a pinned default,
+    parameters included, or the one metadata exclusion; dropping a default only adds hits, so that
+    is allowed. Errors name a record by its position and print a filter path only when it is a
+    pinned one: a custom filter's `file://` path, a word list's file name, or an
+    `--exclude-secrets` pattern is caller-controlled text that could hold an endpoint or a secret.
+    """
+    profile = scanner_profile(scan)
+    if profile["version"] != DETECT_SECRETS_VERSION:
+        raise ImageAuditError(
+            f"a baseline must come from detect-secrets {DETECT_SECRETS_VERSION}; a new version's "
+            "defaults are pinned in a reviewed change with the version (docs/RELEASING.md)"
+        )
+    used = [record_key(item) for item in profile["plugins_used"]]
+    if used != sorted(record_key(item) for item in PLUGINS):
+        missing = [str(item["name"]) for item in PLUGINS if record_key(item) not in used]
+        others = len(used) - (len(PLUGINS) - len(missing))
+        raise ImageAuditError(
+            "a baseline must come from a scan with detect-secrets' default plugins, unchanged "
+            f"(missing or retuned: {', '.join(missing) or 'none'}; unexpected records: {others})"
+        )
+    filters: list[Any] = scan["filters_used"]
+    regex = [record_key(item) for item in filters
+             if isinstance(item, dict) and str(item.get("path", "")).startswith(REGEX_FILTER_PREFIX)]
+    if regex != [record_key(EXCLUDE_FILTER)]:
+        raise ImageAuditError(
+            f"a baseline must come from a scan run with --exclude-files '{SECRETS_EXCLUDE}' and no "
+            "other regex filter: no --exclude-lines, --exclude-secrets, or other file pattern"
+        )
+    defaults = {record_key(item) for item in DEFAULT_FILTERS}
+    default_paths = {str(item["path"]) for item in DEFAULT_FILTERS}
+    for index, item in enumerate(filters):
+        if not isinstance(item, dict):
+            raise ImageAuditError(f"filters_used[{index}] is not a filter record")
+        path = item.get("path")
+        if record_key(item) in defaults or record_key(item) in regex:
+            continue
+        if isinstance(path, str) and path in default_paths:
+            raise ImageAuditError(
+                f"filters_used[{index}] ({path}) is a default filter with changed parameters, "
+                "such as --only-verified produces"
+            )
+        raise ImageAuditError(
+            f"filters_used[{index}] is not a detect-secrets {DETECT_SECRETS_VERSION} default "
+            "filter; a baseline allows no custom filter or word list"
+        )
 
 
 def write_baseline(scan: dict[str, Any], *, digest: str, output: Path) -> int:
@@ -317,17 +469,8 @@ def write_baseline(scan: dict[str, Any], *, digest: str, output: Path) -> int:
     ]
     if not entries:
         raise ImageAuditError("an empty scan cannot be a baseline")
+    check_baseline_profile(scan)
     profile = scanner_profile(scan)
-    # The one regex filter allowed: every later release is held to this profile, so an
-    # `--exclude-lines`, `--exclude-secrets`, or extra file pattern here would suppress hits forever.
-    regex_filters = [item for item in profile["filters_used"]
-                     if not isinstance(item, dict)
-                     or str(item.get("path", "")).startswith("detect_secrets.filters.regex.")]
-    if regex_filters != [{"path": REGEX_EXCLUDE_FILE, "pattern": [SECRETS_EXCLUDE]}]:
-        raise ImageAuditError(
-            f"a baseline must come from a scan run with --exclude-files '{SECRETS_EXCLUDE}' "
-            "and nothing else excluded"
-        )
     document = {
         "schema_version": BASELINE_SCHEMA,
         "description": (

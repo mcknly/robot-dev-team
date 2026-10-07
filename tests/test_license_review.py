@@ -1,6 +1,6 @@
 """Robot Dev Team Project
 File: tests/test_license_review.py
-Description: Regression tests for the release-SBOM license classification (#82).
+Description: Regression tests for the release-SBOM license classification.
 License: MIT
 SPDX-License-Identifier: MIT
 Copyright (c) 2025 MCKNLY LLC

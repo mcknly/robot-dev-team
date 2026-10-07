@@ -20,7 +20,7 @@
 #   - readonly: Agent runs in read-only project mount (default). The agent
 #               receives filesystem errors if it attempts to write files.
 #   - readwrite: Agent runs in read-write project mount. Use for routes
-#                that need to modify code (issue #28).
+#                that need to modify code.
 #
 # Timeout overrides (optional per-route, falls back to global env vars):
 #   max_wall_clock_seconds: Hard upper-bound run duration (default: 7200)

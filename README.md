@@ -95,6 +95,9 @@ This project has been heavily documented to make it agent-friendly. Clone it, po
 Create GitLab user accounts for each agent you plan to use (`claude`, `gemini`, `codex`, etc.), generate a Personal Access Token (PAT) with `api` scope for each, and invite the agent accounts to your target project(s) with **Developer** role (Project > Members > Invite member).
 For multi-project setups, add agents at the **Group** level so access is inherited automatically -- see `docs/GROUP_SETUP.md`. Agents cannot interact with projects they are not members of, even if webhooks are configured correctly.
 
+- **Platform:** the published image is `linux/amd64` only; on Apple Silicon, Docker Desktop runs it under emulation, and a local `--build` produces a native arm64 image that CI neither builds nor tests ([details](docs/SYSTEM_DESIGN.md#dockerfile)).
+- **Network:** a new container downloads the agent CLIs its routes use from their vendors at startup; see [Boot-time egress](docs/DEPENDENCY_MANAGEMENT.md#boot-time-egress) for the observed hosts and caveats. The host CLIs from step 1 only seed credentials; the container installs and runs its own.
+
 ### Linux (read this first as it applies to other platforms as well)
 1. Install the agent CLIs using each vendor's native installer (no Node.js / npm required, except the optional Pi harness -- see its note below):
    ```bash
@@ -132,6 +135,10 @@ For multi-project setups, add agents at the **Group** level so access is inherit
    ```bash
    git clone https://github.com/mcknly/robot-dev-team.git
    cd robot-dev-team
+   ```
+   **Only to run the published image** (step 8): check out the git tag `vX.Y.Z` for the image tag `X.Y.Z` you will pull. Do it now, before step 5 edits the tracked `docker-compose.yml`:
+   ```bash
+   git checkout vX.Y.Z
    ```
 4. Copy `.env.example` to `.env` and populate the required values:
    ```bash
@@ -171,10 +178,24 @@ For multi-project setups, add agents at the **Group** level so access is inherit
    newgrp docker    # or log out/in
    docker info      # verify access works without sudo
    ```
-8. Start the containerized stack:
+8. Start the containerized stack from source:
    ```bash
    docker compose up --build
    ```
+   **Or run the published image** -- only for a release whose `public-release-receipt.json` on its GitHub Release lists a `docker.io/mcknly/robot-dev-team` reference in `image.public_references` ([verifying what you pulled](docs/MIRRORING.md#verifying-what-you-pulled)). From the `vX.Y.Z` checkout, create `docker-compose.override.yml` with the bare `X.Y.Z` image tag; `!reset` (Compose 2.24.4+) drops the committed `build:`:
+   ```yaml
+   services:
+     app:
+       image: docker.io/mcknly/robot-dev-team:X.Y.Z
+       platform: linux/amd64
+       build: !reset null
+   ```
+   ```bash
+   docker compose config --images    # must print docker.io/mcknly/robot-dev-team:X.Y.Z
+   docker compose pull app
+   docker compose up --no-build
+   ```
+   Stop if `config --images` prints anything else: `--no-build` would run an image left by an earlier source build. While the override exists, `docker compose up --build` runs the published image too, so delete or rename the override to build from source again.
 9. Configure the GitLab webhook to point at `http://localhost:8080/webhooks/gitlab` (or your tunnel URL) and send a test event. See [`docs/GITLAB_WEBHOOKS.md`](docs/GITLAB_WEBHOOKS.md) for detailed webhook configuration including event selection and secret token setup, or [`docs/GROUP_SETUP.md`](docs/GROUP_SETUP.md) for automated webhook provisioning via File Hooks. Set `LIVE_DASHBOARD_ENABLED=true` in `.env` to enable the live dashboard at `/dashboard`. Set `DEBUG_RELOAD_ROUTES=true`, configure a route in your routes file (e.g., `config/routes.local.yaml`), trigger the event, confirm a run log appears on the dashboard and in `run-logs/`.
 
 ### macOS (with Docker Desktop)
@@ -182,7 +203,7 @@ For multi-project setups, add agents at the **Group** level so access is inherit
 2. Authenticate each CLI so credentials live under `~/.claude`, `~/.gemini`, and `~/.codex` (as above).
 3. Install Docker Desktop for Mac and ensure it is running (`docker info` should succeed in a new terminal).
 4. Clone the repository, configure `.env`, and edit volume mount paths as in steps 3-6 of the Linux section.
-5. Launch the stack from the terminal:
+5. Launch the stack from the terminal (or run the published image as in step 8 of the Linux section):
    ```bash
    docker compose up --build
    ```
@@ -193,7 +214,7 @@ For multi-project setups, add agents at the **Group** level so access is inherit
 2. Inside the WSL shell, install the agent CLIs using each vendor's native installer (see the Linux section above).
 3. Authenticate each CLI as above.
 4. Install Git and clone the repository inside the WSL filesystem (e.g., `/home/<user>/robot-dev-team`). Configure `.env` and edit volume mount paths as in steps 3-6 of the Linux section.
-5. Make sure your WSL user belongs to the `docker` group (`sudo usermod -aG docker "$USER"` and `newgrp docker`), then start the stack:
+5. Make sure your WSL user belongs to the `docker` group (`sudo usermod -aG docker "$USER"` and `newgrp docker`), then start the stack (or run the published image as in step 8 of the Linux section):
    ```bash
    docker compose up --build
    ```
@@ -436,8 +457,9 @@ Verified against `uv.lock` on August 3, 2026.
 **Source publication note.** Public `main` and stable release artifacts on GitHub are a one-way
 publication of this project's canonical workflow, which runs on a private self-hosted GitLab
 instance. GitHub Issues and pull requests are public intake. The container image is published at
-[`docker.io/mcknly/robot-dev-team`](https://hub.docker.com/r/mcknly/robot-dev-team) from the first
-public release. Each GitHub Release carries a **publication receipt** binding the published image
+[`docker.io/mcknly/robot-dev-team`](https://hub.docker.com/r/mcknly/robot-dev-team) for every
+release whose receipt lists it; earlier releases are source-only. Each GitHub Release carries a
+**publication receipt** binding the published image
 digests to the source commit and tree they were built from. The SBOM and vulnerability evidence for
 that digest are **not published yet** -- they name the canonical instance by construction, so the
 receipt pins their SHA-256 instead; see the mirror policy for that gap. The checked-in

@@ -29,7 +29,7 @@ from app.services.branch_resolver import (
 class TestBoundaryNarrowing:
     """The isinstance-based boundary helpers narrow untyped webhook/API values.
 
-    Regression guard for issue #37: malformed source_branch/iid values must
+    Regression guard: malformed source_branch/iid values must
     surface as None (or be skipped) rather than leaking an untyped value.
     """
 
@@ -1994,7 +1994,7 @@ class TestSmartBranchSelectionIntegration:
     # routes each git/glab-API call to a canned response. Keeping that routing
     # inline next to the event payload and assertions is what makes this
     # end-to-end test legible; hoisting it to a module-level responder would
-    # fragment the scenario. Narrow, per-test suppression (see issue #37).
+    # fragment the scenario. Narrow, per-test suppression.
     async def test_end_to_end_note_mention_steers_branch(self, monkeypatch, tmp_path):  # noqa: C901
         """Full path: resolve_branch -> note event -> smart selection with note mention.
 
@@ -2289,7 +2289,7 @@ async def test_authenticate_git_normal_completes():
 class TestClassifyDirtyState:
     """Tests for _classify_dirty_state: distinguishes submodule-only vs real edits.
 
-    Background: issue #15. `git status --porcelain` alone treats a submodule
+    Background: `git status --porcelain` alone treats a submodule
     gitlink mismatch as a dirty path, which previously caused auto-backup to
     commit a misleading gitlink rollback. The classifier compares
     --ignore-submodules=none against --ignore-submodules=all so the caller can
@@ -2417,7 +2417,7 @@ class TestClassifyDirtyState:
 @pytest.mark.asyncio
 async def test_resolve_branch_submodule_only_skips_backup(monkeypatch, tmp_path):
     """resolve_branch: submodule-only dirty paths must skip _create_backup_branch
-    and continue to checkout (issue #15)."""
+    and continue to checkout."""
     monkeypatch.setattr(settings, "enable_branch_switch", True)
 
     async def mock_get_current_branch(working_dir):
@@ -2509,7 +2509,7 @@ async def test_resolve_branch_submodule_only_checkout_fail_continues(monkeypatch
 @pytest.mark.asyncio
 async def test_sync_current_branch_submodule_only_skips_backup(monkeypatch):
     """_sync_current_branch: submodule-only dirty paths skip uncommitted-changes
-    backup but still proceed with the reset/sync (issue #15)."""
+    backup but still proceed with the reset/sync."""
 
     async def mock_authenticate_git(agent):
         return True
@@ -2547,13 +2547,13 @@ async def test_sync_current_branch_submodule_only_skips_backup(monkeypatch):
 async def test_resolve_branch_e2e_submodule_only_via_porcelain(monkeypatch, tmp_path):  # noqa: C901
     # noqa rationale: the branching lives in the nested subprocess mock, which
     # feeds exact porcelain bytes per git invocation. Keeping that routing
-    # inline is what locks the parser against the issue #15 shape readably;
-    # hoisting it out would fragment the scenario. Narrow suppression (issue #37).
+    # inline is what locks the parser against the submodule-only shape readably;
+    # hoisting it out would fragment the scenario. Narrow suppression.
     """End-to-end through the real _classify_dirty_state: feed actual porcelain
     bytes for ` M hermes-src` and verify no backup is created.
 
     Locks down the parser against the exact submodule-only output shape that
-    triggered issue #15.
+    triggered the destructive backups.
     """
     monkeypatch.setattr(settings, "enable_branch_switch", True)
 

@@ -671,13 +671,13 @@ def test_route_registry_assignees_with_multiple(tmp_path):
 def test_default_routes_enforce_non_interactive_flags():
     """Verify that the shipped routes.yaml includes non-interactive flags for
     Claude and Gemini so agents exit after processing instead of waiting for
-    further input (see issue #61).
+    further input.
 
     The gemini agent is now backed by Google's Antigravity CLI (`agy`), which
-    replaced the deprecated `@google/gemini-cli` npm package (see issue #10).
+    replaced the deprecated `@google/gemini-cli` npm package.
     `--yolo` / `--skip-trust` from the old CLI are gone; Antigravity exposes
     `--dangerously-skip-permissions` (verbatim Claude name) for the same
-    purpose. Two `agy`-specific contracts are enforced here (see issue #19):
+    purpose. Two `agy`-specific contracts are enforced here:
     `--model` is accepted as of `agy` 1.1.1 and must be followed by the
     `${GEMINI_MODEL}` placeholder the loader substitutes; and `-p`/`--print`
     takes the prompt as its *value* -- `agy` never reads stdin -- so it must be
@@ -1382,7 +1382,7 @@ def test_route_registry_raises_on_empty_author_list_entry(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# action-as-list support (issue #31)
+# action-as-list support
 # ---------------------------------------------------------------------------
 
 
@@ -1628,7 +1628,7 @@ def test_route_registry_raises_on_empty_action_list_entry(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Shipped-config precedence: assign-on-issue-creation (issue #31)
+# Shipped-config precedence: assign-on-issue-creation
 # ---------------------------------------------------------------------------
 
 
@@ -1651,7 +1651,7 @@ def test_shipped_config_assign_issue_wins_on_create():
 
     Parser-only and mocked-resolver tests can both pass while a later YAML
     reorder silently restores triage precedence, so this loads the shipped file
-    and asserts on route order end-to-end (codex's review ask on issue #31).
+    and asserts on route order end-to-end.
     """
     registry = _shipped_registry()
 
@@ -1854,7 +1854,7 @@ def test_shipped_routes_yaml_uncomments_to_valid_opencode_config(tmp_path):
 
 
 def test_shipped_routes_yaml_does_not_expose_goose():
-    """Baseline guard: the shipped config must not wire goose (issue #13).
+    """Baseline guard: the shipped config must not wire goose.
 
     Goose is optional and disabled by default -- enabling it requires a host
     Goose config to bind-mount, so a shipped-enabled route would hard-fail the
@@ -1877,7 +1877,7 @@ def test_shipped_routes_yaml_uncomments_to_valid_goose_config(tmp_path):
     """Reversibility guard: stripping column-0 `#` restores Goose wiring.
 
     Also pins the two CLI contracts that are easy to get wrong, and that every
-    reviewer on issue #13 initially got wrong:
+    reviewer initially got wrong:
 
     1. Goose reads the prompt from stdin via `-i -`. `--text` takes a literal
        string, not `-`, so `--text -` would send Goose the prompt "-".
@@ -1989,7 +1989,7 @@ def test_shipped_routes_yaml_uncomments_to_valid_goose_config(tmp_path):
 
 
 def test_shipped_routes_yaml_does_not_expose_grok():
-    """Baseline guard: the shipped config must not wire grok (issue #18).
+    """Baseline guard: the shipped config must not wire grok.
 
     Grok Build is optional and disabled by default. Enabling it requires a Grok
     GitLab account and a host `grok login`, so a shipped-enabled route would
@@ -2142,7 +2142,7 @@ def test_shipped_routes_yaml_uncomments_to_valid_grok_config(tmp_path):
 
 
 def test_shipped_routes_yaml_does_not_expose_pi():
-    """Baseline guard: the shipped config must not wire pi (issue #32).
+    """Baseline guard: the shipped config must not wire pi.
 
     Pi is optional and disabled by default. Enabling it requires a host
     `~/.pi/agent` config to bind-mount and reintroduces a user-local Node

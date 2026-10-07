@@ -82,7 +82,7 @@ applies it by hand, on purpose.
 ## Canonical Contributions
 
 - **Plan first** — review the related GitLab issue and confirm open questions before writing code.
-- **Branch naming** — use `issue-<number>-<short-description>` (e.g., `issue-9-doc-refresh`).
+- **Branch naming** — use `issue-<number>-<short-description>`.
 - **Atomic commits** — group logically-related changes and follow the instructions in `AGENTS.md` for commit preparation.
 
 ## Change Expectations

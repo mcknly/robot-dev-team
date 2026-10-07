@@ -218,9 +218,9 @@ async def _resolve_work_items(
     work_items: List[TriggerWorkItem] = []
     ignored_triggers: List[Dict[str, Any]] = []
 
-    # Assign-on-issue-creation gate (issue #31): when the feature is disabled,
+    # Assign-on-issue-creation gate: when the feature is disabled,
     # skip assignment routes for Issue-open events so a create-with-assignee
-    # falls through to issue-triage (the pre-#31 behavior). Enabled by default,
+    # falls through to issue-triage (the behavior before the feature). Enabled by default,
     # in which case `gate` is None and resolution is unfiltered.
     assign_gate: Optional[Callable[[Any], bool]] = (
         _exclude_assignee_rules
@@ -281,7 +281,7 @@ async def _resolve_work_items(
             )
         )
 
-    # Issue #14: randomize the per-mention dispatch order, but only when the
+    # Randomize the per-mention dispatch order, but only when the
     # trigger originated from an @all/@agents expansion. Explicit lists like
     # "@claude @gemini @codex" stay deterministic so authors can pin order.
     # base_match above keeps the unshuffled list so its diagnostics are stable.
@@ -541,7 +541,7 @@ def _expand_all_mention(mentions: List[str], author: str = "") -> Tuple[List[str
     dispatch-order randomization (see ``RANDOMIZE_ALL_MENTIONS``).
 
     Expansion is suppressed when the comment author is itself a known agent
-    (issue #16): an agent writing @all must not fan out to the whole roster
+    so an agent writing @all does not fan out to the whole roster
     (including itself), which would create a self-trigger loop. The alias tokens
     are still stripped so they do not match anything downstream.
     """
@@ -571,7 +571,7 @@ def _expand_all_mention(mentions: List[str], author: str = "") -> Tuple[List[str
 
 
 def _filter_self_mention(author: str, mentions: List[str]) -> List[str]:
-    """Drop the author's own agent username from the mention list (issue #16).
+    """Drop the author's own agent username from the mention list.
 
     Prevents an agent from being dispatched against a comment it authored
     itself. Only applies when the author is a known agent; human authors are
@@ -653,7 +653,7 @@ def _deduplicate_usernames(candidates: List[str]) -> List[str]:
 # Line-level container markers used by ``_strip_line_containers``. These are
 # anchored at line start (allowing up to three leading spaces, per CommonMark)
 # so a ``>`` or a redirect ``>`` appearing mid-line is never mistaken for a
-# blockquote (issue #17). ``>>>`` on its own line toggles a GitLab-flavored
+# blockquote. ``>>>`` on its own line toggles a GitLab-flavored
 # multiline blockquote whose interior lines need not be prefixed with ``>``.
 _BLOCKQUOTE_RE = re.compile(r"^ {0,3}>")
 _MULTILINE_QUOTE_RE = re.compile(r"^ {0,3}>>>\s*$")
@@ -674,10 +674,10 @@ def _blank_fence(match: "re.Match[str]") -> str:
 
 def _strip_line_containers(text: str) -> str:
     """Blank out blockquoted and indented-code lines so literal @mentions
-    quoted or shown as code do not parse as live mentions (issue #17).
+    quoted or shown as code do not parse as live mentions.
 
     Conservative, over-strip-biased subset (see docs/ROUTES.md): under-stripping
-    a quoted ``@all`` re-fans it out to the whole roster (the #16 incident),
+    a quoted ``@all`` re-fans it out to the whole roster (an agent-to-agent loop),
     while over-stripping merely drops a recoverable live mention. When in doubt
     we strip. Covered:
 
@@ -736,7 +736,7 @@ def _strip_line_containers(text: str) -> str:
 def _strip_code_spans(text: str) -> str:
     """Remove fenced, blockquoted, indented, and inline code so literal
     @mentions discussed in code examples or quoted as terms (e.g. ``@all`` in
-    backticks) are not parsed as live mentions (issues #16, #17).
+    backticks) are not parsed as live mentions.
 
     Order matters: fenced blocks (``` and ~~~) are blanked first -- preserving
     line count -- so the line-level scan for blockquotes and indented code runs
@@ -753,7 +753,7 @@ def _strip_code_spans(text: str) -> str:
 
 # Mention boundary: refuse to treat ``@`` as a mention when the preceding
 # character is part of an email local-part, URL path, or hostname-like token
-# (issue #16 follow-up). This excludes ``support@all``, ``https://x/@all``,
+# (so an embedded ``@all`` cannot fan out). This excludes ``support@all``, ``https://x/@all``,
 # and similar embedded ``@`` sequences while still matching at start-of-string,
 # after whitespace, or after typical punctuation like ``(`` or ``,``.
 _MENTION_PATTERN = re.compile(r"(?<![A-Za-z0-9_./-])@([A-Za-z0-9_][A-Za-z0-9_.-]*)")
@@ -858,13 +858,13 @@ def _only_single_mention_rules(rule) -> bool:
 
 
 def _exclude_assignee_rules(rule) -> bool:
-    """Exclude assignee-matching routes (issue #31).
+    """Exclude assignee-matching routes.
 
     Used to gate assign-on-issue-creation: when
     ``ENABLE_ASSIGN_ON_ISSUE_CREATION`` is off, this predicate drops the
     read-write assignment routes from an ``Issue Hook``/``open`` resolution so a
-    create-with-assignee event falls through to ``issue-triage`` (the pre-#31
-    behavior). ``/assign`` on an existing issue (``action: update``) is
+    create-with-assignee event falls through to ``issue-triage`` (the behavior
+    before the feature). ``/assign`` on an existing issue (``action: update``) is
     unaffected because the gate is only applied to ``open`` events.
     """
     return not rule.assignees
@@ -1184,7 +1184,7 @@ def _create_work_item(
     async def _runner() -> List[Dict[str, Any]]:
         return await _run_dispatch(event_id, match.agents, ctx_with_access, assigned_agent)
 
-    # Determine mention-hold metadata for deduplication (issue #69)
+    # Determine mention-hold metadata for deduplication
     is_mention = event_name == "Note Hook" and bool(mentions)
     is_assignment = assigned_agent is not None
     item_project_path, item_iid, _ = _resolve_resource(ctx_with_access)

@@ -14,7 +14,7 @@ CODEX_ARCH=$(uname -m)
 CODEX_RELEASE_PAGE="https://github.com/openai/codex/releases/latest"
 CODEX_RELEASE_URL=""
 CODEX_RELEASE_TAG=""
-if CODEX_RELEASE_URL=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$CODEX_RELEASE_PAGE"); then
+if CODEX_RELEASE_URL=$(curl -fsSLI --connect-timeout 30 -o /dev/null -w '%{url_effective}' "$CODEX_RELEASE_PAGE"); then
   CODEX_RELEASE_TAG=${CODEX_RELEASE_URL##*/}
 fi
 
@@ -36,7 +36,7 @@ CODEX_CMH_READY=false
 echo "[install-codex] Installing Codex release ${CODEX_RELEASE_TAG}..."
 rm -rf /tmp/codex-install /tmp/codex-cmh-install
 mkdir -p /tmp/codex-install /tmp/codex-cmh-install
-if curl -fsSL "$CODEX_URL" | tar xz -C /tmp/codex-install; then
+if curl -fsSL --connect-timeout 30 "$CODEX_URL" | tar xz -C /tmp/codex-install; then
   # Tarball contains an arch-suffixed binary; normalize it in the staging dir.
   if mv /tmp/codex-install/codex-*-unknown-linux-musl "$CODEX_STAGED" 2>/dev/null \
     || mv /tmp/codex-install/codex "$CODEX_STAGED" 2>/dev/null; then
@@ -56,7 +56,7 @@ fi
 # GitLab comment. Install it alongside codex, into its own temp dir so the
 # arch-suffixed glob above cannot pick it up.
 echo "[install-codex] Installing Codex code-mode host..."
-if curl -fsSL "$CODEX_CMH_URL" | tar xz -C /tmp/codex-cmh-install; then
+if curl -fsSL --connect-timeout 30 "$CODEX_CMH_URL" | tar xz -C /tmp/codex-cmh-install; then
   if mv /tmp/codex-cmh-install/codex-code-mode-host-*-unknown-linux-musl "$CODEX_CMH_STAGED" 2>/dev/null \
     || mv /tmp/codex-cmh-install/codex-code-mode-host "$CODEX_CMH_STAGED" 2>/dev/null; then
     chmod +x "$CODEX_CMH_STAGED"

@@ -61,7 +61,7 @@ class MentionHoldBuffer:
         self.hold_seconds = hold_seconds
         # Pending mention items keyed by (project, iid, agent_lower)
         self._pending: Dict[MentionHoldKey, _HeldMention] = {}
-        # Recent assignment keys with auto-expiring timers (issue #75)
+        # Recent assignment keys with auto-expiring timers
         self._recent_assignments: Dict[MentionHoldKey, asyncio.TimerHandle] = {}
 
     def hold(
@@ -73,7 +73,7 @@ class MentionHoldBuffer:
         """Place a mention item in the hold buffer.
 
         If a recent assignment exists for this key, the mention is suppressed
-        immediately (issue #75).  If a matching key is already held, the new
+        immediately.  If a matching key is already held, the new
         item replaces it (the old timer is cancelled).
         """
         if self.has_recent_assignment(key):
@@ -167,8 +167,7 @@ class MentionHoldBuffer:
         """Cancel all held mentions that overlap with an assignment item's agents.
 
         Also records recent assignment keys so mentions arriving after the
-        assignment (within the hold window) are suppressed immediately
-        (issue #75).
+        assignment (within the hold window) are suppressed immediately.
 
         Returns the list of keys that were suppressed.
         """
@@ -237,7 +236,7 @@ class TriggerQueue:
     """FIFO queue with a background worker processing trigger items.
 
     Includes a MentionHoldBuffer that delays mention-triggered items briefly
-    to allow assignment triggers to suppress them (see issue #69).
+    to allow assignment triggers to suppress them.
     """
 
     def __init__(self, hold_seconds: float = 3.0) -> None:

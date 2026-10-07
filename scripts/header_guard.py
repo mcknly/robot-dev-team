@@ -36,9 +36,13 @@ DEFAULT_FILENAMES: Sequence[str] = (
     "gitlab-connect",
     "glab-usr",
 )
+# `notices/` holds upstream license files verbatim. Adding the project header to one --
+# many are LICENSE.md or NOTICE.md -- would alter the notice it exists to reproduce. The prefix
+# lives here rather than in config/header_guard.toml, which is not committed, so CI applies it.
 DEFAULT_EXCLUDED_PREFIXES: Sequence[str] = (
     ".git/",
     ".venv/",
+    "notices/",
     "run-logs/",
     "sbom/",
     "test-config/",

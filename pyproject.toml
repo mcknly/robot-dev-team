@@ -11,7 +11,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "robot-dev-team"
-version = "0.3.0"
+version = "0.4.0"
 description = "GitLab webhook listener and LLM agent router"
 authors = [{name = "Robot Dev Team"}]
 readme = "README.md"

@@ -1,5 +1,5 @@
 {
-  "description": "Licenses for release-SBOM components whose licenseDeclared is NOASSERTION, keyed by type/name@version. Fetched entries record their source URL; manual entries record where the evidence was read. Written by scripts/license_review.py (#82).",
+  "description": "Licenses for release-SBOM components whose licenseDeclared is NOASSERTION, keyed by type/name@version. Fetched entries record their source URL; manual entries record where the evidence was read. Written by scripts/license_review.py.",
   "entries": {
     "cargo/adler2@2.0.1": {
       "evidence": "image:/usr/local/lib/python3.14/site-packages/uv-0.12.1.dist-info/sboms/uv.cyclonedx.json (cargo-cyclonedx 0.5.9) sha256:c1bfa1b52032d056d4154f4f9f241c356010fe2652b8d748e72e580cfb4df435",

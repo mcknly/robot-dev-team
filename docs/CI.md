@@ -12,10 +12,10 @@ Copyright (c) 2025 MCKNLY LLC
 The pipeline validates every merge request. After a reviewed change is merged, the protected
 default-branch push validates again, builds and smoke-tests a `linux/amd64` image, and publishes a
 content-addressed image. It does not create a public release. An optional manual job can copy one
-qualified digest to a disposable Docker Hub tag to prove the protected credential path; stable
-public promotion remains disabled until #8. Protected stable Git tags promote the tested digest
-into private release aliases through the separate workflow documented in `docs/RELEASING.md`, and
-a manual job then projects the released tree onto the public GitHub repository (see
+qualified digest to a disposable Docker Hub tag to prove the protected credential path. Protected
+stable Git tags promote the tested digest into the private release aliases and copy the same digest
+to Docker Hub through the separate workflow documented in `docs/RELEASING.md`, and a manual job then
+projects the released tree onto the public GitHub repository (see
 [Public GitHub projection](#public-github-projection)).
 
 ## Pipeline flow
@@ -42,7 +42,7 @@ pytest tests
 ```
 
 That `git` is **not** installed from the `Dockerfile`'s `DEBIAN_SNAPSHOT`, and the scope of the
-snapshot-enforcement guarantee in `SECURITY.md` stops at the shipped image (#65). The image is
+snapshot-enforcement guarantee in `SECURITY.md` stops at the shipped image. The image is
 the only thing that carries a digest, an SBOM, and digest-keyed scan evidence for a
 reproducibility claim to bind to; `validate`, `compat_python_floor`, `release_contract`, and
 `github_release_publish` are the only four jobs that touch APT, and none of them contributes a
@@ -111,9 +111,20 @@ fails with its container logs instead of blocking the job indefinitely.
 
 After smoke testing, the job exports that completed local image and scans the archive with the
 digest-pinned Syft v1.42.2 container. Keeping Syft outside the runtime build ensures the generated
-SPDX document describes every final image layer without adding scanner files to the image. The job
-then refuses to publish if the full commit-SHA tag already exists, pushes the exact smoke-tested
-image, and records the registry manifest digest.
+SPDX document describes every final image layer without adding scanner files to the image.
+
+The job then checks the third-party license notices the image installs for `glab` and `uv`
+(`docs/DEPENDENCY_MANAGEMENT.md`). It runs `python3 -m scripts.third_party_notices check-image` in
+the built image as `appuser`, with `--network none` and the new SBOM on stdin. Every `cargo` and
+`golang` entry in the SBOM must have an installed notice. Every notice must hash to the value its
+`notices.json` records and be readable by the app user. The installed binaries' own build data
+must match the notices' toolchain and cover no module or crate the notices miss. Running it
+inside the image, rather than against the source tree, is what catches a dropped `COPY` or a wrong
+destination. A failure stops the job before the push, so no immutable SHA tag exists for an image
+without its notices.
+
+Last, the job refuses to publish if the full commit-SHA tag already exists, pushes the exact
+smoke-tested image, and records the registry manifest digest.
 
 `sbom_publish` follows on the same rule, consuming that job's `sbom.spdx.json` artifact and its
 `IMAGE_DIGEST` dotenv variable, and uploads the SBOM to the Generic Package Registry under
@@ -221,7 +232,8 @@ It does not appear in merge-request or tag pipelines, runs on the protected `rdt
 the `build_smoke_publish` artifacts and a successful `security_scan` from the same pipeline, so it
 cannot be played before the vulnerability gate passes for the digest. It declares
 `environment: dockerhub-publication` (`action: prepare`), the scope that delivers the Docker Hub
-variables to it and to no other job. The job is allowed to fail so an
+variables to it, `release_publish`, and `release_yank`, and to no other job. The job is allowed to
+fail so an
 unplayed or failed provisioning check cannot block ordinary `main` qualification; acceptance
 requires its individual result to be successful.
 
@@ -291,8 +303,8 @@ deliberate -- vulnerability knowledge is time-dependent, so a result that passed
 built is not a claim about the day it is released.
 
 **Blocking rule.** A High or Critical finding blocks when a fix is available. Unfixed and wont-fix
-High/Critical are recorded in the durable evaluation and do not block; tightening that is tracked
-with a date in #60. This is not `--only-fixed` on the scanner: the report keeps every match and
+High/Critical are recorded in the durable evaluation and do not block; tightening that is planned
+with a date. This is not `--only-fixed` on the scanner: the report keeps every match and
 only the blocking decision reads fix state, so the evidence survives the release that accepted it.
 Medium and below are visible and never block.
 
@@ -305,10 +317,13 @@ outage. The **yank** path deliberately keeps no such dependency: it installs Cra
 reads scan evidence.
 
 Exceptions live in `security/vulnerability-exceptions.yaml`, are scoped to an exact package,
-version, and type, and require an owner, a rationale, an expiry, and a tracking issue. Expired
-entries, entries matching no finding, entries naming a version that is no longer installed, and
-entries shadowed by an earlier one all fail the job -- the failure mode an exception file has to
-defend against is entries outliving the findings that justified them with nothing ever failing.
+version, and type, and require an owner, a rationale, an expiry, and a `tracking_issue`. That field
+holds a short topic slug such as `glab-go-toolchain`, never a private issue id: the file is in the
+published tree, so `test_no_tracked_file_cites_the_private_tracker` rejects one, and an upstream
+record belongs in the rationale as a full `https://gitlab.com/...` or GitHub URL. Expired entries,
+entries matching no finding, entries naming a version that is no longer installed, and entries
+shadowed by an earlier one all fail the job -- the failure mode an exception file has to defend
+against is entries outliving the findings that justified them with nothing ever failing.
 The summary warns for three weeks before an entry expires, so the first notice is not a red
 pipeline on every branch and tag at once.
 
@@ -369,16 +384,38 @@ an SPDX-2.3 document, then verifies the staged vulnerability evaluation for the 
 must bind to that digest from inside the document, come from the pinned scanner, record a passing
 database freshness check, and carry a passing verdict. The job never runs the scanner itself -- a
 Grype report embeds a scan timestamp, so a re-derived document would break the durable-file content
-check on an ordinary retry, with the aliases already moved. The job then publishes a durable
-release manifest, changelog, and the exact SBOM and scan bytes to the Generic Package Registry and
-creates the GitLab Release through the project Releases API with `CI_JOB_TOKEN`. Crane is the only
-binary `release_publish` and `release_yank` download; the release record needs no CLI and no `git`.
+check on an ordinary retry, with the aliases already moved.
+
+`release_publish` also promotes the release to Docker Hub. It declares
+`environment: dockerhub-publication` (`action: prepare`) and fails before any registry login if
+`DOCKERHUB_USERNAME` or `DOCKERHUB_TOKEN` is missing. In the same pre-mutation window it resolves
+`docker.io/mcknly/robot-dev-team:X.Y.Z` and fails closed if that tag names any other digest. After
+the private aliases move, it copies `$CI_REGISTRY_IMAGE@<digest>` to the same `X.Y.Z` and eligible
+moving aliases on Docker Hub with `crane copy`, never a rebuild, and resolves each public tag back
+to the release digest. A tag that already names the digest is never pushed again.
+
+The job then publishes a durable release manifest, changelog, and the exact SBOM and scan bytes to
+the Generic Package Registry and creates the GitLab Release through the project Releases API with
+`CI_JOB_TOKEN`. The manifest records the verified Docker Hub tags in `public_aliases` and the
+version tag with its digest in `public_references`, which `github_release_publish` copies into the
+public receipt. Crane is the only binary `release_publish` and `release_yank` download; the
+release record needs no CLI and no `git`.
 
 The release resource group prevents concurrent alias updates. Existing identical state is an
 idempotent retry; an immutable alias or durable package conflict fails closed. An annotated
-protected `vX.Y.Z-yank` tag authorizes `release_yank`, which records a withdrawal and recomputes
-each affected moving alias from compatible non-yanked releases. Full operator and recovery
-instructions are in `docs/RELEASING.md`.
+protected `vX.Y.Z-yank` tag authorizes `release_yank`, which records a withdrawal and reconciles
+the moving aliases. It resolves all of `X.Y`, `X`, and `latest` from the registry, not from the
+manifest, because a release also inherits aliases through earlier yanks. Each alias that names the
+yanked digest goes to the newest compatible release with a *different* digest, stays with a newer
+live release of the same image, or, with neither, makes the private side refuse before any write.
+For a release that was promoted, the same rule then runs on Docker Hub. It declares
+`environment: dockerhub-publication` (`action: prepare`) for that, and still installs crane only.
+A Docker Hub alias falls back only to a release that was itself published to Docker Hub, and is
+repointed with `crane tag` inside that repository; a private-only release is never copied there. When no public release is compatible, the job fails
+after the private side is done, naming the tags the Docker Hub owner must delete, because the token
+cannot delete. Any Docker Hub failure, a missing credential included, leaves the private
+withdrawal in place and writes no yank record, so `github_release_withdraw` waits and a retry
+converges. Full operator and recovery instructions are in `docs/RELEASING.md`.
 
 ## Public GitHub projection
 
@@ -514,6 +551,13 @@ must use the operator's real route configuration and credentials described in `d
   default-branch ancestry disagrees. Preserve the tag and prepare a new higher release version.
 - An immutable release alias or durable package conflict indicates prior publication with
   different content. Do not overwrite it; compare the registry digest and Generic Package record.
+- `public release alias docker.io/... already points to ...` means Docker Hub already has that
+  version at another digest. That attempt mutated nothing, but if the message adds that an earlier
+  attempt moved the private aliases, an earlier attempt's copy is what wrote the tag. A failure
+  inside `crane copy` to `docker.io/...` happens after the private aliases move and before any
+  manifest. See `docs/RELEASING.md` ("Failure before or during publication") for both.
+- `DOCKERHUB_USERNAME is required` from `release_publish` means the job no longer receives the
+  environment-scoped variables: check the job's `environment:` and the variables' scope.
 - Registry authentication or pull failures should be checked against
   `https://<your-gitlab-host>/v2/` and the `read_registry` scope of the deploy token.
 - `outbound host gate` from `github_release_publish` names the file or object that carries a

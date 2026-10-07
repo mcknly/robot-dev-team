@@ -455,7 +455,7 @@ GitLab user and set a real token/email.
 ## Worked Example: Grok Build (a CLI whose headless mode looks argv-only)
 
 Grok Build (`grok`, from xAI) ships commented out in `config/routes.yaml`,
-`.env.example`, and `docker-compose.yml` (issue #18). It is the *simple* shape of
+`.env.example`, and `docker-compose.yml`. It is the *simple* shape of
 a custom agent -- one binary, one logical agent, one cloud provider -- so the only
 interesting parts are the two places its CLI does not behave the way the docs
 suggest.
@@ -513,7 +513,7 @@ the host; create a `grok` GitLab user and set a real token/email.
 ## Worked Example: Pi (a harness that reintroduces Node -- behind the gate)
 
 Pi (`pi`, package `@earendil-works/pi-coding-agent`) ships commented out in
-`config/routes.yaml`, `.env.example`, and `docker-compose.yml` (issue #32). It is
+`config/routes.yaml`, `.env.example`, and `docker-compose.yml`. It is
 provider-agnostic like OpenCode/Goose -- one `pi` binary backs every logical
 `pi-*` agent, named per model (`pi-nemotron` here). Two things make it worth a
 worked example: it brings Node back to the image, and it is the one harness

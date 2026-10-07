@@ -11,7 +11,7 @@
 set -euo pipefail
 
 echo "[install-claude] Installing Claude Code (native installer)..."
-if ! curl -fsSL https://claude.ai/install.sh | bash; then
+if ! curl -fsSL --connect-timeout 30 https://claude.ai/install.sh | bash; then
   echo "[install-claude] WARN: failed to install Claude Code; continuing without it" >&2
   exit 0
 fi

@@ -1,6 +1,6 @@
 """Robot Dev Team Project
 File: tests/test_image_audit.py
-Description: Regression tests for the release image layer extraction and hostname scan (#51).
+Description: Regression tests for the release image layer extraction and hostname scan.
 License: MIT
 SPDX-License-Identifier: MIT
 Copyright (c) 2025 MCKNLY LLC
@@ -182,6 +182,11 @@ def test_extraction_refuses_a_directory_that_already_holds_files(tmp_path: Path)
         ("[::1]:5050", "::1"),
         ("[fe80::1]", "fe80::1"),
         ("fe80::1", "fe80::1"),
+        ("gitlab_internal.test", "gitlab_internal.test"),
+        ("10.0.0.5:5050", "10.0.0.5"),
+        # One spelling per address: the compressed one, bracketed or bare.
+        ("2001:db8:0:0:0:0:0:1", "2001:db8::1"),
+        ("[2001:0DB8:0000::0001]:443", "2001:db8::1"),
     ],
 )
 def test_hosts_are_normalized_to_bare_lowercase_names(value: str, host: str) -> None:
@@ -194,12 +199,40 @@ def test_hosts_are_normalized_to_bare_lowercase_names(value: str, host: str) -> 
         f"https://{HOST}", f"{HOST}/team", "", " ",
         # Typos that would otherwise pass through as a literal no bare occurrence contains.
         f"{HOST}:", f"{HOST}:port", f"[{HOST}", f"{HOST}]", "[::1]:", "[::1]x", ":5050", "fe80::1:",
+        # Multi-colon values that are not IPv6 addresses, bare or bracketed.
+        f"{HOST}:5050:x", "a:b:c", "[a:b:c]", f"[{HOST}]", "[foo bar]",
+        # User info, whitespace anywhere in the value as given, and a non-breaking space.
+        f"user@{HOST}", f"user:pass@{HOST}:5050", f"[user@{HOST}]",
+        "my host", f" {HOST}", f"{HOST} ", f"\u00a0{HOST}", f"{HOST}\t",
+        # Characters no host name holds, and malformed labels.
+        f"{HOST};x", f"{HOST}#x", f"{HOST}?x", f"*.{HOST}", f"{HOST}.", f".{HOST}",
+        "gitlab..test", f"-{HOST}", f"{HOST}-", "gitlab-.test", "gitl\u00e4b.test",
+        # A zone id is kept in the compressed form, and an IPv4-mapped address compresses
+        # differently on Python 3.12 than on 3.13+: neither is a stable literal.
+        "fe80::1%eth0", "[fe80::1%eth0]:5050", "::ffff:1.2.3.4", "[::ffff:1.2.3.4]", "::ffff:102:304",
+        # A dotted IPv6 form compresses to hex nobody writes, and `::` matches nearly any binary.
+        "::1.2.3.4", "[64:ff9b::1.2.3.4]:443", "::", "[::]:5050",
+        # str.lower() folds KELVIN SIGN into ASCII "k": refused before it can pass as a name.
+        "\N{KELVIN SIGN}ey.example",
     ],
 )
 def test_a_url_an_empty_host_or_a_malformed_port_is_refused(value: str) -> None:
     """Searching for a literal URL would miss every bare occurrence of the host."""
     with pytest.raises(ia.ImageAuditError):
         ia.normalize_host(value)
+
+
+def test_a_refused_host_is_not_repeated_in_the_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A bad --host value is the literal the scan keeps out of logs; ipaddress would quote it."""
+    (tmp_path / "file").write_text("x")
+    for value in (f"{HOST}:5050:x", "[fe80::1%eth0]", f"user@{HOST}", f"{HOST};x"):
+        assert ia.main(["hosts", "--root", str(tmp_path), "--no-extraction", "--host", value]) == 1
+        captured = capsys.readouterr()
+        assert "ERROR" in captured.err
+        assert HOST not in captured.err + captured.out
+        assert "fe80" not in captured.err + captured.out
 
 
 def test_hosts_are_found_in_content_file_names_and_directory_names(tmp_path: Path) -> None:
@@ -359,10 +392,11 @@ def test_a_non_utf8_member_name_is_scanned_not_a_crash(tmp_path: Path) -> None:
 # --- Secrets baseline -------------------------------------------------------------------------
 
 EXCLUDE = {"path": "detect_secrets.filters.regex.should_exclude_file", "pattern": [ia.SECRETS_EXCLUDE]}
+# What a runbook scan records: the pinned defaults plus the metadata exclusion.
 PROFILE = {
-    "version": "1.5.0",
-    "plugins_used": [{"name": "HexHighEntropyString", "limit": 3.0}],
-    "filters_used": [{"path": "detect_secrets.filters.heuristic.is_likely_id_string"}, EXCLUDE],
+    "version": ia.DETECT_SECRETS_VERSION,
+    "plugins_used": [dict(item) for item in ia.PLUGINS],
+    "filters_used": [*(dict(item) for item in ia.DEFAULT_FILTERS), EXCLUDE],
 }
 
 
@@ -530,10 +564,151 @@ def test_a_baseline_requires_exactly_the_metadata_exclusion(
                           output=tmp_path / "b.json")
 
 
+VERIFICATION = "detect_secrets.filters.common.is_ignored_due_to_verification_policies"
+# Caller-controlled text a refused record carries; none of it may reach the error.
+CUSTOM_FILTER = {"path": "file:///srv/gitlab.internal.test/drop.py::drop_all"}
+WORD_LIST = {
+    "file_hash": "0" * 40,
+    "file_name": "/home/operator/gitlab.internal.test-words.txt",
+    "min_length": 3,
+    "path": "detect_secrets.filters.wordlist.should_exclude_secret",
+}
+
+
+def filters_with(*extra: Any, drop: str = "", replace: dict[str, Any] | None = None) -> list[Any]:
+    records = [dict(item) for item in PROFILE["filters_used"] if item.get("path") != drop]
+    if replace:
+        records = [replace if item["path"] == replace["path"] else item for item in records]
+    return [*records, *extra]
+
+
+@pytest.mark.parametrize(
+    ("filters", "message"),
+    [
+        # `--filter file://...::drop_all`, as detect-secrets 1.5.0 records it (captured live).
+        (filters_with(CUSTOM_FILTER), r"filters_used\[12\] is not a detect-secrets 1\.5\.0 default"),
+        # `--word-list` (needs the pyahocorasick extra), as 1.5.0 records it (captured live).
+        (filters_with(WORD_LIST), r"filters_used\[12\] is not a detect-secrets 1\.5\.0 default"),
+        # An unknown filter inside the detect_secrets namespace is not a default either.
+        (filters_with({"path": "detect_secrets.filters.custom.drop"}), "not a detect-secrets"),
+        # `--only-verified` keeps the verification filter's path and raises min_level: every
+        # unverified hit, which is all of them, would be dropped.
+        (filters_with(replace={"min_level": 3, "path": VERIFICATION}), f"{VERIFICATION}.*changed parameters"),
+        (filters_with(replace={"min_level": 2.0, "path": VERIFICATION}), "changed parameters"),
+        (filters_with("detect_secrets.filters.heuristic.is_lock_file"), "not a filter record"),
+    ],
+)
+def test_a_baseline_allows_only_the_pinned_default_filters(
+    tmp_path: Path, filters: list[Any], message: str
+) -> None:
+    with pytest.raises(ia.ImageAuditError, match=message):
+        ia.write_baseline({**AUDITED, "filters_used": filters}, digest="sha256:a",
+                          output=tmp_path / "b.json")
+    assert not (tmp_path / "b.json").exists()
+
+
+def test_dropping_a_default_filter_is_accepted(tmp_path: Path) -> None:
+    """A dropped default filter only adds hits, so it cannot weaken the profile."""
+    filters = filters_with(drop="detect_secrets.filters.heuristic.is_likely_id_string")
+
+    assert ia.write_baseline({**AUDITED, "filters_used": filters}, digest="sha256:a",
+                             output=tmp_path / "b.json") == 2
+
+
+def plugins_with(*extra: Any, drop: str = "", replace: dict[str, Any] | None = None) -> list[Any]:
+    records = [dict(item) for item in PROFILE["plugins_used"] if item["name"] != drop]
+    if replace:
+        records = [replace if item["name"] == replace["name"] else item for item in records]
+    return [*records, *extra]
+
+
+@pytest.mark.parametrize(
+    ("plugins", "message"),
+    [
+        (plugins_with(drop="HexHighEntropyString"), r"retuned: HexHighEntropyString; unexpected records: 0"),
+        (plugins_with(replace={"limit": 8.0, "name": "HexHighEntropyString"}),
+         r"retuned: HexHighEntropyString; unexpected records: 1"),
+        (plugins_with(replace={"keyword_exclude": "password", "name": "KeywordDetector"}),
+         r"retuned: KeywordDetector; unexpected records: 1"),
+        # A custom plugin only adds hits, but it is not what the runbook scans with either.
+        (plugins_with({"name": "Custom", "path": "file:///srv/gitlab.internal.test/p.py"}), r"none; unexpected records: 1"),
+        (plugins_with(dict(ia.PLUGINS[0])), r"none; unexpected records: 1"),
+    ],
+)
+def test_a_baseline_requires_exactly_the_pinned_plugins(
+    tmp_path: Path, plugins: list[Any], message: str
+) -> None:
+    with pytest.raises(ia.ImageAuditError, match=message):
+        ia.write_baseline({**AUDITED, "plugins_used": plugins}, digest="sha256:a",
+                          output=tmp_path / "b.json")
+
+
+def test_a_baseline_requires_the_pinned_scanner_version(tmp_path: Path) -> None:
+    with pytest.raises(ia.ImageAuditError, match="must come from detect-secrets 1.5.0"):
+        ia.write_baseline({**AUDITED, "version": "1.6.0"}, digest="sha256:a", output=tmp_path / "b.json")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("filters_used", filters_with(CUSTOM_FILTER)),
+        ("filters_used", filters_with(WORD_LIST)),
+        ("filters_used", filters_with({"path": "detect_secrets.filters.regex.should_exclude_secret",
+                                       "pattern": ["gitlab\\.internal\\.test"]})),
+        ("plugins_used", plugins_with({"name": "Custom", "path": "file:///srv/gitlab.internal.test/p.py"})),
+    ],
+)
+def test_a_refused_profile_keeps_caller_controlled_text_out_of_the_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], field: str, value: list[Any]
+) -> None:
+    """File paths, word-list names and exclusion patterns could carry an endpoint or a secret."""
+    scan_path = tmp_path / "scan.json"
+    scan_path.write_text(json.dumps({**AUDITED, field: value}))
+
+    code = ia.main(["baseline", "--scan", str(scan_path), "--digest", "sha256:a",
+                    "--output", str(tmp_path / "b.json")])
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "ERROR" in captured.err
+    for leaked in ("gitlab", "internal", "file://", "/srv", "/home", "words.txt"):
+        assert leaked not in captured.err + captured.out
+
+
 def test_the_runbook_scans_with_the_exclusion_the_baseline_binds() -> None:
     runbook = (Path(__file__).resolve().parents[1] / "docs/RELEASING.md").read_text(encoding="utf-8")
 
     assert f"--exclude-files '{ia.SECRETS_EXCLUDE}'" in runbook
+    assert f"detect-secrets=={ia.DETECT_SECRETS_VERSION}" in runbook
+
+
+def test_the_committed_baseline_profile_is_exactly_the_pinned_one() -> None:
+    """The pins are the committed profile: a refresh under this guard keeps it acceptable."""
+    committed = json.loads((Path(__file__).resolve().parents[1] / "security/image-secrets-baseline.json")
+                           .read_text(encoding="utf-8"))["scanner"]
+
+    assert committed == ia.scanner_profile(PROFILE)
+    assert len(ia.DEFAULT_FILTERS) == 11 and len(ia.PLUGINS) == 27
+
+
+def test_the_committed_baseline_regenerates_byte_for_byte(tmp_path: Path) -> None:
+    """Replaying the committed entries through `baseline` writes the committed file unchanged.
+
+    That is the offline half of the refresh check; a live scan of the next digest is the other.
+    """
+    path = Path(__file__).resolve().parents[1] / "security/image-secrets-baseline.json"
+    committed = json.loads(path.read_text(encoding="utf-8"))
+    results: dict[str, list[dict[str, Any]]] = {}
+    for line, entry in enumerate(committed["entries"]):
+        results.setdefault(f"layer-{line % 7:02d}/{entry['path']}", []).append(
+            {"type": entry["type"], "hashed_secret": entry["hashed_secret"], "line_number": line}
+        )
+    output = tmp_path / "baseline.json"
+
+    ia.write_baseline({**committed["scanner"], "results": results}, digest=committed["digest"],
+                      output=output)
+
+    assert output.read_bytes() == path.read_bytes()
 
 
 def test_an_empty_scan_cannot_become_a_baseline(tmp_path: Path) -> None:

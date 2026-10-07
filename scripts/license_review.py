@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Robot Dev Team Project
 File: scripts/license_review.py
-Description: Classify the license of every component in a release SBOM (#82).
+Description: Classify the license of every component in a release SBOM.
 License: MIT
 SPDX-License-Identifier: MIT
 Copyright (c) 2025 MCKNLY LLC
@@ -279,7 +279,7 @@ def write_evidence(path: Path, entries: Mapping[str, Mapping[str, Any]]) -> None
         "description": (
             "Licenses for release-SBOM components whose licenseDeclared is NOASSERTION, keyed by "
             "type/name@version. Fetched entries record their source URL; manual entries record "
-            "where the evidence was read. Written by scripts/license_review.py (#82)."
+            "where the evidence was read. Written by scripts/license_review.py."
         ),
         "entries": {key: dict(entries[key]) for key in sorted(entries)},
     }

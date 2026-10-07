@@ -67,12 +67,12 @@ else
   NODE_TARBALL="node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz"
   NODE_BASE_URL="https://nodejs.org/dist/v${NODE_VERSION}"
 
-  if ! curl -fsSL "${NODE_BASE_URL}/${NODE_TARBALL}" -o "${TMP_DIR}/${NODE_TARBALL}"; then
+  if ! curl -fsSL --connect-timeout 30 "${NODE_BASE_URL}/${NODE_TARBALL}" -o "${TMP_DIR}/${NODE_TARBALL}"; then
     echo "[install-pi] WARN: failed to download Node runtime; continuing without Pi" >&2
     exit 0
   fi
 
-  if ! curl -fsSL "${NODE_BASE_URL}/SHASUMS256.txt" -o "${TMP_DIR}/SHASUMS256.txt"; then
+  if ! curl -fsSL --connect-timeout 30 "${NODE_BASE_URL}/SHASUMS256.txt" -o "${TMP_DIR}/SHASUMS256.txt"; then
     echo "[install-pi] WARN: failed to download Node checksums; continuing without Pi" >&2
     exit 0
   fi

@@ -13,9 +13,17 @@ This guide documents how we keep runtime tooling deterministic, how to update de
 
 ## Python dependencies
 - All runtime and development packages are pinned in `pyproject.toml` and resolved through `uv.lock`.
-- Container builds run `uv sync --frozen --no-dev --no-install-project` into `/opt/venv`.
+- Container builds run `uv sync --frozen --no-dev --no-install-project --no-cache` into `/opt/venv`.
   The application source remains importable from `/work`, while dependency resolution is locked
-  and does not invoke the project's floating PEP 517 build requirement.
+  and does not invoke the project's floating PEP 517 build requirement. `--no-cache` keeps uv's
+  cache out of the image layer. Pass it on the command, not through `UV_NO_CACHE` in the
+  image `ENV`: that setting would also reach the runtime container and disable caching for every
+  `uv` an agent runs in a mounted project.
+  `tests/test_release_contract.py::test_dockerfile_uv_commands_leave_no_build_cache` enforces both.
+  It covers `uv`, `uvx` and `python -m uv`, and it looks through `RUN` options, `sh -c` scripts,
+  exec form and shell prefixes. For `uvx`, `uv run` and `uv tool run`, put `--no-cache` before
+  the tool's name, since anything after it goes to the tool. It refuses a heredoc `RUN` that
+  mentions uv, because it cannot tell which program reads the body.
 - Use `uv` to refresh locks. Inside the running container:
   - `docker compose exec app uv lock --upgrade` resolves both runtime and `dev` extras.
   - Copy the refreshed `uv.lock` back to the host: `docker compose cp app:/work/uv.lock uv.lock`.
@@ -60,15 +68,15 @@ This guide documents how we keep runtime tooling deterministic, how to update de
   is being hopped precisely to clear CVEs. Bump it when 3.12 publishes a security release, the
   same way any other pin is bumped: readable tag *and* OCI index digest, re-resolved and
   verified against the current `3.12-slim-<codename>` tag.
-- **Its distro is not its own axis, and the tree enforces that too.** The version exclusion is
-  a support policy; a codename encodes nothing about a support floor, so this lane's codename
-  moves with the runtime's. `test_runtime_python_image_pins_agree` requires the floor pin's
-  codename to equal `PYTHON_IMAGE`'s while continuing to require its *version* to differ, which
-  is the whole exclusion stated precisely. Without it a distro hop can move the `Dockerfile`,
-  the `.gitlab-ci.yml` literals and the APT suites and still leave this lane on an end-of-life
-  Debian -- the condition #59 exists to end, surviving on the one job nobody rebuilds locally.
-  Re-resolve the floor image against the new codename in the same change as the base move.
-- OS packages are installed via a Debian snapshot pinned by `DEBIAN_SNAPSHOT` in the `Dockerfile`. We track a snapshot no more than one month old (current: `20260915T194013Z`) to balance deterministic rebuilds with timely security fixes.
+- **Its distro is not its own axis, and the tree enforces that too.** The version exclusion is a
+  support policy; a codename encodes nothing about a support floor, so this lane's codename moves
+  with the runtime's. `test_runtime_python_image_pins_agree` requires the floor pin's codename to
+  equal `PYTHON_IMAGE`'s while continuing to require its *version* to differ, which is the whole
+  exclusion stated precisely. Without it a distro hop can move the `Dockerfile`, the
+  `.gitlab-ci.yml` literals and the APT suites and still leave this lane on an end-of-life Debian --
+  the condition the Debian 13 migration exists to end, surviving on the one job nobody rebuilds
+  locally. Re-resolve the floor image against the new codename in the same change as the base move.
+- OS packages are installed via a Debian snapshot pinned by `DEBIAN_SNAPSHOT` in the `Dockerfile`. We track a snapshot no more than one month old (current: `20261006T081244Z`) to balance deterministic rebuilds with timely security fixes.
 - **The snapshot must be the only Debian source.** The base image ships its own deb822 source
   (`/etc/apt/sources.list.d/debian.sources`) pointing at the live `deb.debian.org` mirrors, and
   APT reads `sources.list.d/` in addition to `sources.list`. Writing our snapshot entries
@@ -117,7 +125,7 @@ This guide documents how we keep runtime tooling deterministic, how to update de
   1. Pick the latest viable snapshot timestamp from <https://snapshot.debian.org> (verify with `curl -I` that the packages exist). Check all three suites the `Dockerfile` configures -- `trixie`, `trixie-updates`, and `trixie-security` -- because they are archived independently.
   2. Choose a timestamp at or after the base image's build date. This only prevents pinning an archive *older* than the image; it does not guarantee the upgrade has candidates, and usually it will not have any. Verify what the step actually resolves with `apt-get -s upgrade` inside the built image rather than assuming a package count.
      - The two archives are imported independently and `debian-security` normally lags `debian` by several hours, so a timestamp new enough to sit after the base image's build date is often *ahead* of the newest security snapshot. `snapshot.debian.org` resolves each request to the latest snapshot at or before the requested time, which means a timestamp ahead of an archive's newest import can silently start resolving somewhere else once that archive catches up. Prefer an exact timestamp that already exists in the listing, and record in the MR what each of the three suites resolved to at pin time -- the value in the `Dockerfile` is a request, not by itself a statement about what was installed.
-     - Two guards will fail loudly on a codename change, and neither should be relaxed to make a build pass. The held-back parser reads `N not upgraded.` out of `apt-get -s upgrade`; trixie ships APT 3.x, which still emits that sentence (verified on the #59 migration build, APT 3.0.3). If a future APT changes the wording, re-anchor the parser to the new wording. And because `apt-get upgrade` never installs new packages, a library transition whose upgrade path needs a newly-named package is held back -- the remedy is to add the package to the explicit install list or move the snapshot, never `dist-upgrade`.
+     - Two guards will fail loudly on a codename change, and neither should be relaxed to make a build pass. The held-back parser reads `N not upgraded.` out of `apt-get -s upgrade`; trixie ships APT 3.x, which still emits that sentence (verified on the bookworm -> trixie migration build, APT 3.0.3). If a future APT changes the wording, re-anchor the parser to the new wording. And because `apt-get upgrade` never installs new packages, a library transition whose upgrade path needs a newly-named package is held back -- the remedy is to add the package to the explicit install list or move the snapshot, never `dist-upgrade`.
   3. Update `DEBIAN_SNAPSHOT`, rebuild with `docker compose build --no-cache`, and confirm the image installs successfully.
   4. Note the snapshot date in your commit message or MR description to show awareness of CVE coverage.
 - Add or update packages in the `apt-get install` list sparingly and keep `--no-install-recommends`. That flag is meaningful only on `install`; `upgrade` never installs new packages, so it is inert there.
@@ -127,7 +135,7 @@ This guide documents how we keep runtime tooling deterministic, how to update de
   actually enforced. A release blocked by a *fixable* deb CVE is normally telling you the snapshot
   is stale, not that a package needs handling by hand. The gate and the cadence have to be
   maintained together or the gate turns into a monthly exception-writing exercise.
-- **The base distro is supported again, and that changes what a deb finding means** (#59). While
+- **The base distro is supported again, and that changes what a deb finding means**. While
   the image was on bookworm, Grype annotated every report with "all N deb packages come from an
   EOL distro; vulnerability data may be incomplete or outdated" -- the one failure mode a CVE
   gate cannot detect on its own, since under-reporting looks exactly like a clean image. On
@@ -144,7 +152,7 @@ This guide documents how we keep runtime tooling deterministic, how to update de
   matching would make that report read as clean.
 
 ### Agent CLI installs
-The entrypoint runs the `scripts/install-*.sh` scripts that the active route config actually needs -- a harness is installed only when an enabled route runs its binary *and* that agent is credentialed (see `app/preflight.py` and issue #20). The **base image** ships no Node.js / npm (dropped when Gemini's harness became `agy`); the sole exception is the optional Pi harness, which bootstraps a pinned, user-local Node runtime at boot only when a `pi-*` route is enabled and credentialed (see the Pi row below), so operators who never enable Pi still get a Node-free image:
+The entrypoint runs the `scripts/install-*.sh` scripts that the active route config actually needs -- a harness is installed only when an enabled route runs its binary *and* that agent is credentialed (see `app/preflight.py`). The **base image** ships no Node.js / npm (dropped when Gemini's harness became `agy`); the sole exception is the optional Pi harness, which bootstraps a pinned, user-local Node runtime at boot only when a `pi-*` route is enabled and credentialed (see the Pi row below), so operators who never enable Pi still get a Node-free image:
 
 | Agent      | Method                          | Notes                                         |
 |------------|---------------------------------|-----------------------------------------------|
@@ -163,6 +171,37 @@ All of them pull the latest version on every container start. Auto-updates are a
 - Record deviations from the latest-tracking policy in this document if operations ever require pinning.
 - **Prefer fetching a release artifact over piping a vendor install script**, where the vendor publishes one. Both track latest equally, but an install script is itself a mutable asset the vendor can change or withdraw: Block removed Goose's `download_cli.sh` from its release while continuing to publish the binaries, which took the container from booting to `curl: (22) ... 404` with no change on our side. Codex, Goose, and Grok fetch artifacts directly for this reason. Grok's vendor script adds three further reasons to avoid it in a container: it symlinks a bare `agent` command onto `PATH` (hopelessly ambiguous in a repo whose whole vocabulary is "agents"), it appends a block to `~/.bashrc` / `~/.zshrc`, and it stages downloads under `~/.grok` -- which is bind-mounted from the host, so all of that would land in the operator's home directory. The remaining `curl | bash` installers are a deliberate trade -- the vendor scripts handle platform detection and install-path conventions -- and the entrypoint's post-install binary check turns any such breakage into a refused boot rather than a dispatch-time failure.
 
+### Boot-time egress
+
+A pulled image is **not** self-contained. Every container start runs the installers for the harnesses your enabled, credentialed routes dispatch, and on a new container every one of them downloads from vendor hosts (a restart of the same container differs slightly; see below). Why the project installs at boot rather than baking the CLIs in is recorded in `docs/SYSTEM_DESIGN.md` section 7. This is the list to build an egress allowlist from.
+
+**Scope and freshness.** These are the destinations observed for `linux/amd64` on **2026-09-28/29**, by reading the in-repo installers, reading (not executing) the three vendor install scripts, and following each redirect with HEAD requests. They are **not** yet confirmed by booting a fresh container behind a default-deny policy; that check is a release gate (see `docs/RELEASING.md`). The vendor scripts, their manifests, and the CDN redirects choose hosts without any change to this repository, so a host can move under a published image. Read this table from the checkout of the tag you are running, not from `main`: the installers are baked into the image, so this document belongs to the image tag.
+
+Every destination is HTTPS on port 443. Allowlist by hostname; the GitHub, Google Cloud Storage, and Cloudflare-fronted edges are CDNs whose addresses change.
+
+| Harness (agent) | Installer | Stock `config/routes.yaml` | Hosts contacted at boot |
+|---|---|---|---|
+| Claude Code (`claude`) | `scripts/install-claude.sh` | **enabled** | `claude.ai` (install script, redirects to) `downloads.claude.ai` (bootstrap, `latest`, `<version>/manifest.json`, `<version>/linux-x64/claude`). The script then runs the downloaded binary's `claude install` subcommand, which has **not been traced**: treat this row as "these hosts, plus whatever the current binary contacts during `install`". The script stages the download in `~/.claude/downloads` -- the **host** bind mount -- on every start, restarts included, and deletes it only after `claude install` returns. If `claude install` fails, the script removes the binary and exits non-zero, so a new container refuses to boot. |
+| Antigravity (`agy`, the `gemini` agent) | `scripts/install-gemini.sh` | **enabled** | `antigravity.google` (install script); `antigravity-cli-auto-updater-974169037036.us-central1.run.app` (`/manifests/linux_amd64.json`); `storage.googleapis.com` (the artifact URL the manifest names, today under `/antigravity-public/`). The artifact host is chosen by the manifest, not by this repository. The script then runs `agy install --dir ~/.local/bin` and ignores its exit status. That step has **not been traced** either, but a failure there leaves the binary in place. The script exits 0 **before any download** when `~/.local/bin/agy` already exists, so a restarted container neither contacts these hosts nor updates `agy`. |
+| Codex (`codex` + `codex-code-mode-host`) | `scripts/install-codex.sh` | **enabled** | `github.com` (`/openai/codex/releases/latest`, then both release assets for the resolved tag); `release-assets.githubusercontent.com` (GitHub's current redirect target for release assets). Preflight requires both binaries. |
+| OpenCode (`opencode`) | `scripts/install-opencode.sh` | commented out | `opencode.ai` (install script, redirects to) `raw.githubusercontent.com`; `api.github.com` (unauthenticated `releases/latest`, subject to GitHub's anonymous rate limit); `github.com`; `release-assets.githubusercontent.com`. |
+| Goose (`goose`) | `scripts/install-goose.sh` | commented out | `github.com` (`/block/goose/releases/download/stable/`, `.tar.gz` with `.tar.bz2` fallback); `release-assets.githubusercontent.com`. |
+| Grok Build (`grok`) | `scripts/install-grok.sh` | commented out | `x.ai` (`/cli/stable`, `/cli/grok-<version>-linux-x86_64`, about 150 MB) and, on any failure there, `storage.googleapis.com` (`/grok-build-public-artifacts/cli/`). Allow both: `x.ai` is Cloudflare-fronted, a challenge page is rejected by the installer's version check, and the fallback is what makes that survivable. |
+| Pi (`pi`) | `scripts/install-pi.sh` | commented out | `nodejs.org` (`/dist/v22.23.1/` tarball and `SHASUMS256.txt`, fetched once per container and then cached in its writable layer); `registry.npmjs.org` (`@earendil-works/pi-coding-agent` and its dependency tarballs, on every start). |
+
+What turns a row on or off:
+
+- A harness is installed only when an **enabled** route dispatches that agent **and** the agent is credentialed (`app/preflight.py`). A token with no route installs nothing; commenting out a route drops its hosts. The stock route file enables Claude, Antigravity, and Codex, so a stock boot needs the first three rows and nothing else.
+- A **new** container (first `up`, after `down`, after an image pull, or on `--force-recreate`) downloads every enabled harness: `~/.local` is container-local and not a volume, and the harnesses track latest by design. A **restart** of the same container keeps its writable layer and runs every installer again. All of them re-download, except Antigravity (its vendor script skips an existing `agy`) and Pi's Node tarball (cached for the container's lifetime). Build the allowlist for a new container; a restart that succeeds proves nothing about it.
+- The image's `uname -m` is `x86_64` even under Docker Desktop's emulation on Apple Silicon, so the amd64 paths above are the ones requested. Some installers carry `aarch64` branches; they are unused until a multi-architecture image exists.
+- `http://snapshot.debian.org` is a **build-time** source only. A running container never contacts it.
+
+**Dispatch egress is a separate list.** An allowlist built from this table gets the container to `uvicorn`. Serving a webhook then needs your GitLab host (`GLAB_HOST`) and any git remotes, each vendor's model API for the harnesses you route to, and anything the agents themselves fetch while working. Those destinations depend on your routes and your vendors' services; this table does not cover them.
+
+**Forward proxies.** The in-repo installers use `curl`, which honours `HTTPS_PROXY` / `NO_PROXY` from the container environment (`env_file: .env` reaches the entrypoint, and the privilege drop inherits it). Whether the vendor binaries honour it during `claude install` and `agy`'s own update checks is **unverified**. The same variables reach dispatch, so `NO_PROXY` must list your `GLAB_HOST` and `host.docker.internal`, or `glab` and `git` traffic to a private GitLab goes out through the proxy. The image trusts only the Debian `ca-certificates` bundle and has no supported custom-CA path, so a TLS-intercepting proxy fails these downloads with a certificate error.
+
+**What blocked egress looks like.** Each installer treats a download failure as a warning and exits 0; the entrypoint then refuses to start with `[entrypoint] FATAL: harness binaries not on PATH after install: <binary>`, and the actual `curl` error is **above** that line. A firewall that *drops* rather than rejects packets makes each blocked fetch wait out a connect timeout, and the installs run one after another, so a long stall after `[entrypoint] Running install-<agent>.sh...` is how dropped egress looks. Every `curl` call in the in-repo installers sets `--connect-timeout 30` to bound that; the fetches *inside* the vendor scripts (Claude, Antigravity, OpenCode) and npm's cannot be changed from here. With `restart: unless-stopped`, a refused boot becomes a slow restart loop, and there is no healthcheck in the committed compose file: `GET /health` answers only once the entrypoint has finished. A warm container may come back up after a failed re-fetch because the previous binary is still on disk; that is an accident of the warning path, not an offline mode.
+
 ## SBOM generation
 - `scripts/generate-sbom.sh` exports the completed local image and scans its Docker archive with the digest-pinned Syft v1.42.2 container. Syft is not installed in the runtime image.
 - Run `scripts/generate-sbom.sh` with no arguments to rebuild the Compose image and refresh `sbom/sbom.spdx.json`. CI passes its already smoke-tested image and artifact path explicitly, so both workflows use the same scanner.
@@ -171,7 +210,7 @@ All of them pull the latest version on every container start. Auto-updates are a
 - **Step 3 above is enforced, not remembered.**
   `tests/test_release_contract.py::test_reference_sbom_records_the_runtime_interpreter` asserts
   that the `python` package in `sbom/sbom.spdx.json` is the version `PYTHON_IMAGE` ships, so a
-  pin bump that skips the regeneration fails in `validate` rather than going silent (#73). The
+  pin bump that skips the regeneration fails in `validate` rather than going silent. The
   binding is scoped to the interpreter deliberately: regeneration needs a Docker daemon, and
   Syft stamps a per-run `documentNamespace` and timestamp, so the document itself is not
   reproducible from the tree and cannot be compared byte for byte. The interpreter is the field
@@ -179,56 +218,124 @@ All of them pull the latest version on every container start. Auto-updates are a
   reference artifact is in scope -- the release path stages the smoke-tested image's own
   document, so a stale in-tree copy never reached a published release.
 - **The same file is also bound to the base image's Debian release**, by
-  `test_reference_sbom_records_the_base_image_distro`, because the interpreter binding cannot
-  see a distro-only hop: #59 moved bookworm -> trixie with `PYTHON_VERSION` unchanged at 3.14.7,
-  and an SBOM left on the old image would have satisfied the interpreter check verbatim while
-  describing 125 packages the image no longer ships. The check reads the `distro` qualifier off
-  the document's own deb purls
+  `test_reference_sbom_records_the_base_image_distro`, because the interpreter binding cannot see a
+  distro-only hop: the Debian 13 migration moved bookworm -> trixie with `PYTHON_VERSION` unchanged
+  at 3.14.7, and an SBOM left on the old image would have satisfied the interpreter check verbatim
+  while describing 125 packages the image no longer ships. The check reads the `distro` qualifier
+  off the document's own deb purls
   (`pkg:deb/debian/base-files@13.8%2Bdeb13u6?arch=amd64&distro=debian-13`) -- a value Syft takes
   from the scanned image's /etc/os-release, not from anything this repository asserts, so the
-  artifact stays evidence about the built image rather than a restatement of the pin. The
-  qualifier carries the major release and never the codename, so the comparison goes through a
-  codename-to-major table (`DEBIAN_RELEASES`) in the test module. That table is a maintenance
-  cost with the same justification as `EOL_DISTRO_RELEASES`: the mapping is not derivable from
-  the tree, and an unknown codename is a hard failure naming the line to add rather than a
-  check that quietly stops applying.
-- **Do not treat a vulnerability count as a property of the image alone -- it depends on what
-  you hand the scanner.** Grype returns materially different results for an image than for the
-  Syft SBOM of that same image. Measured on the **post-#58** `setpriv` image with Grype v0.116.1
-  and a single DB built 2026-08-04T07:02:51Z: **376 matches / 10 fixable High-Critical scanning
-  the image, 385 / 15 scanning its SBOM**. This is not a cataloging difference: the divergent
-  artifacts carry identical purls and lookup keys. Always state the **image identity** (digest or
-  commit), the scanner version, the DB build date, and the input form alongside a count. A count
-  quoted without those four things cannot be compared to anything -- and image identity is in that
-  list because it is the one most easily left out: the bullet below reports 381 / 12 and 458 / 49
-  from the same scanner version and the same DB build, differing only in that it measures a
-  *pre-#58* image. Three matching attributes, four different numbers. Expect these figures to go
-  stale on any commit that moves the dependency footprint; refresh them by re-scanning the image
+  artifact stays evidence about the built image rather than a restatement of the pin. The qualifier
+  carries the major release and never the codename, so the comparison goes through a
+  codename-to-major table (`DEBIAN_RELEASES`) in the test module. That table is a maintenance cost
+  with the same justification as `EOL_DISTRO_RELEASES`: the mapping is not derivable from the tree,
+  and an unknown codename is a hard failure naming the line to add rather than a check that quietly
+  stops applying.
+- **Do not treat a vulnerability count as a property of the image alone -- it depends on what you
+  hand the scanner.** Grype returns materially different results for an image than for the Syft SBOM
+  of that same image. Measured on the first `setpriv` image (after `gosu` was removed) with Grype
+  v0.116.1 and a single DB built 2026-08-04T07:02:51Z: **376 matches / 10 fixable High-Critical
+  scanning the image, 385 / 15 scanning its SBOM**. This is not a cataloging difference: the
+  divergent artifacts carry identical purls and lookup keys. Always state the **image identity**
+  (digest or commit), the scanner version, the DB build date, and the input form alongside a count.
+  A count quoted without those four things cannot be compared to anything -- and image identity is
+  in that list because it is the one most easily left out: the bullet below reports 381 / 12 and 458
+  / 49 from the same scanner version and the same DB build, differing only in that it measures a
+  *pre-`setpriv`* image. Three matching attributes, four different numbers. Expect these figures to
+  go stale on any commit that moves the dependency footprint; refresh them by re-scanning the image
   whenever the SBOM is regenerated, or leave them attributed to the commit that produced them.
-- **Scan the image, not the SBOM. The published SPDX document is not a substitute** (#61). Grype
-  v0.116.1 forces `capture-symbols=all` when it catalogs an image itself, and its `gosymbols`
-  qualifier then discards Go matches whose vulnerable symbols the compiled binary does not use; a
-  package carrying no symbol evidence keeps module-granularity matching instead. SPDX 2.3 has no
-  field for symbol evidence, and Syft's SPDX decoder (`spdxhelpers/to_syft_model.go`) rebuilds a Go
-  package from its H1 digest alone -- so nothing on the read side would consume symbols even if an
-  encoder started emitting them, and an SPDX input takes the coarse path. Confirmed on one archive,
-  one Grype v0.116.1 binary, and one frozen DB (2026-08-04T07:02:51Z) against `sha256:602736dc`,
-  which is a **pre-#58** image -- its Go stdlib residue is `gosu`'s, cleared since, which is why
-  its counts are larger than the post-#58 pair above. The image scan and a symbol-bearing
-  `syft-json` scan agree exactly (381 matches / 12 fixable High-Critical), while `spdx-json` and a
-  `syft-json` written without symbols also agree exactly (458 / 49) and both emit Grype's
-  missing-symbols warning. Those SBOM rows used Syft **v1.50.0** -- deliberately newer than the
-  pinned v1.42.2 -- with `capture-symbols=all` explicitly set, and the SPDX it wrote still carried
-  no symbols for any of the 137 catalogued Go modules while its `syft-json` carried them for 125.
-  That is the load-bearing result: the loss is in the format, not in the pinned version, so it
-  cannot be fixed by bumping the pin. The image result is a strict **subset** of the SBOM result --
-  the entire 37-finding delta in fixable High-Critical is Go module-granularity matches that the
-  symbol-aware path judged unreachable, so nothing the image scan drops is a match the precise
-  matcher would have kept. A second SPDX round-trip loss: the CPython artifact catalogs as type
-  `binary` on the image path and returns as `UnknownPackage` through SPDX, so an exception file
-  keyed on an exact `type` (#50) can only be evaluated against a report produced by the image scan.
-  Keep the SBOM for inventory, provenance, and audit -- that is what it is good at.
+- **Scan the image, not the SBOM. The published SPDX document is not a substitute**. Grype v0.116.1
+  forces `capture-symbols=all` when it catalogs an image itself, and its `gosymbols` qualifier then
+  discards Go matches whose vulnerable symbols the compiled binary does not use; a package carrying
+  no symbol evidence keeps module-granularity matching instead. SPDX 2.3 has no field for symbol
+  evidence, and Syft's SPDX decoder (`spdxhelpers/to_syft_model.go`) rebuilds a Go package from its
+  H1 digest alone -- so nothing on the read side would consume symbols even if an encoder started
+  emitting them, and an SPDX input takes the coarse path. Confirmed on one archive, one Grype
+  v0.116.1 binary, and one frozen DB (2026-08-04T07:02:51Z) against `sha256:602736dc`, which is a
+  **pre-`setpriv`** image -- its Go stdlib residue is `gosu`'s, cleared since, which is why its
+  counts are larger than the `setpriv` pair above. The image scan and a symbol-bearing `syft-json`
+  scan agree exactly (381 matches / 12 fixable High-Critical), while `spdx-json` and a `syft-json`
+  written without symbols also agree exactly (458 / 49) and both emit Grype's missing-symbols
+  warning. Those SBOM rows used Syft **v1.50.0** -- deliberately newer than the pinned v1.42.2 --
+  with `capture-symbols=all` explicitly set, and the SPDX it wrote still carried no symbols for any
+  of the 137 catalogued Go modules while its `syft-json` carried them for 125. That is the
+  load-bearing result: the loss is in the format, not in the pinned version, so it cannot be fixed
+  by bumping the pin. The image result is a strict **subset** of the SBOM result -- the entire
+  37-finding delta in fixable High-Critical is Go module-granularity matches that the symbol-aware
+  path judged unreachable, so nothing the image scan drops is a match the precise matcher would have
+  kept. A second SPDX round-trip loss: the CPython artifact catalogs as type `binary` on the image
+  path and returns as `UnknownPackage` through SPDX, so an exception file keyed on an exact `type`
+  can only be evaluated against a report produced by the image scan. Keep the SBOM for inventory,
+  provenance, and audit -- that is what it is good at.
 - That artifact expires; the durable copy does not. `sbom_publish` uploads the same bytes to the Generic Package Registry keyed by the published image digest, and every stable release copies them to its own package version and links them from the GitLab Release. `--source-name` is what ties a document to its image: the reference it records is checked at both ends against the digest the document is filed under, so keep it on any hand-run scan. Retrieval and recovery are in `docs/RELEASING.md`. The document describes the built image only -- harnesses installed at boot by `docker-entrypoint.sh` are outside it.
+
+## Third-party license notices
+
+`glab` and `uv` are redistributed in the image, and the MIT, BSD, Apache-2.0, and FreeType
+licenses of the code compiled into them require their notices to go with every copy. Neither
+upstream package ships those notices, so the image installs them itself
+(`docs/LICENSE_REVIEW.md` section 6):
+
+| Image path | Contents |
+| --- | --- |
+| `/usr/share/doc/glab/copyright` | glab's own `LICENSE` at `GLAB_VERSION` |
+| `/usr/share/doc/glab/CREDITS` | the FreeType credit the FTL requires in the documentation |
+| `/usr/share/doc/glab/third-party/` | every compiled-in Go module's license and notice files, and the Go standard library's |
+| `/usr/share/doc/uv/third-party/` | every compiled-in crate's, and the Rust standard library's, with the crates it vendors |
+| `/usr/share/doc/{glab,uv}/notices.json` | the files that cover each component, each file's origin, and its SHA-256 |
+
+The tree lives in `notices/`. It is committed and copied in by the `Dockerfile`, so the image
+build downloads nothing for it. `scripts/third_party_notices.py collect` regenerates it:
+
+```bash
+python -m scripts.third_party_notices collect \
+  --glab-binary <path to glab> --uv-binary <path to uv> --cache /tmp/notices-cache
+```
+
+Point it at the binaries of the pinned versions. The simplest source is the image you are
+updating: `docker create` it, then `docker cp` out `/usr/bin/glab` and `/usr/local/bin/uv`.
+Collection is deterministic, so a re-run with the same pins leaves the tree byte-identical. It
+fails closed on each of these:
+
+- **The binaries define the set.** The component list comes from the binaries' own build data (Go
+  buildinfo and cargo-auditable), which is what Syft reads too. `collect` refuses binaries whose
+  version or toolchain differs from `COLLECTION_INPUTS`.
+- **Every input is pinned.** `COLLECTION_INPUTS` in the script pins glab's module hash, the uv
+  source tarball, and the Go and Rust standard-library source archives. Go modules are checked
+  against the `h1:` hashes in glab's own `go.sum`, and glab's module hash has to match
+  sum.golang.org as well. Crates are checked against the `Cargo.lock` checksums in the pinned uv
+  source. No collector binary is involved, so there is no tool to pin beyond the script itself.
+- **Only license text is copied.** Notice files are taken from every directory of a component,
+  which is how the bundled C libraries' notices (`jemalloc/COPYING`, `zstd/LICENSE`) are found.
+  Source files never are, whatever their name.
+- **A missing notice is never filled in.** A component whose archive omits its license file needs
+  a reviewed entry in `NOTICE_FALLBACKS`, which names the upstream file at a commit and pins its
+  hash. `collect` fails on a new component with no file, and on a fallback nothing links any more.
+  It never generates text from an SPDX identifier.
+- **Embedded works are reviewed by hand.** A component can carry its own license and still embed
+  another project's code whose license it only links to, which no file-level check can see. d2's
+  `NOTICE.txt` files are the case in `glab` today, and its `NOTICE_FALLBACKS` entry installs the
+  linked MIT texts. Read the embedded bytes too, not only the notices: d2's `dagre.js` keeps
+  graphlib's BSD-3-Clause source header, which graphlib's MIT `LICENSE` does not contain. A notice
+  that exists only as a source header is a fallback with `lines`: only those lines of the pinned
+  file are installed, pinned again by `header_sha256`, and `collect` fails unless they occur
+  verbatim in the component's `embedded_in` file. The entry is keyed to the d2 version, so a bump
+  that moves d2 fails `collect` until the new version's `NOTICE.txt` files and embedded bundles
+  are re-read and the entry is moved.
+
+Three checks keep the tree honest:
+
+- `tests/test_third_party_notices.py`, in `validate` on every merge request, requires the tree to
+  match its manifests exactly. It also requires the manifests to name the current
+  `COLLECTION_INPUTS`, those pins to match the `Dockerfile`, and every `cargo` and `golang` entry of
+  the reference `sbom/sbom.spdx.json` to have a notice.
+- `scripts/ci-build-image.sh` runs `check-image` inside the built image before pushing it. The
+  check runs as `appuser` with no network. It joins the generated SBOM to the installed notices,
+  re-hashes every file, and reads the installed binaries' build data directly, so a module Syft
+  missed or a rebuilt binary also fails.
+- `scripts/header_guard.py` excludes `notices/` by default, and `.gitattributes` turns off
+  line-ending conversion there. Either a header or a converted line ending would alter the
+  upstream bytes.
 
 ## Release CI tools
 
@@ -281,6 +388,11 @@ different reasons.
      `compat_python_floor`'s *version* alone: it pins the supported floor, not the runtime. Its
      *codename* does move with the base, and the contract test fails if it does not.
    - `scripts/generate-sbom.sh`: the Syft image and digest, when bumping the scanner.
+   - `scripts/third_party_notices.py`: `COLLECTION_INPUTS`, whenever `GLAB_VERSION` or
+     `UV_VERSION` moves. That includes the Go and Rust toolchains the new binaries were built
+     with, which `collect` reports if they changed. Then re-run `collect` and commit `notices/`
+     in the same change. The contract tests fail until both move together (see "Third-party
+     license notices" above).
    - `SECURITY.md`, `README.md`, `docs/CI.md`, `docs/SYSTEM_DESIGN.md`, and the "Supported
      toolchain versions" list above all restate these numbers; grep for the old literals before
      you finish. `README.md` and `docs/AGENT_ONBOARDING.md` state the supported **floor**, so
@@ -289,9 +401,10 @@ different reasons.
    image you actually validated, not a fresh rebuild -- see the SBOM section above.
 4. Run the automated test suite and linting.
 5. Document significant dependency changes in the merge request description.
-6. After a `UV_VERSION` or `TOOL_RELEASES` bump merges, expect the pre-tag secrets comparison to
-   report lost and new hits. uv's own SBOM makes up most of
-   `security/image-secrets-baseline.json`, and the tool checksums sit in
-   `scripts/release_tools.py`. MR pipelines build no image, so refresh
-   the baseline from the new `main` digest in a follow-up MR, as `docs/RELEASING.md` describes.
-   Do not refresh it wholesale without reading the hits.
+6. After a `UV_VERSION` or `TOOL_RELEASES` bump, or any change to `notices/`, merges, expect the
+   pre-tag secrets comparison to report lost and new hits. uv's own SBOM and the two
+   `notices.json` manifests make up most of `security/image-secrets-baseline.json`, and the tool
+   checksums sit in `scripts/release_tools.py`. Each `notices.json` records a SHA-256 for every
+   notice file, and detect-secrets reports those hashes as `Hex High Entropy String`. MR pipelines
+   build no image, so refresh the baseline from the new `main` digest in a follow-up MR, as
+   `docs/RELEASING.md` describes. Do not refresh it wholesale without reading the hits.

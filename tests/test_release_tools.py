@@ -151,7 +151,7 @@ def exception_entry(**overrides: Any) -> dict[str, Any]:
         "owner": "@cavin",
         "rationale": "No fix on the branch we ship; migration tracked.",
         "expires": (dt.date.today() + dt.timedelta(days=30)).isoformat(),
-        "tracking_issue": "#66",
+        "tracking_issue": "cpython-312-no-fix",
     }
     entry.update(overrides)
     return {key: value for key, value in entry.items() if value is not None}
@@ -361,6 +361,9 @@ def release_env(**overrides: str) -> dict[str, str]:
         "CI_PIPELINE_URL": "https://gitlab.example/pipelines/1",
         "CI_JOB_URL": "https://gitlab.example/jobs/2",
         "CI_PROJECT_URL": "https://gitlab.example/team/robot-dev-team",
+        # release_publish promotes to Docker Hub, so its job declares the scoped environment.
+        "DOCKERHUB_USERNAME": "docker-user",
+        "DOCKERHUB_TOKEN": "docker-token",
     }
     values.update(overrides)
     return values
@@ -373,8 +376,6 @@ def dockerhub_probe_env(**overrides: str) -> dict[str, str]:
         CI_PIPELINE_ID="187",
         IMAGE_PUBLISHED="true",
         IMAGE_DIGEST=DIGEST,
-        DOCKERHUB_USERNAME="docker-user",
-        DOCKERHUB_TOKEN="docker-token",
     )
     values.update(overrides)
     return values
@@ -855,10 +856,15 @@ def test_publish_promotes_digest_and_uploads_durable_files(
     }
     context_path = tmp_path / "context.json"
     context_path.write_text(json.dumps(context), encoding="utf-8")
-    aliases: list[str] = []
+    writes: list[tuple[str, str, str | None]] = []
+    logins: list[tuple[str, str]] = []
 
     monkeypatch.setattr(release_tools, "gitlab_api_from_env", lambda env: (api, {}))
-    monkeypatch.setattr(release_tools, "crane_login", lambda *args: None)
+    monkeypatch.setattr(
+        release_tools,
+        "crane_login",
+        lambda _crane, registry, username, _password: logins.append((registry, username)),
+    )
     monkeypatch.setattr(release_tools, "crane_digest", lambda *args: DIGEST)
 
     def fake_apply(
@@ -868,8 +874,9 @@ def test_publish_promotes_digest_and_uploads_durable_files(
         alias: str,
         *,
         immutable: bool,
+        copy_from: str | None = None,
     ) -> dict[str, str]:
-        aliases.append(alias)
+        writes.append((repository, alias, copy_from))
         return {
             "name": alias,
             "reference": f"{repository}:{alias}",
@@ -887,8 +894,31 @@ def test_publish_promotes_digest_and_uploads_durable_files(
         environ=release_env(),
     )
 
-    assert aliases == ["0.2.0", "0.2", "0", "latest"]
+    public = "docker.io/mcknly/robot-dev-team"
+    source = f"{REGISTRY_IMAGE}@{DIGEST}"
+    assert logins == [("registry.example", "ci-user"), ("index.docker.io", "docker-user")]
+    # Private aliases first, then the same alias set copied from the private digest.
+    assert writes == [
+        (REGISTRY_IMAGE, "0.2.0", None),
+        (REGISTRY_IMAGE, "0.2", None),
+        (REGISTRY_IMAGE, "0", None),
+        (REGISTRY_IMAGE, "latest", None),
+        (public, "0.2.0", source),
+        (public, "0.2", source),
+        (public, "0", source),
+        (public, "latest", source),
+    ]
     assert manifest["image_digest"] == DIGEST
+    assert manifest["image_reference"] == source
+    assert [alias["reference"] for alias in manifest["public_aliases"]] == [
+        f"{public}:0.2.0",
+        f"{public}:0.2",
+        f"{public}:0",
+        f"{public}:latest",
+    ]
+    # Only the immutable tag is a reference: the receipt is permanent, moving aliases are not.
+    assert manifest["public_references"] == [{"reference": f"{public}:0.2.0", "digest": DIGEST}]
+    assert json.loads(api.files[("0.2.0", "release-manifest.json")]) == manifest
     uploaded = {(version, filename) for _, version, filename, _ in api.uploads}
     assert ("0.2.0", "release-manifest.json") in uploaded
     assert ("0.2.0", "changelog.md") in uploaded
@@ -1109,10 +1139,13 @@ def run_publish(
         alias: str,
         *,
         immutable: bool,
+        copy_from: str | None = None,
     ) -> dict[str, str]:
         if forbid_aliases:
             raise AssertionError(f"alias {alias} was written before the release could fail closed")
-        aliases.append(alias)
+        # Only the private writes are returned; the Docker Hub promotion has its own tests.
+        if copy_from is None:
+            aliases.append(alias)
         return {
             "name": alias,
             "reference": f"{repository}:{alias}",
@@ -1219,6 +1252,455 @@ def test_publish_retry_reuses_the_existing_version_scoped_sbom(
         (version, filename) for _, version, filename, _ in api.uploads
     }
     assert api.files[("0.2.0", "sbom.spdx.json")] == SBOM_BYTES
+
+
+PUBLIC_REPOSITORY = "docker.io/mcknly/robot-dev-team"
+
+
+class FakeRegistry:
+    """Answer crane's digest, tag, and copy calls the way two real registries would.
+
+    `tags` maps `repository:tag` to a manifest digest. A digest reference resolves only when a
+    tag in that repository already names it, so a `crane tag` of a digest that was never pushed
+    to Docker Hub fails here as it would there. `poisoned` makes one copy to a destination store
+    another digest, once. `copy_error` makes every copy fail the way a denied push or an outage
+    does, without writing anything. `unreachable` makes every lookup under that prefix fail the way
+    an outage does, which is not a not-found. `lookups` records every reference resolved.
+    """
+
+    def __init__(self, tags: dict[str, str] | None = None) -> None:
+        self.tags = {f"{REGISTRY_IMAGE}:{SHA}": DIGEST}
+        self.tags.update(tags or {})
+        self.writes: list[tuple[str, ...]] = []
+        self.poisoned: dict[str, str] = {}
+        self.copy_error: str | None = None
+        self.unreachable: str | None = None
+        self.lookups: list[str] = []
+
+    def resolve(self, reference: str) -> str:
+        self.lookups.append(reference)
+        if self.unreachable is not None and reference.startswith(self.unreachable):
+            raise release_tools.ReleaseError(
+                f"crane digest {reference} failed: dial tcp: connection refused"
+            )
+        if "@" in reference:
+            repository, digest = reference.split("@", 1)
+            if any(
+                key.rsplit(":", 1)[0] == repository and value == digest
+                for key, value in self.tags.items()
+            ):
+                return digest
+        elif reference in self.tags:
+            return self.tags[reference]
+        raise release_tools.ReleaseError(
+            f"crane digest {reference} failed: MANIFEST_UNKNOWN: manifest unknown; unknown tag"
+        )
+
+    def run(self, arguments: Sequence[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        command = tuple(arguments)
+        if command[1:3] == ("auth", "login"):
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if command[1] == "digest":
+            return subprocess.CompletedProcess(command, 0, f"{self.resolve(command[2])}\n", "")
+        if command[1] == "copy" and self.copy_error is not None:
+            raise release_tools.ReleaseError(f"crane copy {command[2]} failed: {self.copy_error}")
+        self.writes.append(command[1:])
+        if command[1] == "tag":
+            repository = command[2].split("@", 1)[0]
+            self.tags[f"{repository}:{command[3]}"] = self.resolve(command[2])
+        elif command[1] == "copy":
+            self.tags[command[3]] = self.poisoned.pop(command[3], None) or self.resolve(command[2])
+        else:  # pragma: no cover - a new crane verb is a test bug
+            raise AssertionError(f"unexpected crane command: {command}")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+
+def run_registry_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    api: FakeApi,
+    registry: FakeRegistry,
+    *,
+    version: str = "0.2.0",
+    environ: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Drive publish_release through the real alias code against a fake registry."""
+    context = {
+        "operation": "publish",
+        "release_version": version,
+        "git_tag": f"v{version}",
+        "source_commit": SHA,
+        "changelog": f"## [v{version}] - 2026-07-23\n\n- Release.\n",
+    }
+    context_path = tmp_path / "context.json"
+    context_path.write_text(json.dumps(context), encoding="utf-8")
+    monkeypatch.setattr(release_tools, "gitlab_api_from_env", lambda env: (api, {}))
+    monkeypatch.setattr(release_tools, "run", registry.run)
+    return release_tools.publish_release(
+        context_path=context_path,
+        artifacts_dir=tmp_path / "artifacts",
+        crane=Path("crane"),
+        exceptions_path=EXCEPTIONS_PATH,
+        environ=environ or release_env(CI_COMMIT_TAG=f"v{version}"),
+    )
+
+
+def test_publish_copies_the_qualified_digest_to_docker_hub(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = FakeApi(sbom_files=staged_sbom())
+    registry = FakeRegistry()
+
+    manifest = run_registry_publish(tmp_path, monkeypatch, api, registry)
+
+    source = f"{REGISTRY_IMAGE}@{DIGEST}"
+    assert registry.writes == [
+        ("tag", source, "0.2.0"),
+        ("tag", source, "0.2"),
+        ("tag", source, "0"),
+        ("tag", source, "latest"),
+        # Every public write is a digest-addressed copy from the private registry: never a
+        # rebuild, and never a tag reference that could move between resolve and copy.
+        ("copy", source, f"{PUBLIC_REPOSITORY}:0.2.0"),
+        ("copy", source, f"{PUBLIC_REPOSITORY}:0.2"),
+        ("copy", source, f"{PUBLIC_REPOSITORY}:0"),
+        ("copy", source, f"{PUBLIC_REPOSITORY}:latest"),
+    ]
+    for alias in ("0.2.0", "0.2", "0", "latest"):
+        assert registry.tags[f"{PUBLIC_REPOSITORY}:{alias}"] == DIGEST
+    assert manifest["public_aliases"] == [
+        {
+            "name": alias,
+            "reference": f"{PUBLIC_REPOSITORY}:{alias}",
+            "digest": DIGEST,
+            "kind": "immutable" if alias == "0.2.0" else "moving",
+        }
+        for alias in ("0.2.0", "0.2", "0", "latest")
+    ]
+    assert manifest["public_references"] == [
+        {"reference": f"{PUBLIC_REPOSITORY}:0.2.0", "digest": DIGEST}
+    ]
+    assert "docker-token" not in json.dumps(manifest)
+    assert (tmp_path / "artifacts" / "release-manifest.json").read_bytes() == api.files[
+        ("0.2.0", "release-manifest.json")
+    ]
+
+
+def test_publish_retry_writes_nothing_that_is_already_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retry after a complete run converges without a single registry write.
+
+    It is also why the unconfirmed behaviour of Docker Hub's immutable-tag rule on a same-digest
+    re-push cannot fail a retry: an exact match is never pushed again.
+    """
+    api = FakeApi(sbom_files=staged_sbom())
+    registry = FakeRegistry()
+    first = run_registry_publish(tmp_path, monkeypatch, api, registry)
+    registry.writes.clear()
+    uploads = len(api.uploads)
+
+    second = run_registry_publish(tmp_path, monkeypatch, api, registry)
+
+    assert registry.writes == []
+    assert len(api.uploads) == uploads
+    assert second == first
+
+
+def test_publish_completes_a_run_that_stopped_partway_through_docker_hub(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = f"{REGISTRY_IMAGE}@{DIGEST}"
+    api = FakeApi(sbom_files=staged_sbom())
+    registry = FakeRegistry(
+        {
+            f"{REGISTRY_IMAGE}:{alias}": DIGEST
+            for alias in ("0.2.0", "0.2", "0", "latest")
+        }
+        | {f"{PUBLIC_REPOSITORY}:0.2.0": DIGEST}
+    )
+
+    manifest = run_registry_publish(tmp_path, monkeypatch, api, registry)
+
+    assert registry.writes == [
+        ("copy", source, f"{PUBLIC_REPOSITORY}:0.2"),
+        ("copy", source, f"{PUBLIC_REPOSITORY}:0"),
+        ("copy", source, f"{PUBLIC_REPOSITORY}:latest"),
+    ]
+    assert manifest["public_references"] == [
+        {"reference": f"{PUBLIC_REPOSITORY}:0.2.0", "digest": DIGEST}
+    ]
+
+
+def test_publish_stops_before_any_write_when_the_public_version_names_another_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Checked before the private aliases move, because the private X.Y.Z is immutable too.
+
+    Found after them, the release could never complete: the private version alias would already
+    name this digest and the public one another.
+    """
+    api = FakeApi(sbom_files=staged_sbom())
+    registry = FakeRegistry({f"{PUBLIC_REPOSITORY}:0.2.0": TARGET_DIGEST})
+
+    with pytest.raises(release_tools.ReleaseError, match="public release alias .* already points") as raised:
+        run_registry_publish(tmp_path, monkeypatch, api, registry)
+
+    # A first attempt: the private alias does not name this digest, so no earlier-attempt hint.
+    assert "this attempt mutated nothing" in str(raised.value)
+    assert "earlier attempt" not in str(raised.value)
+    assert registry.writes == []
+    assert api.uploads == []
+    assert api.release_calls == []
+
+
+def test_publish_retry_after_a_bad_public_version_copy_names_the_earlier_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The preflight conflict on a retry can be this release's own earlier copy.
+
+    The runbook for a clean preflight conflict says the public tag was written by hand. After an
+    attempt whose X.Y.Z copy failed to verify, that is wrong: the private aliases moved and this
+    release's own copy wrote the public tag. The error has to say so.
+    """
+    api = FakeApi(sbom_files=staged_sbom())
+    registry = FakeRegistry()
+    registry.poisoned[f"{PUBLIC_REPOSITORY}:0.2.0"] = TARGET_DIGEST
+
+    with pytest.raises(release_tools.ReleaseError, match="alias verification failed"):
+        run_registry_publish(tmp_path, monkeypatch, api, registry)
+    registry.writes.clear()
+
+    with pytest.raises(release_tools.ReleaseError, match="earlier attempt of this release"):
+        run_registry_publish(tmp_path, monkeypatch, api, registry)
+
+    assert registry.writes == []
+    for alias in ("0.2.0", "0.2", "0", "latest"):
+        assert registry.tags[f"{REGISTRY_IMAGE}:{alias}"] == DIGEST
+    assert ("0.2.0", "release-manifest.json") not in api.files
+
+
+def test_publish_retry_repairs_a_moving_public_alias_that_failed_to_verify(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unlike X.Y.Z, a moving alias is rewritten on retry, so a recovered registry completes."""
+    api = FakeApi(sbom_files=staged_sbom())
+    registry = FakeRegistry()
+    registry.poisoned[f"{PUBLIC_REPOSITORY}:latest"] = TARGET_DIGEST
+
+    with pytest.raises(release_tools.ReleaseError, match="alias verification failed"):
+        run_registry_publish(tmp_path, monkeypatch, api, registry)
+    assert ("0.2.0", "release-manifest.json") not in api.files
+    registry.writes.clear()
+
+    manifest = run_registry_publish(tmp_path, monkeypatch, api, registry)
+
+    assert registry.writes == [("copy", f"{REGISTRY_IMAGE}@{DIGEST}", f"{PUBLIC_REPOSITORY}:latest")]
+    assert registry.tags[f"{PUBLIC_REPOSITORY}:latest"] == DIGEST
+    assert manifest["public_references"] == [
+        {"reference": f"{PUBLIC_REPOSITORY}:0.2.0", "digest": DIGEST}
+    ]
+
+
+def test_publish_writes_no_manifest_when_a_public_push_is_denied_and_a_retry_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The preflight only proves the token can read, so a denied push surfaces after it.
+
+    By then the private aliases have moved. No manifest, package file, or release record may be
+    written, and a retry once the push works writes only the public tags.
+    """
+    api = FakeApi(sbom_files=staged_sbom())
+    registry = FakeRegistry()
+    registry.copy_error = "DENIED: requested access to the resource is denied"
+
+    with pytest.raises(release_tools.ReleaseError, match="DENIED"):
+        run_registry_publish(tmp_path, monkeypatch, api, registry)
+
+    for alias in ("0.2.0", "0.2", "0", "latest"):
+        assert registry.tags[f"{REGISTRY_IMAGE}:{alias}"] == DIGEST
+        assert f"{PUBLIC_REPOSITORY}:{alias}" not in registry.tags
+    assert api.uploads == []
+    assert api.release_calls == []
+
+    registry.copy_error = None
+    registry.writes.clear()
+    manifest = run_registry_publish(tmp_path, monkeypatch, api, registry)
+
+    source = f"{REGISTRY_IMAGE}@{DIGEST}"
+    assert registry.writes == [
+        ("copy", source, f"{PUBLIC_REPOSITORY}:{alias}") for alias in ("0.2.0", "0.2", "0", "latest")
+    ]
+    assert manifest["public_references"] == [
+        {"reference": f"{PUBLIC_REPOSITORY}:0.2.0", "digest": DIGEST}
+    ]
+
+
+def test_publish_moves_only_the_public_aliases_this_release_is_eligible_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A maintenance release takes its X.Y on Docker Hub and leaves X and latest alone."""
+    api = FakeApi(
+        files={("0.3.0", "release-manifest.json"): json.dumps(release_manifest("0.3.0")).encode()},
+        sbom_files=staged_sbom(),
+    )
+    registry = FakeRegistry(
+        {
+            f"{PUBLIC_REPOSITORY}:0.3.0": TARGET_DIGEST,
+            f"{PUBLIC_REPOSITORY}:0": TARGET_DIGEST,
+            f"{PUBLIC_REPOSITORY}:latest": TARGET_DIGEST,
+        }
+    )
+
+    manifest = run_registry_publish(tmp_path, monkeypatch, api, registry, version="0.2.1")
+
+    assert [alias["name"] for alias in manifest["public_aliases"]] == ["0.2.1", "0.2"]
+    assert registry.tags[f"{PUBLIC_REPOSITORY}:0"] == TARGET_DIGEST
+    assert registry.tags[f"{PUBLIC_REPOSITORY}:latest"] == TARGET_DIGEST
+
+
+def test_publish_fails_when_a_public_copy_does_not_verify(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A registry that stores other bytes than the source manifest is caught by digest.
+
+    No manifest is written, so the receipt can never record an unverified public reference.
+    """
+    api = FakeApi(sbom_files=staged_sbom())
+    registry = FakeRegistry()
+    registry.poisoned[f"{PUBLIC_REPOSITORY}:0.2.0"] = TARGET_DIGEST
+
+    with pytest.raises(release_tools.ReleaseError, match="alias verification failed"):
+        run_registry_publish(tmp_path, monkeypatch, api, registry)
+
+    assert ("0.2.0", "release-manifest.json") not in api.files
+    assert api.release_calls == []
+
+
+@pytest.mark.parametrize("missing", ["DOCKERHUB_USERNAME", "DOCKERHUB_TOKEN"])
+def test_publish_requires_docker_hub_credentials_before_any_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing: str
+) -> None:
+    """A job that lost the environment scope fails before it touches either registry."""
+    api = FakeApi(sbom_files=staged_sbom())
+    registry = FakeRegistry()
+    monkeypatch.setattr(
+        release_tools,
+        "crane_login",
+        lambda *_args: pytest.fail("no registry login without Docker Hub credentials"),
+    )
+    environ = release_env()
+    del environ[missing]
+
+    with pytest.raises(release_tools.ReleaseError, match=f"{missing} is required"):
+        run_registry_publish(tmp_path, monkeypatch, api, registry, environ=environ)
+
+    assert registry.writes == []
+    assert api.uploads == []
+
+
+def test_publish_retry_rejects_a_manifest_whose_public_references_differ(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The durable manifest is write-once, so a retry must agree with it, public part included."""
+    existing = release_manifest("0.2.0") | {"public_references": []}
+    api = FakeApi(
+        files={("0.2.0", "release-manifest.json"): json.dumps(existing).encode()},
+        sbom_files=staged_sbom(),
+    )
+    registry = FakeRegistry()
+
+    with pytest.raises(release_tools.ReleaseError, match="conflicting public_references"):
+        run_registry_publish(tmp_path, monkeypatch, api, registry)
+
+    assert api.release_calls == []
+
+
+def test_apply_alias_copies_across_registries_from_a_pinned_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = FakeRegistry()
+    monkeypatch.setattr(release_tools, "run", registry.run)
+
+    record = release_tools.apply_alias(
+        Path("crane"),
+        PUBLIC_REPOSITORY,
+        DIGEST,
+        "latest",
+        immutable=False,
+        copy_from=f"{REGISTRY_IMAGE}@{DIGEST}",
+    )
+
+    assert registry.writes == [("copy", f"{REGISTRY_IMAGE}@{DIGEST}", f"{PUBLIC_REPOSITORY}:latest")]
+    assert record == {
+        "name": "latest",
+        "reference": f"{PUBLIC_REPOSITORY}:latest",
+        "digest": DIGEST,
+        "kind": "moving",
+    }
+
+
+@pytest.mark.parametrize(
+    "copy_from",
+    [f"{REGISTRY_IMAGE}:{SHA}", f"{REGISTRY_IMAGE}@{TARGET_DIGEST}"],
+)
+def test_apply_alias_refuses_a_source_not_pinned_to_the_release_digest(
+    monkeypatch: pytest.MonkeyPatch, copy_from: str
+) -> None:
+    """A tag source could move between the preflight and the copy; a digest source cannot."""
+    monkeypatch.setattr(
+        release_tools,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("nothing may be resolved or written"),
+    )
+
+    with pytest.raises(release_tools.ReleaseError, match="not pinned"):
+        release_tools.apply_alias(
+            Path("crane"),
+            PUBLIC_REPOSITORY,
+            DIGEST,
+            "0.2.0",
+            immutable=True,
+            copy_from=copy_from,
+        )
+
+
+def test_public_references_absent_from_an_older_manifest_are_empty() -> None:
+    """Releases from before Docker Hub promotion authorized no public image."""
+    manifest = release_manifest("0.3.0")
+
+    assert release_tools.validated_public_references(manifest, release_tools.Version(0, 3, 0)) == []
+
+
+def test_public_references_round_trip_from_a_published_manifest() -> None:
+    reference = {"reference": f"{PUBLIC_REPOSITORY}:0.2.0", "digest": DIGEST}
+    manifest = release_manifest("0.2.0") | {"public_references": [reference]}
+
+    assert release_tools.validated_public_references(
+        manifest, release_tools.Version(0, 2, 0)
+    ) == [reference]
+
+
+@pytest.mark.parametrize(
+    "references",
+    [
+        {"reference": f"{PUBLIC_REPOSITORY}:0.2.0", "digest": DIGEST},
+        [{"reference": f"{PUBLIC_REPOSITORY}:0.2.0", "digest": TARGET_DIGEST}],
+        [{"reference": f"{PUBLIC_REPOSITORY}:0.2.1", "digest": DIGEST}],
+        [{"reference": f"{PUBLIC_REPOSITORY}:latest", "digest": DIGEST}],
+        [{"reference": "docker.io/someone-else/robot-dev-team:0.2.0", "digest": DIGEST}],
+        [{"reference": f"{PUBLIC_REPOSITORY}:0.2.0", "digest": DIGEST, "note": "extra"}],
+        ["docker.io/mcknly/robot-dev-team:0.2.0"],
+        # Each entry is individually exact; only the count catches a duplicate.
+        [{"reference": f"{PUBLIC_REPOSITORY}:0.2.0", "digest": DIGEST}] * 2,
+    ],
+)
+def test_public_references_fail_closed_on_anything_else(references: Any) -> None:
+    """The receipt is what a consumer checks a pull against, so nothing unexpected is copied."""
+    manifest = release_manifest("0.2.0") | {"public_references": references}
+
+    with pytest.raises(release_tools.ReleaseError, match="public"):
+        release_tools.validated_public_references(manifest, release_tools.Version(0, 2, 0))
 
 
 def sbom_env(**overrides: str) -> dict[str, str]:
@@ -1774,7 +2256,8 @@ def test_yank_links_the_sbom_only_when_the_release_has_one(
         api = FakeApi(files)
         monkeypatch.setattr(release_tools, "gitlab_api_from_env", lambda env: (api, {}))
         monkeypatch.setattr(release_tools, "crane_login", lambda *args: None)
-        monkeypatch.setattr(release_tools, "crane_digest", lambda *args: DIGEST)
+        # The moving aliases already belong to a newer release; this test is about the links.
+        monkeypatch.setattr(release_tools, "crane_digest", lambda *args: THIRD_DIGEST)
         release_tools.yank_release(
             context_path=write_yank_context(tmp_path, version="0.2.0"),
             artifacts_dir=tmp_path / "artifacts",
@@ -1914,6 +2397,565 @@ def test_yank_rejects_cross_line_replacement_before_writing(
         )
 
 
+THIRD_DIGEST = f"sha256:{'c' * 64}"
+
+
+def promoted_manifest(
+    version: str,
+    digest: str,
+    *,
+    moving: Sequence[str],
+    public: bool = True,
+) -> dict[str, Any]:
+    """A manifest as publish_release writes it, with or without the Docker Hub promotion."""
+
+    def records(repository: str) -> list[dict[str, str]]:
+        return [
+            {
+                "name": name,
+                "reference": f"{repository}:{name}",
+                "digest": digest,
+                "kind": "immutable" if name == version else "moving",
+            }
+            for name in (version, *moving)
+        ]
+
+    manifest = release_manifest(version, digest=digest, aliases=records(REGISTRY_IMAGE))
+    if public:
+        manifest["public_aliases"] = records(PUBLIC_REPOSITORY)
+        manifest["public_references"] = [
+            {"reference": f"{PUBLIC_REPOSITORY}:{version}", "digest": digest}
+        ]
+    return manifest
+
+
+def run_registry_yank(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    api: FakeApi,
+    registry: FakeRegistry,
+    *,
+    version: str,
+    environ: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Drive yank_release through the real reconciliation code against a fake registry."""
+    monkeypatch.setattr(release_tools, "gitlab_api_from_env", lambda env: (api, {}))
+    monkeypatch.setattr(release_tools, "run", registry.run)
+    return release_tools.yank_release(
+        context_path=write_yank_context(tmp_path, version=version),
+        artifacts_dir=tmp_path / "artifacts",
+        crane=Path("crane"),
+        environ=environ or release_env(CI_COMMIT_TAG=f"v{version}-yank"),
+    )
+
+
+def yank_api(*manifests: dict[str, Any]) -> FakeApi:
+    """Durable state for a yank: every manifest, and the yanked release's changelog."""
+    files = {
+        (manifest["release_version"], "release-manifest.json"): json.dumps(manifest).encode()
+        for manifest in manifests
+    }
+    for manifest in manifests:
+        files[(manifest["release_version"], "changelog.md")] = b"## notes\n"
+    return FakeApi(files)
+
+
+def test_yank_repoints_docker_hub_aliases_to_the_previous_public_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = yank_api(
+        promoted_manifest("0.4.1", DIGEST, moving=("0.4", "0", "latest")),
+        promoted_manifest("0.4.0", TARGET_DIGEST, moving=()),
+    )
+    registry = FakeRegistry(
+        {f"{repository}:{alias}": DIGEST for repository in (REGISTRY_IMAGE, PUBLIC_REPOSITORY)
+         for alias in ("0.4.1", "0.4", "0", "latest")}
+        | {f"{REGISTRY_IMAGE}:0.4.0": TARGET_DIGEST, f"{PUBLIC_REPOSITORY}:0.4.0": TARGET_DIGEST}
+    )
+
+    record = run_registry_yank(tmp_path, monkeypatch, api, registry, version="0.4.1")
+
+    # Private first, then Docker Hub, each retagging inside its own repository. Nothing is copied.
+    assert registry.writes == [
+        ("tag", f"{REGISTRY_IMAGE}@{TARGET_DIGEST}", "0.4"),
+        ("tag", f"{REGISTRY_IMAGE}@{TARGET_DIGEST}", "0"),
+        ("tag", f"{REGISTRY_IMAGE}@{TARGET_DIGEST}", "latest"),
+        ("tag", f"{PUBLIC_REPOSITORY}@{TARGET_DIGEST}", "0.4"),
+        ("tag", f"{PUBLIC_REPOSITORY}@{TARGET_DIGEST}", "0"),
+        ("tag", f"{PUBLIC_REPOSITORY}@{TARGET_DIGEST}", "latest"),
+    ]
+    # The bad version tag stays, for auditability and because Docker Hub keeps it immutable.
+    assert registry.tags[f"{PUBLIC_REPOSITORY}:0.4.1"] == DIGEST
+    assert record["public_alias_targets"] == {"0": "0.4.0", "0.4": "0.4.0", "latest": "0.4.0"}
+    assert record["public_aliases_removed"] == []
+    assert json.loads(api.files[("0.4.1", "yank-record.json")]) == record
+    notes = (tmp_path / "artifacts" / "yanked-release-notes.md").read_text()
+    assert "- `latest` now tracks v0.4.0" in notes
+    assert "- Docker Hub `latest` now tracks v0.4.0" in notes
+
+
+def test_yank_never_copies_a_private_only_release_to_docker_hub(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no public fallback the owner deletes the tags, and a retry then converges.
+
+    The private fallback (0.3.0) predates promotion, so it was never held to the public-surface
+    checks. It must not reach Docker Hub through a yank, so the job reconciles the private side,
+    fails naming the exact tags to delete, writes no yank record, and keeps GitHub untouched.
+    """
+    api = yank_api(
+        promoted_manifest("0.3.1", DIGEST, moving=("0.3", "0", "latest")),
+        promoted_manifest("0.3.0", TARGET_DIGEST, moving=(), public=False),
+    )
+    registry = FakeRegistry(
+        {f"{repository}:{alias}": DIGEST for repository in (REGISTRY_IMAGE, PUBLIC_REPOSITORY)
+         for alias in ("0.3.1", "0.3", "0", "latest")}
+        | {f"{REGISTRY_IMAGE}:0.3.0": TARGET_DIGEST}
+    )
+
+    with pytest.raises(release_tools.ReleaseError, match="cannot delete tags") as raised:
+        run_registry_yank(tmp_path, monkeypatch, api, registry, version="0.3.1")
+
+    for alias in ("0.3", "0", "latest"):
+        assert f"{PUBLIC_REPOSITORY}:{alias}" in str(raised.value)
+        assert registry.tags[f"{REGISTRY_IMAGE}:{alias}"] == TARGET_DIGEST
+        assert registry.tags[f"{PUBLIC_REPOSITORY}:{alias}"] == DIGEST
+    assert all(write[0] == "tag" and write[1].startswith(REGISTRY_IMAGE) for write in registry.writes)
+    assert ("0.3.1", "yank-record.json") not in api.files
+    assert api.release_calls == []
+
+    # The owner deletes the three tags in Docker Hub; the retry writes nothing and completes.
+    for alias in ("0.3", "0", "latest"):
+        del registry.tags[f"{PUBLIC_REPOSITORY}:{alias}"]
+    registry.writes.clear()
+
+    record = run_registry_yank(tmp_path, monkeypatch, api, registry, version="0.3.1")
+
+    assert registry.writes == []
+    assert record["alias_targets"] == {"0": "0.3.0", "0.3": "0.3.0", "latest": "0.3.0"}
+    assert record["public_alias_targets"] == {}
+    assert record["public_aliases_removed"] == ["0", "0.3", "latest"]
+    notes = (tmp_path / "artifacts" / "yanked-release-notes.md").read_text()
+    assert "- Docker Hub `latest` is no longer published" in notes
+    assert [call["action"] for call in api.release_calls] == ["create"]
+
+
+def test_yank_repoints_what_it_can_before_naming_the_tags_to_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An X.Y with no public patch to fall back to does not stop `latest` and `X` from moving."""
+    api = yank_api(
+        promoted_manifest("0.5.0", DIGEST, moving=("0.5", "0", "latest")),
+        promoted_manifest("0.4.0", TARGET_DIGEST, moving=()),
+    )
+    # Privately, 0.5 already names another digest, so the private side leaves it alone rather
+    # than refusing; only Docker Hub's 0.5 lacks a fallback.
+    registry = FakeRegistry(
+        {f"{REGISTRY_IMAGE}:{alias}": DIGEST for alias in ("0.5.0", "0", "latest")}
+        | {f"{REGISTRY_IMAGE}:0.5": THIRD_DIGEST}
+        | {f"{PUBLIC_REPOSITORY}:{alias}": DIGEST for alias in ("0.5.0", "0.5", "0", "latest")}
+        | {f"{REGISTRY_IMAGE}:0.4.0": TARGET_DIGEST, f"{PUBLIC_REPOSITORY}:0.4.0": TARGET_DIGEST}
+    )
+
+    with pytest.raises(release_tools.ReleaseError, match="cannot delete tags") as raised:
+        run_registry_yank(tmp_path, monkeypatch, api, registry, version="0.5.0")
+
+    assert f"{PUBLIC_REPOSITORY}:0.5" in str(raised.value)
+    assert f"{PUBLIC_REPOSITORY}:latest" not in str(raised.value)
+    assert registry.tags[f"{PUBLIC_REPOSITORY}:latest"] == TARGET_DIGEST
+    assert registry.tags[f"{PUBLIC_REPOSITORY}:0"] == TARGET_DIGEST
+    assert registry.tags[f"{PUBLIC_REPOSITORY}:0.5"] == DIGEST
+    assert ("0.5.0", "yank-record.json") not in api.files
+
+
+@pytest.mark.parametrize("problem", ["missing-credentials", "outage"])
+def test_docker_hub_trouble_never_holds_back_the_private_withdrawal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, problem: str
+) -> None:
+    """The private side completes, the job fails, and no yank record means a retry converges."""
+    api = yank_api(
+        promoted_manifest("0.4.1", DIGEST, moving=("latest",)),
+        promoted_manifest("0.4.0", TARGET_DIGEST, moving=()),
+    )
+    registry = FakeRegistry(
+        {f"{REGISTRY_IMAGE}:latest": DIGEST, f"{PUBLIC_REPOSITORY}:latest": DIGEST}
+        | {f"{REGISTRY_IMAGE}:0.4.0": TARGET_DIGEST, f"{PUBLIC_REPOSITORY}:0.4.0": TARGET_DIGEST}
+    )
+    environ = release_env(CI_COMMIT_TAG="v0.4.1-yank")
+    if problem == "missing-credentials":
+        del environ["DOCKERHUB_TOKEN"]
+        expected = "DOCKERHUB_TOKEN is required"
+    else:
+        registry.unreachable = PUBLIC_REPOSITORY
+        expected = "connection refused"
+
+    with pytest.raises(release_tools.ReleaseError, match=expected):
+        run_registry_yank(tmp_path, monkeypatch, api, registry, version="0.4.1", environ=environ)
+
+    assert registry.tags[f"{REGISTRY_IMAGE}:latest"] == TARGET_DIGEST
+    assert registry.tags[f"{PUBLIC_REPOSITORY}:latest"] == DIGEST
+    assert ("0.4.1", "yank-record.json") not in api.files
+    assert api.release_calls == []
+
+    registry.unreachable = None
+    record = run_registry_yank(tmp_path, monkeypatch, api, registry, version="0.4.1")
+
+    assert record["alias_targets"] == {"latest": "0.4.0"}
+    assert record["public_alias_targets"] == {"latest": "0.4.0"}
+
+
+def test_yank_of_a_never_promoted_release_never_contacts_docker_hub(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Withdrawing a pre-promotion release needs neither Docker Hub credentials nor a lookup."""
+    api = yank_api(
+        promoted_manifest("0.3.1", DIGEST, moving=("latest",), public=False),
+        promoted_manifest("0.3.0", TARGET_DIGEST, moving=(), public=False),
+    )
+    registry = FakeRegistry({f"{REGISTRY_IMAGE}:latest": DIGEST, f"{REGISTRY_IMAGE}:0.3.0": TARGET_DIGEST})
+    environ = release_env(CI_COMMIT_TAG="v0.3.1-yank")
+    del environ["DOCKERHUB_USERNAME"]
+    del environ["DOCKERHUB_TOKEN"]
+
+    record = run_registry_yank(tmp_path, monkeypatch, api, registry, version="0.3.1", environ=environ)
+
+    assert record["alias_targets"] == {"latest": "0.3.0"}
+    assert record["public_alias_targets"] == {}
+    assert not any(reference.startswith("docker.io/") for reference in registry.lookups)
+
+
+def test_yank_rejects_an_invalid_public_alias_record_after_the_private_side(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Durable state is not trusted input: a public alias at another digest is never acted on."""
+    bad = promoted_manifest("0.4.1", DIGEST, moving=("latest",))
+    bad["public_aliases"][1]["digest"] = THIRD_DIGEST
+    api = yank_api(bad, promoted_manifest("0.4.0", TARGET_DIGEST, moving=()))
+    registry = FakeRegistry(
+        {f"{REGISTRY_IMAGE}:latest": DIGEST, f"{PUBLIC_REPOSITORY}:latest": DIGEST}
+        | {f"{REGISTRY_IMAGE}:0.4.0": TARGET_DIGEST, f"{PUBLIC_REPOSITORY}:0.4.0": TARGET_DIGEST}
+    )
+
+    with pytest.raises(release_tools.ReleaseError, match="invalid public alias"):
+        run_registry_yank(tmp_path, monkeypatch, api, registry, version="0.4.1")
+
+    assert registry.tags[f"{REGISTRY_IMAGE}:latest"] == TARGET_DIGEST
+    assert registry.tags[f"{PUBLIC_REPOSITORY}:latest"] == DIGEST
+    assert ("0.4.1", "yank-record.json") not in api.files
+
+
+def both_registries(tags: dict[str, str]) -> dict[str, str]:
+    """The same alias state in the private registry and on Docker Hub."""
+    return {
+        f"{repository}:{alias}": digest
+        for repository in (REGISTRY_IMAGE, PUBLIC_REPOSITORY)
+        for alias, digest in tags.items()
+    }
+
+
+def test_yank_checks_live_aliases_not_only_the_recorded_ones(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A release inherits aliases after publication, above all through an earlier yank.
+
+    0.4.1 took only `0.4` when published. Yanking 0.5.0 then moved `latest` and `0` to it on both
+    registries. Yanking 0.4.1 must find those by live lookup and move them too, or the yank record
+    and the GitHub withdrawal follow while both registries still serve the yanked image.
+    """
+    api = yank_api(
+        promoted_manifest("0.5.0", THIRD_DIGEST, moving=("0.5", "0", "latest")),
+        promoted_manifest("0.4.1", DIGEST, moving=("0.4",)),
+        promoted_manifest("0.4.0", TARGET_DIGEST, moving=()),
+    )
+    api.files[("0.5.0", "yank-record.json")] = b"{}"
+    registry = FakeRegistry(
+        both_registries(
+            {"0.4.1": DIGEST, "0.4": DIGEST, "0": DIGEST, "latest": DIGEST}
+            | {"0.4.0": TARGET_DIGEST, "0.5.0": THIRD_DIGEST, "0.5": THIRD_DIGEST}
+        )
+    )
+
+    record = run_registry_yank(tmp_path, monkeypatch, api, registry, version="0.4.1")
+
+    for repository in (REGISTRY_IMAGE, PUBLIC_REPOSITORY):
+        for alias in ("0.4", "0", "latest"):
+            assert registry.tags[f"{repository}:{alias}"] == TARGET_DIGEST
+    assert record["alias_targets"] == {"0": "0.4.0", "0.4": "0.4.0", "latest": "0.4.0"}
+    assert record["public_alias_targets"] == {"0": "0.4.0", "0.4": "0.4.0", "latest": "0.4.0"}
+
+
+def test_yank_does_not_trust_an_incomplete_public_alias_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A promoted manifest that lists only its version tag still gets every live alias checked."""
+    bad = promoted_manifest("0.4.1", DIGEST, moving=("0.4", "0", "latest"))
+    bad["public_aliases"] = bad["public_aliases"][:1]
+    api = yank_api(bad, promoted_manifest("0.4.0", TARGET_DIGEST, moving=()))
+    registry = FakeRegistry(
+        both_registries({"0.4.1": DIGEST, "0.4": DIGEST, "0": DIGEST, "latest": DIGEST, "0.4.0": TARGET_DIGEST})
+    )
+
+    record = run_registry_yank(tmp_path, monkeypatch, api, registry, version="0.4.1")
+
+    assert record["public_alias_targets"] == {"0": "0.4.0", "0.4": "0.4.0", "latest": "0.4.0"}
+    assert registry.tags[f"{PUBLIC_REPOSITORY}:latest"] == TARGET_DIGEST
+
+
+def test_yank_refuses_public_fields_that_disagree_about_promotion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """References without alias records are unexplained state: fail after the private side."""
+    bad = promoted_manifest("0.4.1", DIGEST, moving=("latest",))
+    bad["public_aliases"] = []
+    api = yank_api(bad, promoted_manifest("0.4.0", TARGET_DIGEST, moving=()))
+    registry = FakeRegistry(both_registries({"latest": DIGEST, "0.4.0": TARGET_DIGEST}))
+
+    with pytest.raises(release_tools.ReleaseError, match="disagree"):
+        run_registry_yank(tmp_path, monkeypatch, api, registry, version="0.4.1")
+
+    assert registry.tags[f"{REGISTRY_IMAGE}:latest"] == TARGET_DIGEST
+    assert registry.tags[f"{PUBLIC_REPOSITORY}:latest"] == DIGEST
+    assert ("0.4.1", "yank-record.json") not in api.files
+
+
+def test_yank_skips_a_fallback_that_publishes_the_same_image(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """0.4.1 shares the yanked 0.4.2's digest, so the aliases roll back to 0.4.0 instead.
+
+    Retagging to 0.4.1 would record a rollback while every alias still served the yanked bytes.
+    """
+    api = yank_api(
+        promoted_manifest("0.4.2", DIGEST, moving=("0.4", "0", "latest")),
+        promoted_manifest("0.4.1", DIGEST, moving=()),
+        promoted_manifest("0.4.0", TARGET_DIGEST, moving=()),
+    )
+    registry = FakeRegistry(
+        both_registries(
+            {"0.4.2": DIGEST, "0.4.1": DIGEST, "0.4": DIGEST, "0": DIGEST, "latest": DIGEST}
+            | {"0.4.0": TARGET_DIGEST}
+        )
+    )
+
+    record = run_registry_yank(tmp_path, monkeypatch, api, registry, version="0.4.2")
+
+    assert record["alias_targets"] == {"0": "0.4.0", "0.4": "0.4.0", "latest": "0.4.0"}
+    assert record["public_alias_targets"] == {"0": "0.4.0", "0.4": "0.4.0", "latest": "0.4.0"}
+    for repository in (REGISTRY_IMAGE, PUBLIC_REPOSITORY):
+        assert registry.tags[f"{repository}:latest"] == TARGET_DIGEST
+
+
+def test_yank_leaves_aliases_with_a_newer_live_release_of_the_same_image(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A yank withdraws a version, not an image: 0.4.1 is live and its tags stay its own."""
+    api = yank_api(
+        promoted_manifest("0.4.0", DIGEST, moving=("0.4", "0", "latest")),
+        promoted_manifest("0.4.1", DIGEST, moving=("0.4", "0", "latest")),
+    )
+    registry = FakeRegistry(
+        both_registries({"0.4.0": DIGEST, "0.4.1": DIGEST, "0.4": DIGEST, "0": DIGEST, "latest": DIGEST})
+    )
+
+    record = run_registry_yank(tmp_path, monkeypatch, api, registry, version="0.4.0")
+
+    assert registry.writes == []
+    assert record["aliases_kept"] == {"0": "0.4.1", "0.4": "0.4.1", "latest": "0.4.1"}
+    assert record["public_aliases_kept"] == {"0": "0.4.1", "0.4": "0.4.1", "latest": "0.4.1"}
+    assert record["public_aliases_removed"] == []
+    notes = (tmp_path / "artifacts" / "yanked-release-notes.md").read_text()
+    assert "- Docker Hub `latest` stays with v0.4.1, a newer release of the same image" in notes
+
+
+def test_yank_records_but_does_not_recreate_a_deleted_tag_of_a_newer_same_image_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`latest` belongs to live 0.4.1, which ships the same image, and someone deleted it.
+
+    Recreating it would republish a tag for a release this yank is not withdrawing, so it stays
+    missing, but every alias the release recorded still appears somewhere in the record.
+    """
+    api = yank_api(
+        promoted_manifest("0.4.0", DIGEST, moving=("0.4", "0", "latest")),
+        promoted_manifest("0.4.1", DIGEST, moving=("0.4", "0", "latest")),
+    )
+    registry = FakeRegistry(both_registries({"0.4.0": DIGEST, "0.4.1": DIGEST, "0.4": DIGEST, "0": DIGEST}))
+
+    record = run_registry_yank(tmp_path, monkeypatch, api, registry, version="0.4.0")
+
+    assert registry.writes == []
+    assert f"{PUBLIC_REPOSITORY}:latest" not in registry.tags
+    assert record["public_aliases_kept"] == {"0": "0.4.1", "0.4": "0.4.1"}
+    assert record["public_aliases_skipped"] == ["latest"]
+    assert record["aliases_skipped"] == ["latest"]
+    assert record["public_aliases_removed"] == []
+
+
+def test_yank_names_tags_for_deletion_when_only_older_releases_share_the_image(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no distinct public image to fall back to, the same-digest 0.4.1 is not a fallback.
+
+    The private side has the private-only 0.4.0, so it completes; Docker Hub needs the owner.
+    """
+    api = yank_api(
+        promoted_manifest("0.4.2", DIGEST, moving=("0.4", "0", "latest")),
+        promoted_manifest("0.4.1", DIGEST, moving=()),
+        promoted_manifest("0.4.0", TARGET_DIGEST, moving=(), public=False),
+    )
+    registry = FakeRegistry(
+        both_registries({"0.4.2": DIGEST, "0.4.1": DIGEST, "0.4": DIGEST, "0": DIGEST, "latest": DIGEST})
+        | {f"{REGISTRY_IMAGE}:0.4.0": TARGET_DIGEST}
+    )
+
+    with pytest.raises(release_tools.ReleaseError, match="cannot delete tags"):
+        run_registry_yank(tmp_path, monkeypatch, api, registry, version="0.4.2")
+
+    assert registry.tags[f"{REGISTRY_IMAGE}:latest"] == TARGET_DIGEST
+    assert registry.tags[f"{PUBLIC_REPOSITORY}:latest"] == DIGEST
+    assert ("0.4.2", "yank-record.json") not in api.files
+
+
+def test_private_yank_refuses_when_every_fallback_publishes_the_same_image(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = yank_api(
+        promoted_manifest("0.4.1", DIGEST, moving=("0.4", "0", "latest"), public=False),
+        promoted_manifest("0.4.0", DIGEST, moving=(), public=False),
+    )
+    registry = FakeRegistry(
+        {f"{REGISTRY_IMAGE}:{alias}": DIGEST for alias in ("0.4.1", "0.4.0", "0.4", "0", "latest")}
+    )
+
+    with pytest.raises(release_tools.ReleaseError, match="with a different image"):
+        run_registry_yank(tmp_path, monkeypatch, api, registry, version="0.4.1")
+
+    assert registry.writes == []
+
+
+def test_yank_recreates_an_absent_recorded_alias_that_has_a_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Absent means removed only when there is nothing to fall back to.
+
+    `latest` was recorded and is missing, and 0.4.0 is compatible, so it is recreated there.
+    `0` was never this release's and is missing, so it is not this yank's to recreate.
+    """
+    api = yank_api(
+        promoted_manifest("0.4.1", DIGEST, moving=("0.4", "latest")),
+        promoted_manifest("0.4.0", TARGET_DIGEST, moving=()),
+    )
+    registry = FakeRegistry(
+        both_registries({"0.4.1": DIGEST, "0.4": DIGEST, "0.4.0": TARGET_DIGEST})
+        | {f"{REGISTRY_IMAGE}:latest": DIGEST}
+    )
+
+    record = run_registry_yank(tmp_path, monkeypatch, api, registry, version="0.4.1")
+
+    assert registry.tags[f"{PUBLIC_REPOSITORY}:latest"] == TARGET_DIGEST
+    assert f"{PUBLIC_REPOSITORY}:0" not in registry.tags
+    assert record["public_alias_targets"] == {"0.4": "0.4.0", "latest": "0.4.0"}
+    assert record["public_aliases_removed"] == []
+    notes = (tmp_path / "artifacts" / "yanked-release-notes.md").read_text()
+    assert "no longer published" not in notes
+
+
+YANKED = release_tools.Version(0, 4, 2)
+
+
+@pytest.mark.parametrize(
+    ("candidates", "expected"),
+    [
+        # A distinct image in the line wins over a newer-but-older-than-yanked same image.
+        ({(0, 4, 1): DIGEST, (0, 4, 0): TARGET_DIGEST}, ("repoint", (0, 4, 0))),
+        # A newer live release of the same image keeps the alias.
+        ({(0, 4, 3): DIGEST, (0, 4, 0): TARGET_DIGEST}, ("keep", (0, 4, 3))),
+        # A newer release with another image is the normal fallback.
+        ({(0, 4, 3): THIRD_DIGEST}, ("repoint", (0, 4, 3))),
+        # Only older releases of the same image: nothing to fall back to.
+        ({(0, 4, 1): DIGEST}, ("none", None)),
+        ({}, ("none", None)),
+    ],
+)
+def test_select_fallback_prefers_a_different_image(
+    candidates: dict[tuple[int, int, int], str], expected: tuple[str, Any]
+) -> None:
+    action, target = release_tools.select_fallback(
+        "0.4",
+        yanked=YANKED,
+        bad_digest=DIGEST,
+        candidates={release_tools.Version(*key): digest for key, digest in candidates.items()},
+    )
+
+    assert (action, None if target is None else (target.major, target.minor, target.patch)) == expected
+
+
+def test_public_aliases_absent_from_an_older_manifest_are_empty() -> None:
+    assert release_tools.validated_public_aliases(
+        release_manifest("0.3.0"), release_tools.Version(0, 3, 0)
+    ) == []
+
+
+def test_public_aliases_round_trip_from_a_published_manifest() -> None:
+    manifest = promoted_manifest("0.4.1", DIGEST, moving=("0.4", "latest"))
+
+    assert release_tools.validated_public_aliases(
+        manifest, release_tools.Version(0, 4, 1)
+    ) == manifest["public_aliases"]
+
+
+def _alias(name: str, **overrides: Any) -> dict[str, Any]:
+    record = {
+        "name": name,
+        "reference": f"{PUBLIC_REPOSITORY}:{name}",
+        "digest": DIGEST,
+        "kind": "immutable" if name == "0.4.1" else "moving",
+    }
+    record.update(overrides)
+    return record
+
+
+@pytest.mark.parametrize(
+    "records",
+    [
+        {"0.4.1": "not-a-list"},
+        ["latest"],
+        [_alias("latest", digest=TARGET_DIGEST)],
+        [_alias("latest", reference=f"{REGISTRY_IMAGE}:latest")],
+        [_alias("latest", kind="immutable")],
+        [_alias("0.4.1", kind="moving")],
+        [_alias("0.3")],
+        [_alias("1")],
+        [_alias("latest"), _alias("latest")],
+        [_alias("latest", note="extra")],
+        [_alias("latest") | {"name": ["latest"]}],
+    ],
+)
+def test_public_aliases_fail_closed_on_anything_else(records: Any) -> None:
+    """A yank repoints whatever this names, so nothing outside the version's own tags passes."""
+    manifest = release_manifest("0.4.1") | {"public_aliases": records}
+
+    with pytest.raises(release_tools.ReleaseError, match="public_aliases|invalid public alias"):
+        release_tools.validated_public_aliases(manifest, release_tools.Version(0, 4, 1))
+
+
+def test_public_fallbacks_are_only_releases_published_to_docker_hub(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    corrupt = promoted_manifest("0.4.0", TARGET_DIGEST, moving=())
+    corrupt["public_references"][0]["digest"] = THIRD_DIGEST
+    released = {
+        release_tools.Version(0, 5, 0): promoted_manifest("0.5.0", DIGEST, moving=()),
+        release_tools.Version(0, 4, 0): corrupt,
+        release_tools.Version(0, 3, 0): promoted_manifest(
+            "0.3.0", THIRD_DIGEST, moving=(), public=False
+        ),
+    }
+
+    assert release_tools.public_release_digests(released) == {release_tools.Version(0, 5, 0): DIGEST}
+    assert "ignoring unreadable public record 0.4.0" in capsys.readouterr().err
+
+
 def test_download_tool_verifies_and_extracts_binary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1975,7 +3017,7 @@ def test_unfixed_high_is_recorded_without_blocking() -> None:
     """The day-one rule is fix-state aware, and the evidence for tightening it must survive.
 
     This is deliberately not `--only-fixed` on the scanner: the finding stays in the report and
-    is listed in the evaluation, so #60 can be argued from the durable record.
+    is listed in the evaluation, so tightening it can be argued from the durable record.
     """
     evaluation = evaluate(
         scan_report(
@@ -2162,7 +3204,7 @@ def test_shipped_exception_file_parses_and_covers_the_accepted_findings() -> Non
     staying in the image, so a class entry on stdlib@go1.26.5 would be unbounded over every
     future Go stdlib disclosure against the same build.
 
-    The CPython ten that shipped alongside them (#66) are gone: the 3.14 runtime migration
+    The CPython ten that shipped alongside them are gone: the 3.14 runtime migration
     cleared every one, so they were deleted rather than re-scoped. Asserting the exact count
     here is what makes an entry's arrival or departure a decision rather than a diff nobody
     reads.
@@ -2178,8 +3220,8 @@ def test_shipped_exception_file_parses_and_covers_the_accepted_findings() -> Non
     for entry in exceptions:
         by_issue.setdefault(entry.tracking_issue, set()).add(entry.artifact_scope)
 
-    assert by_issue == {"#71": {("stdlib", "go1.26.5", "go-module")}}
-    assert sum(entry.tracking_issue == "#71" for entry in exceptions) == 5
+    assert by_issue == {"glab-go-toolchain": {("stdlib", "go1.26.5", "go-module")}}
+    assert sum(entry.tracking_issue == "glab-go-toolchain" for entry in exceptions) == 5
 
 
 def test_report_must_bind_to_the_released_digest() -> None:
@@ -2245,7 +3287,7 @@ def test_report_without_an_image_source_is_rejected() -> None:
 def test_eol_distro_is_recorded_rather_than_swallowed() -> None:
     """Under-reporting is the one failure mode a CVE gate cannot detect on its own.
 
-    The runtime left bookworm in #59, so this is now driven by an explicit Debian 12 report
+    The runtime has left bookworm, so this is now driven by an explicit Debian 12 report
     rather than the default fixture. That is the case that has to keep working: scan evidence
     is digest-keyed and outlives the image it describes, so a yank or a forensic
     re-evaluation can still hand this evaluator a report taken against a bookworm release.
@@ -2253,7 +3295,7 @@ def test_eol_distro_is_recorded_rather_than_swallowed() -> None:
     evaluation = evaluate(scan_report(distro={"name": "debian", "version": "12.15"}))
 
     assert evaluation["distro"]["end_of_life"] is True
-    assert "#59" in evaluation["distro"]["note"]
+    assert "migrated to Debian 13" in evaluation["distro"]["note"]
     assert "WARNING" in release_tools.summarize_evaluation(evaluation)
 
 
@@ -2839,7 +3881,7 @@ def test_offline_evaluate_runs_the_policy_without_a_scanner(tmp_path: Path) -> N
         '    owner: "@cavin"\n'
         '    rationale: "No fix on the branch we ship."\n'
         f'    expires: "{(dt.date.today() + dt.timedelta(days=30)).isoformat()}"\n'
-        '    tracking_issue: "#66"\n',
+        '    tracking_issue: "cpython-312-no-fix"\n',
         encoding="utf-8",
     )
 
@@ -3014,8 +4056,8 @@ def test_shadow_diagnostic_ignores_non_blocking_findings() -> None:
 def test_offline_evaluate_catches_an_exception_that_no_longer_matches(tmp_path: Path) -> None:
     """Moving an excepted artifact invalidates every entry scoped to it, at once.
 
-    #66 is the case that proved this in anger: the 3.14 hop retired all ten CPython entries in
-    one commit. The same shape is queued behind #71, so the report here is the shipped file's
+    CPython 3.12 is the case that proved this in anger: the 3.14 hop retired all ten CPython
+    entries in one commit. The same shape is queued behind the glab toolchain bump, so the report here is the shipped file's
     remaining artifact rebuilt on a patched toolchain. It has to be discoverable before the
     merge, because neither the image build nor the scan runs on a merge request.
     """
@@ -3144,7 +4186,8 @@ def test_yank_succeeds_with_no_scan_evidence_and_no_scanner(
     )
     monkeypatch.setattr(release_tools, "gitlab_api_from_env", lambda env: (api, {}))
     monkeypatch.setattr(release_tools, "crane_login", lambda *args: None)
-    monkeypatch.setattr(release_tools, "crane_digest", lambda *args: DIGEST)
+    # The moving aliases already belong to a newer release; this test is about the scanner.
+    monkeypatch.setattr(release_tools, "crane_digest", lambda *args: THIRD_DIGEST)
     monkeypatch.setattr(
         release_tools,
         "download_tool",
@@ -3178,7 +4221,8 @@ def test_yank_links_the_scan_evidence_only_when_the_release_has_it(
     api = FakeApi(files)
     monkeypatch.setattr(release_tools, "gitlab_api_from_env", lambda env: (api, {}))
     monkeypatch.setattr(release_tools, "crane_login", lambda *args: None)
-    monkeypatch.setattr(release_tools, "crane_digest", lambda *args: DIGEST)
+    # The moving aliases already belong to a newer release; this test is about the links.
+    monkeypatch.setattr(release_tools, "crane_digest", lambda *args: THIRD_DIGEST)
 
     release_tools.yank_release(
         context_path=write_yank_context(tmp_path, version="0.2.0"),

@@ -45,7 +45,7 @@ if [[ "${1:-}" != "--as-app" && "$(id -u)" -eq 0 ]]; then
   chown -R appuser:appuser /home/appuser /work 2>/dev/null || true
 
   # Drop privileges and re-exec. setpriv replaces gosu, whose Debian build is a static Go
-  # binary linked against an EOL Go 1.19.8 toolchain that Debian will not rebuild (#58).
+  # binary linked against an EOL Go 1.19.8 toolchain that Debian will not rebuild.
   # Three details are load-bearing, none of them stylistic:
   #  1. No --reset-env. setpriv would otherwise clear the environment before exec, and the
   #     *_AGENT_GITLAB_TOKEN loop below walks `env` -- it would find nothing and write no

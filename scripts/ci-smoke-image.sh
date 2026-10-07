@@ -34,6 +34,19 @@ smoke_gidonly_gid=4242
 build_uid="$(docker run --rm --entrypoint id "$image_ref" -u appuser)"
 build_gid="$(docker run --rm --entrypoint id "$image_ref" -g appuser)"
 
+# The source pointer for the image's Debian packages is a label, and a label is only worth
+# publishing if it names the snapshot the image was actually built from. The unit test pins the
+# Dockerfile's text; this checks the built config, which is what a consumer's `docker inspect` reads.
+want_snapshot="$(sed -n 's/^ARG DEBIAN_SNAPSHOT=//p' Dockerfile)"
+got_snapshot="$(docker inspect --format \
+  '{{ index .Config.Labels "com.mcknly.robot-dev-team.debian-snapshot" }}' "$image_ref")"
+if [ -z "$want_snapshot" ] || [ "$got_snapshot" != "$want_snapshot" ]; then
+  echo "[ci-smoke] ERROR: image label debian-snapshot is '${got_snapshot}'," \
+    "expected the Dockerfile's DEBIAN_SNAPSHOT '${want_snapshot}'" >&2
+  exit 1
+fi
+echo "[ci-smoke] debian-snapshot label matches DEBIAN_SNAPSHOT (${got_snapshot})"
+
 cleanup() {
   docker rm -f \
     "$positive_container" "$negative_container" "$gidonly_container" \
@@ -251,7 +264,7 @@ fi
 echo "[ci-smoke] Privilege drop verified on the served process."
 
 # The image contract the drop depends on. gosu's absence is asserted because its Debian build is
-# the EOL-Go-toolchain CVE source this replaced (#58); a reintroduction would be silent.
+# the EOL-Go-toolchain CVE source this replaced; a reintroduction would be silent.
 echo "[ci-smoke] Asserting the privilege-drop image contract..."
 docker exec "$positive_container" sh -c '
 set -eu

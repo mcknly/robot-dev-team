@@ -220,7 +220,7 @@ ensure_safe_directory() {
 # <parent>/.git/modules/<name>. --git-common-dir resolves the shared directory
 # in both shapes, which is where per-repository config and the credential store
 # belong. The old `-d .git` predicate simply failed on both and dropped to the
-# global path from inside a perfectly writable checkout (issue #43).
+# global path from inside a perfectly writable checkout.
 #
 # Scope note: this makes the store and helper *shared across every worktree of
 # a repository*, because `git config --local` from a linked worktree writes

@@ -13,20 +13,24 @@ Robot Dev Team releases are authorized by annotated, protected Git tags and prom
 was already built and smoke-tested by the protected `main` pipeline. A release pipeline never
 rebuilds the image.
 
-The current automated release track is private, stable SemVer only, and `linux/amd64` only. Preview
-releases and an `edge` channel are unsupported. The public Docker Hub target is provisioned and its
-credential can be tested through the manual probe below, but stable public promotion remains gated
-on #8. Once a release has completed, a manual job projects the released tree onto the public
-GitHub repository (see [Publish to GitHub](#publish-to-github)); it builds and qualifies nothing,
-and the private GitLab pipeline remains the sole build root, as decided in #76.
+The automated release track is stable SemVer only and `linux/amd64` only. Preview releases and an
+`edge` channel are unsupported. `release_publish` promotes each stable release to the private
+registry and copies the same digest to Docker Hub (see [Authorize and publish](#authorize-and-publish)),
+and a yank reconciles both registries (see
+[Yank and emergency rollback](#yank-and-emergency-rollback)). Once a release has completed, a manual
+job projects the released tree onto the public GitHub repository (see
+[Publish to GitHub](#publish-to-github)); it builds and qualifies nothing, and the private GitLab
+pipeline remains the sole build root: the public image is the digest that pipeline built, scanned,
+and qualified, never a second build from the public tree.
 
 ## Docker Hub target and credential probe
 
 The sole public container target is `docker.io/mcknly/robot-dev-team`; GHCR is not a publication
 target. `mcknly` is a personal Docker namespace for this personal, non-commercial open-source
 project. Its personal access token is therefore account-scoped rather than repository-scoped. That
-broader scope is an explicit interim exception recorded in #52 and must be revisited if the project
-becomes an organizational or commercial publication or moves to a Docker organization.
+broader scope is an explicit interim exception, recorded with the credential, and must be revisited
+if the project becomes an organizational or commercial publication or moves to a Docker
+organization.
 
 The project stores the Docker credentials as protected project-level CI/CD variables with the
 environment scope `dockerhub-publication`:
@@ -34,25 +38,25 @@ environment scope `dockerhub-publication`:
 - `DOCKERHUB_USERNAME` is `mcknly`. It is protected but visible because GitLab cannot mask values
   shorter than eight characters and the public username is not a secret.
 - `DOCKERHUB_TOKEN` is protected, masked, and hidden. It must have read/write access but does not
-  need delete access. Ownership, rotation, and revocation records stay in #52, never in the
-  repository.
+  need delete access. Ownership, rotation, and revocation records stay in the private tracker,
+  never in the repository.
 
 Neither key may also exist with the default `*` (All) scope. Define both on the project, not the
 `mcknly-labs` group: environment scope on group variables is not available on GitLab CE.
 
 Job `rules:` do not limit a protected variable. GitLab passes it to every job that runs on a
 protected ref, including `validate` and `compat_python_floor` on the shared `rdt-validate` runner,
-so rules alone cannot keep the account-wide token away from those jobs. The environment scope
-does: a job receives the credentials only when it runs on a protected ref **and** declares
-`environment: dockerhub-publication`. `dockerhub_credential_probe` declares it with
-`action: prepare`, which applies the scoped variables without recording a deployment. GitLab CE has
-no protected-environment approval step, so the set of jobs that declare the environment is the
-remaining boundary. `test_only_approved_jobs_receive_scoped_credentials` fails if any job,
-template, or `default:` other than the approved set declares it, and holds `github-publication`
-to the same rule. The future public release and yank
-jobs in #8 and #53 must be added to that set explicitly, declare the same environment, and keep
-their strict protected-tag rules. If the variable scope and the job ever disagree, the probe fails
-on the missing `DOCKERHUB_USERNAME` before any login.
+so rules alone cannot keep the account-wide token away from those jobs. The environment scope does:
+a job receives the credentials only when it runs on a protected ref **and** declares
+`environment: dockerhub-publication`. `dockerhub_credential_probe`, `release_publish`, and
+`release_yank` declare it with `action: prepare`, which applies the scoped variables without
+recording a deployment. GitLab CE has no protected-environment approval step, so the set of jobs
+that declare the environment is the remaining boundary. `test_only_approved_jobs_receive_scoped_credentials`
+fails if any job, template, or `default:` other than the approved set declares it, and holds
+`github-publication` to the same rule. A new holder must be added to that set explicitly and keep a
+strict protected-ref rule. If the variable scope and a job ever disagree, the probe and
+`release_publish` fail on the missing `DOCKERHUB_USERNAME` before any login. `release_yank`
+completes the private withdrawal first and then fails the same way.
 
 After provisioning or rotating the token, open a protected `main` pipeline whose
 `build_smoke_publish` and `security_scan` jobs succeeded and run the manual
@@ -70,12 +74,12 @@ at the expected digest. Reading a tag on a public repository needs no push right
 current token. After the copy it resolves the destination and fails unless both registries report
 the same manifest digest. Its `dockerhub-probe.json` artifact records the source, the destination
 in the `docker.io/...` form above, the pipeline, the job, and the verified digest, without
-credentials. This is a write-path acceptance test only; it does not publish a stable release and
-does not replace #8's idempotent multi-registry promotion implementation.
+credentials. This is a write-path acceptance test only; it does not publish a stable release.
+Stable releases reach Docker Hub through `release_publish`.
 
 The CI token intentionally cannot clean up the public tag. After recording the successful job URL
-and digest in #52, the Docker repository owner must delete the probe tag in Docker Hub under
-**My Hub > Repositories > robot-dev-team > Tags**. Confirm that the exact
+and digest in the private credential record, the Docker repository owner must delete the probe tag
+in Docker Hub under **My Hub > Repositories > robot-dev-team > Tags**. Confirm that the exact
 `ci-credential-probe-<pipeline-id>` tag is selected before deleting it. Do not delete any SemVer or
 moving release alias.
 
@@ -84,15 +88,68 @@ mismatch, the tag can still exist: find it on the `Docker Hub probe cleanup targ
 job log and delete it the same way. Retrying a job whose tag already exists fails by design; delete
 the tag first, then retry, or probe from a newer `main` pipeline.
 
-Docker Hub supports beta immutable-tag rules. Before the first public stable release, configure
-**Specific tags are immutable** with `^[0-9]+\.[0-9]+\.[0-9]+$`; keep `X.Y`, `X`, `latest`, and
-the `ci-credential-probe-*` namespace mutable. The code in #8 and #53 must still preflight existing
-state, reject digest conflicts, and verify every write rather than treating the beta registry
-setting as the release contract.
+Docker Hub supports beta immutable-tag rules. The repository has **Specific tags are immutable**
+set with `^[0-9]+\.[0-9]+\.[0-9]+$` (configured by the repository owner on 2026-10-06), so `X.Y`,
+`X`, `latest`, and the `ci-credential-probe-*` namespace stay mutable. Keep it that way: a pattern
+that matched a moving alias would make every later release fail when it moves that alias. The
+release code does not treat the beta setting as the contract. It checks existing state before
+writing, rejects a digest conflict on `X.Y.Z`, and verifies every write by digest. A tag that
+already names the release digest is never pushed again, so a retry does not depend on how the rule
+treats a same-digest re-push, which Docker's documentation does not say.
 
-Public consumer metadata and the `linux/amd64` disclosure remain tracked in #54 and #55. The
-Docker Hub overview must link the public source surface before #8 performs the first stable public
-promotion.
+### Docker Hub repository overview
+
+The Docker Hub overview is edited by hand by the Docker Hub repository owner; no job or merge
+request can write it. It is kept short and sends readers to the source. Whatever else the owner
+writes, it must carry three things before the first stable public promotion: the public source
+link, how to verify an image (by digest, since it is not signed), and the corresponding-source
+pointer, which `docs/LICENSE_REVIEW.md` relies on the registry page to repeat. The other facts a
+consumer needs live in the source the overview links to: `linux/amd64`-only support and boot-time
+egress are in the README Quick Start, and the SBOM scope is in `SECURITY.md`. Paste the block
+below, below any project description the owner adds, and re-paste it whenever this block changes.
+Keep the canonical hostname out of it.
+
+```markdown
+**Source:** https://github.com/mcknly/robot-dev-team -- start with the README's Quick Start, and
+check out the git tag `vX.Y.Z` for the image tag `X.Y.Z` you pull.
+
+**Verify by digest; images are not signed.** There is no cosign signature, by decision. Each
+GitHub Release carries `public-release-receipt.json`, which lists the image reference and digest
+that release published. Check the digest you pulled against it, and pin `@sha256:...` in
+production. See `docs/MIRRORING.md` ("Verifying what you pulled").
+
+**Corresponding source.** `docs/LICENSE_REVIEW.md` ("Corresponding source for the image") says
+where the source of every redistributed package is. In short: every Debian package's source is on
+snapshot.debian.org by source name and version, and the image labels
+`com.mcknly.robot-dev-team.debian-snapshot` and `com.mcknly.robot-dev-team.debian-source`
+(`docker inspect`) name the snapshot the build installed from. Source for the MPL-2.0 components
+compiled into `uv` and `glab` is on crates.io and the Go module proxy at the versions the image
+ships.
+```
+
+### Boot egress check before the first public promotion
+
+`docs/DEPENDENCY_MANAGEMENT.md` ("Boot-time egress") publishes the hosts a container needs at
+start. They were observed by reading the installers and following redirects, not by booting behind
+a firewall. Before the first public promotion to Docker Hub, and again whenever an installer
+changes, qualify the table against that exact digest. Every step uses a **fresh** container
+(`docker compose up --force-recreate`, or after `docker compose down`): a restarted container
+keeps the harnesses its earlier start installed, and the Antigravity installer then skips its
+download entirely, so a restart proves nothing about egress.
+
+1. Start a fresh container with the stock routes behind a default-deny egress policy that allows
+   only the hosts in the table's first three rows. It must reach `uvicorn` (`GET /health`
+   answers).
+2. Block those hosts and start a fresh container. The entrypoint must exit 1 with
+   `harness binaries not on PATH after install` before the port opens. Allow for the connect
+   timeouts: a dropping firewall makes this take minutes, not seconds.
+3. Comment out one default agent's routes and start a fresh container. It must start without that
+   agent's hosts.
+4. Repeat step 1 for every optional harness whose row claims a working allowlist.
+
+Record every denied destination the logs show and update the table in the same merge request. A
+row whose vendor step was not traced -- today, `claude install` and `agy install` -- stays marked
+unverified rather than promising a complete allowlist.
 
 ## Release contract
 
@@ -185,7 +242,11 @@ Open a release-preparation merge request targeting `main`. It must:
 2. Add a fresh empty `[Unreleased]` section to `docs/CHANGELOG.md`.
 3. Rename the prior `[Unreleased]` content to `[vX.Y.Z] - YYYY-MM-DD` and finalize it. The dated
    section must carry the notes: it becomes the GitLab Release description and the durable
-   `changelog.md` package file, and an empty one fails the release contract test.
+   `changelog.md` package file, and an empty one fails the release contract test. The date is
+   the release-preparation date. Do not correct it after the merge if the tag slips: a date-only
+   commit on `main` builds a new digest, and every pre-tag check would have to run again against
+   it. Nothing checks the date against the tag, and the public release dates come from the
+   tagger time.
 4. Include any final code or documentation required by the release.
 5. Bring `security/license-evidence.json` up to date with the latest protected `main` digest,
    using the refresh commands in `docs/LICENSE_REVIEW.md` section 7, so that `classify` exits 0
@@ -244,9 +305,15 @@ Every step fails closed rather than passing on nothing:
   - a scan whose detect-secrets version, plugins or filters differ from the baseline's, including
     a missing or extra `--exclude-files` pattern.
 
-`hosts` accepts a host with a port, and it refuses a URL. To scan a tree that `extract` did not
-produce, such as a merged filesystem or a positive control, pass `--no-extraction`. Then only an
-empty scan fails, because there is no layer record to count against.
+`hosts` accepts a host name with a port, and an IPv6 address bare or in brackets, with or
+without a port. It refuses anything it would otherwise search for as a literal that no bare
+occurrence of the host contains: a URL, user info, whitespace anywhere in the value, a character
+outside letters, digits, `-`, `_` and `.`, an empty label or a leading or trailing dot or hyphen,
+a multi-colon value that is not an IPv6 address, and an IPv6 address with a zone id, an
+IPv4-mapped or dotted one, and `::`. An IPv6 address is searched in its compressed spelling only. The error never
+repeats the refused value. To scan a tree that `extract` did not produce, such as a merged
+filesystem or a positive control, pass `--no-extraction`. Then only an empty scan fails, because
+there is no layer record to count against.
 
 Then run the license review against the same digest: the full procedure in
 `docs/LICENSE_REVIEW.md` section 7, not a shortcut, because it is what binds the result to the
@@ -263,17 +330,33 @@ All three must exit 0. Record the results on the release-prep MR. What a failure
 - **Hits confined to a component a merged MR knowingly bumped**, lost or unclassified, are
   expected. uv's own SBOM contributes most of the baseline, so a uv bump loses its old hashes and
   adds new ones. A `TOOL_RELEASES` pin change moves the checksums in `scripts/release_tools.py`.
+  A regenerated `notices/` tree moves the per-file SHA-256 values in the two
+  `/usr/share/doc/{glab,uv}/notices.json` manifests, which detect-secrets reports as hex strings.
   Those hits are handled the same way: read them, refresh the baseline from the new `main` digest
   in a follow-up MR, and name the bump in that MR. They are not a trigger for the full audit
   (`docs/SANITIZATION_REPORT.md` section 12). Refresh from the kept scan with:
   `python -m scripts.image_audit baseline --scan <audit directory>/secrets-scan.json --digest
-  "$DIGEST" --output security/image-secrets-baseline.json`.
+  "$DIGEST" --output security/image-secrets-baseline.json`. `baseline` records only the profile
+  the runbook scan produces, because every later release is held to it: the detect-secrets
+  version in `DETECT_SECRETS_VERSION`, exactly the plugins in `PLUGINS`, and filters drawn only
+  from `DEFAULT_FILTERS` plus the one metadata exclusion (all in `scripts/image_audit.py`). It
+  compares whole records, parameters included, so it refuses `--only-verified` and a retuned
+  plugin as well as a custom filter or a word list. A detect-secrets bump that changes the default
+  records makes `baseline` refuse until those constants are updated. Update them in the same
+  reviewed MR as the version pin in this runbook, and name the changed records there.
 - **An unresolved or needs-review license entry** means the release-prep MR did not cover a
   component change. Fix the evidence in a follow-up MR and tag the `main` commit that follows
   instead.
 
 These are release-preparation reviews, not pipeline gates. A CI gate is deferred until a few
 releases show how often the evidence actually changes (see `docs/LICENSE_REVIEW.md` section 8).
+
+Last, prove the Docker Hub push right: play `dockerhub_credential_probe` on that same `main`
+pipeline, record the job URL, and delete the probe tag (see
+[Docker Hub target and credential probe](#docker-hub-target-and-credential-probe)). The release's
+own preflight logs in and reads Docker Hub, but a read needs no push right and `crane auth login`
+never contacts the registry. So a revoked or read-only token, or a Docker Hub outage, first shows
+up at the release's first `crane copy`. By then the private aliases have already moved.
 
 ## Authorize and publish
 
@@ -291,17 +374,35 @@ The tag pipeline then:
 1. Runs the normal validation suite and validates the release contract.
 2. Resolves the existing full-SHA image digest from the registry.
 3. Fetches the SBOM staged under that exact digest and rejects the release if it is missing, is
-   not an SPDX-2.3 document, or does not name the image being released.
-4. Uses checksum-pinned Crane to add the eligible aliases to that exact digest.
-5. Verifies every alias by resolving it back from the registry.
-6. Publishes `release-manifest.json`, `changelog.md`, and `sbom.spdx.json` under the Generic
-   Package `robot-dev-team-release/X.Y.Z`.
-7. Creates or updates the GitLab Release and links the durable package files.
+   not an SPDX-2.3 document, or does not name the image being released. The staged scan evidence
+   is verified at the same point (see [The vulnerability gate](#the-vulnerability-gate)).
+4. Logs in to Docker Hub and rejects the release if `docker.io/mcknly/robot-dev-team:X.Y.Z`
+   already names a different digest.
+5. Uses checksum-pinned Crane to add the eligible aliases to that exact digest in the private
+   registry.
+6. Copies the same digest from the private registry to `X.Y.Z` and the same eligible moving aliases
+   on Docker Hub (`crane copy`, never a rebuild). A tag that already names the digest is left alone.
+7. Verifies every alias in both registries by resolving it back to the release digest.
+8. Publishes `release-manifest.json`, `changelog.md`, `sbom.spdx.json`, and the scan evidence under
+   the Generic Package `robot-dev-team-release/X.Y.Z`. The manifest's `public_aliases` lists every
+   verified Docker Hub tag, and `public_references` holds the immutable `X.Y.Z` reference with its
+   digest. `github_release_publish` later copies `public_references` into the public receipt.
+9. Creates or updates the GitLab Release and links the durable package files.
 
-Step 3 precedes step 4 deliberately, and the ordering is a safety property rather than a
-convenience: the SBOM is fetched in the only window where the digest is known and no alias has
-moved and no package file has been written, so a missing or unusable SBOM aborts the release
-with nothing mutated. Tests assert it directly by failing on any alias write in those cases.
+Steps 3 and 4 precede step 5 deliberately, and the ordering is a safety property rather than a
+convenience: they run in the only window where the digest is known and no alias has moved and no
+package file has been written, so a missing or unusable SBOM, failing scan evidence, or a
+conflicting public `X.Y.Z` aborts the release with nothing mutated. Tests assert it directly by
+failing on any alias write in those cases. The Docker Hub check has to come first because the
+private `X.Y.Z` is immutable too: found after the private aliases moved, a public conflict would
+leave a release that no retry could finish. The check reads; it cannot prove the token may push,
+which is why the credential probe runs before tagging.
+
+The manifest is written only after every public tag has verified, so a receipt can never list a
+reference that was not checked. Docker Hub gets exactly the moving aliases the private registry
+gets, computed by the same non-regression rule from the private release record. A maintenance
+release therefore takes its own `X.Y` on Docker Hub and leaves `X` and `latest` with the newer
+line.
 
 The GitLab Release is written through the project Releases API with `CI_JOB_TOKEN` -- the same
 client that writes the durable package files -- so the release image needs no `git` executable and
@@ -309,8 +410,10 @@ no CLI to identify the project: it is `CI_PROJECT_ID`, never discovered from the
 is sent with the release, so the API can attach a release to the protected tag but can never create
 a tag of its own.
 
-The release job is serialized and idempotent. A retry accepts an existing `X.Y.Z` alias or package
-file only when its content matches. Release asset links are reconciled the same way: a link whose
+The release job is serialized and idempotent. A retry accepts an existing `X.Y.Z` alias, in either
+registry, or package file only when its content matches, and a retry after a partial Docker Hub
+copy writes only the tags still missing. The durable manifest is write-once, so a retry must agree
+with it on the public references too. Release asset links are reconciled the same way: a link whose
 name and URL already match is left alone, a missing link is added, and a name or URL that is
 already used for something else fails closed. Conflicting immutable state fails closed.
 
@@ -329,11 +432,26 @@ the prefix difference above:
 - The full-SHA image alias -- the full 40-character commit SHA, not a `sha-` short form.
 - The version image alias `X.Y.Z` -- bare, not `vX.Y.Z`.
 - The digest-pinned image.
+- The Docker Hub tag `docker.io/mcknly/robot-dev-team:X.Y.Z`, and the manifest's
+  `public_references`. Without `--platform`, `crane copy` pushes the source manifest unchanged, so
+  this is the same digest as the private one, not merely an equivalent image.
+
+Check the public side from a machine with no Docker Hub credentials, so the check also proves the
+repository is public:
+
+```bash
+crane digest docker.io/mcknly/robot-dev-team:X.Y.Z
+docker pull docker.io/mcknly/robot-dev-team@sha256:<digest>
+```
 
 Deployments should record and use the `image_reference` value from `release-manifest.json`. Keep
 the host-specific compose override that pins it in `docker-compose.release.yml`, which is
 git-ignored: it names a registry and a deployment-specific digest that should not reach the
-repository.
+repository. The README Quick Start's public path is different and uses the auto-merged
+`docker-compose.override.yml` (`image: docker.io/mcknly/robot-dev-team:X.Y.Z`,
+`platform: linux/amd64`, and `build: !reset null`). A host that keeps both should set `image:` in
+only one of them: once `-f` or `COMPOSE_FILE` names files, Compose loads the override only if it is
+listed, and the last listed file's `image:` wins.
 
 ## Publish to GitHub
 
@@ -369,6 +487,13 @@ Failure handling:
 - **`outbound host gate`** names the file or object that carries a canonical host. Nothing was
   published. The tagged tree cannot change, so fix it on `main` and release a new version; this
   version stays canonical-only.
+- **`the changelog section for X.Y.Z cites the private tracker`** lists the issue or
+  merge-request shorthand, pipeline or job numbers, or tracker paths in that version's notes.
+  Nothing was published. Every tag cut before `test_no_tracked_file_cites_the_private_tracker`
+  existed fails here by design; do not play the job on those. Like the host gate, it is fixed on
+  `main` and in a new release; this version stays canonical-only. The exception is `v0.3.0`, which
+  was projected before this check existed. It is already public with those citations, and a retry
+  on its tag now stops here without changing anything public.
 - **A rejected atomic push** usually means a pull request was merged into `rc` while the job ran.
   Retry; the job re-reads `rc`.
 - **Anything reported as conflicting** -- a public tag or commit that is not byte-identical to what
@@ -425,8 +550,12 @@ The digest-scoped package accrues one version per protected `main` commit and is
 generic packages have no expiry policy. That is a deliberate cost, and it is what makes an SBOM
 retrievable for a digest that was built but never released.
 
-The SBOM describes the built image. Harnesses that `docker-entrypoint.sh` installs at boot are
-outside it.
+**Scope.** The SBOM describes the built image: the Debian packages from the pinned snapshot,
+CPython, the application virtualenv, `glab`, `uv`/`uvx`, the installed license notices, and the
+application. The harness CLIs that `docker-entrypoint.sh` installs at boot are **outside it**, and
+outside the vulnerability gate too, which scans the same digest. They are received from their
+vendors under the vendors' terms, which is also why `docs/LICENSE_REVIEW.md` excludes them. The
+reason they are installed at boot is recorded in `docs/SYSTEM_DESIGN.md` section 7.
 
 Both ends of this path check that the document's top-level `name` is the image reference that was
 scanned, `<registry image>:<commit sha>`, which `scripts/generate-sbom.sh` sets with
@@ -437,6 +566,48 @@ image. Keep `--source-name` on any hand-run rescan.
 Releases published before this workflow existed -- `v0.2.0` and `v0.2.1` -- carry no SBOM package
 file and no SBOM release link. Their images are unchanged; only the durable record is absent.
 Yanking one of them does not invent a link for a file that is not there.
+
+### Inventory a running container
+
+To inventory a **running** container, wait for the entrypoint to finish (`GET /health` answers),
+then scan the container's filesystem with the same digest-pinned Syft `scripts/generate-sbom.sh`
+uses -- not a `syft` on your `$PATH`. The result is not a release artifact, so there is no
+`--source-name` to check.
+
+This does **not** inventory the harness CLIs. Their vendor binaries carry no package metadata
+Syft reads, so a scan of a container with every harness installed adds only Pi's Node runtime.
+Harnesses track latest and are installed at boot, so no inventory of them is published.
+
+Export the filesystem; never `docker commit` the container. A commit records the container's
+configuration, including every variable Compose injected from `.env` -- the agent GitLab tokens
+and `GITLAB_WEBHOOK_SECRET` -- and `docker image save` then writes that configuration into the
+tarball. `docker export` carries the filesystem only, does not pause the container, and leaves out
+the contents of volumes and bind mounts, so the host credential directories are not in it.
+
+```bash
+(
+  set -euo pipefail
+  scratch="$(mktemp -d)"   # mode 0700: private to you
+  trap 'chmod -R u+w "$scratch"; rm -rf "$scratch"' EXIT   # deleted however the scan ends
+  mkdir "$scratch/rootfs"
+  # Harnesses land in ~/.local, which is container-local, so the export includes them.
+  docker export robot-dev-team | tar -x -C "$scratch/rootfs"
+  docker run --rm -v "$scratch/rootfs:/rootfs:ro" \
+    anchore/syft:v1.42.2@sha256:15952b4306fd990724afaaf7f1c71fcd03546b89fbf6f2d32b0be5f81e3ef431 \
+    dir:/rootfs --base-path /rootfs --output spdx-json > rdt-running.spdx.json
+)
+```
+
+**The export still holds secrets**: treat the scratch directory as a credential store, which is
+why the recipe keeps it private and deletes it on exit. Leaving out bind mounts does not leave out
+everything sensitive. The entrypoint writes a `glab-token` under `~/.<agent>/` for every agent
+token in `.env`, and only the directories you mount are left out. Each dispatch also leaves the
+agent's GitLab token in the container-local `~/.config/glab-cli/` (the `glab` configuration, and
+the fallback git credential store used outside a repository). The SBOM itself lists packages and
+file paths, not file contents.
+
+This is a different inventory from the release SBOM, not a more complete copy of it: it varies
+from one start to the next, and nothing about it is reproducible or bound to a release.
 
 ## The vulnerability gate
 
@@ -605,6 +776,40 @@ with "relies on exception ... which expired on ...", the fix is to renew or remo
   patch version. Do not delete a link that points at a durable package file of that same release.
 - If `X.Y.Z` already points to another digest or a durable package file conflicts, stop and
   investigate. Never overwrite or delete the evidence.
+- If `release_publish` stops with `public release alias docker.io/mcknly/robot-dev-team:X.Y.Z
+  already points to ...`, Docker Hub already has that version at another digest, and that attempt
+  mutated nothing. Read the rest of the message, because there are two cases:
+  - *"this attempt mutated nothing"* alone: the private `X.Y.Z` does not name the release digest,
+    so no attempt of this release has moved anything. Nothing in this repository writes a SemVer
+    tag to Docker Hub outside this job, so the tag was written by hand or by a release of the same
+    version from a different commit. Establish which before going further.
+  - *"an earlier attempt of this release moved the private aliases"*: an earlier attempt copied
+    `X.Y.Z`, failed to verify it (next bullet), and left the private aliases moved with no
+    manifest. Read that attempt's log. Until a manifest exists, the release cannot be yanked
+    either.
+
+  In both cases the immutable-tag rule means only the Docker Hub repository owner could remove the
+  tag, and that would replace a public version people may already have pulled. Publish the
+  correction as a higher patch version instead.
+- If it stops with `alias verification failed for docker.io/...`, the public tag resolved to
+  another digest after the copy. Without `--platform`, `crane copy` pushes the source manifest
+  unchanged, so that is unexplained registry state. The manifest is not written, so the receipt
+  cannot record the bad tag. Inspect it with `crane manifest docker.io/mcknly/robot-dev-team:<alias>`
+  first. What a retry does depends on the alias. For `X.Y.Z`, the retry stops at the preflight
+  with the earlier-attempt message above and writes nothing. For a moving alias (`X.Y`, `X`,
+  `latest`), the retry copies it again, and if the registry now stores the right bytes the release
+  completes.
+- If it stops inside `crane copy` to `docker.io/...` (`DENIED`, `UNAUTHORIZED`, `TOOMANYREQUESTS`,
+  or a timeout), the push itself failed. The private aliases have already moved, but no manifest,
+  package file, or GitLab Release was written, so the release cannot be yanked yet. Restore the
+  token's write access, wait out the rate limit or outage, then retry `release_publish` in the
+  same pipeline. It skips every tag that is already in place and writes only the missing public
+  tags. Running the credential probe before tagging (see
+  [Prepare a release](#prepare-a-release)) is what keeps this case rare.
+- If it stops with `DOCKERHUB_USERNAME is required` or `DOCKERHUB_TOKEN is required`, the job no
+  longer receives the environment-scoped variables. Nothing was mutated. Restore the job's
+  `environment: dockerhub-publication` or the variables' scope (see
+  [Docker Hub target and credential probe](#docker-hub-target-and-credential-probe)) and retry.
 
 ## Yank and emergency rollback
 
@@ -622,26 +827,124 @@ git push gitlab v0.2.0-yank
 
 The protected tag is the authorization boundary; pipeline variables cannot select the release,
 replacement, reason, or operator. The job derives the bad version and reason from the tag, obtains
-the actual job user from GitLab, and recomputes each moving alias from the highest compatible
-non-yanked release. It refuses the operation before making changes if an alias still points to the
-bad digest and has no compatible replacement. An alias already moved by a newer release is left
-untouched. Every change is verified before the job writes an immutable `yank-record.json` and
-marks the GitLab Release as withdrawn.
+the actual job user from GitLab, and resolves all three of the version's moving aliases (`X.Y`, `X`,
+and `latest`) from the registry. It does not rely on the manifest's list, because a release also
+inherits aliases after publication, above all when an earlier yank fell back to it. Only an alias
+that names the yanked digest is acted on, and an alias already moved by a newer release is left
+untouched. Each one goes to a fallback chosen by digest, not only by version:
+
+- **The newest compatible release with a different image.** Two releases can share a digest, and
+  retagging to one of them would record a rollback while still serving the yanked bytes.
+- **Kept, if the newest compatible release is newer than the yanked one and publishes the same
+  image.** A yank withdraws a version, not an image, and that tag belongs to a release that is
+  still current. If the image itself is the problem, yank every version that publishes it.
+- **None otherwise.** The job refuses before making changes, because the private registry holds
+  every earlier release, so no compatible release with a different image exists. Publish a
+  corrected higher patch release first.
+
+A release that was promoted to Docker Hub has its Docker Hub aliases reconciled next, by the rules
+in [Docker Hub during a yank](#docker-hub-during-a-yank). Every change in both registries is
+verified before the job writes an immutable `yank-record.json` and marks the GitLab Release as
+withdrawn. The record lists, per registry, what each alias now tracks (`alias_targets`), which
+stayed with a newer release of the same image (`aliases_kept`), and which were left alone or
+removed.
 
 `github_release_withdraw` then runs automatically. It reads the reason from the immutable
-`yank-record.json` rather than from an artifact. If the version was published to GitHub, it
-renames that release `[WITHDRAWN] Robot Dev Team vX.Y.Z`, prepends the reason, and moves GitHub's
-"latest" marker to the highest release left; the public tag, commit, and assets stay as the record
-of what was published. It is a no-op for a version that was never published, and it fails --
-pointing back at `github_release_publish` -- when the public tag exists without a published
-release, since that is a publication that stopped partway (see "Publish to GitHub"). The reason is the one
-free-text input on this path, so it is held to the outbound host gate differently from everything
-else: a reason that names the canonical instance is **withheld** from the public notice rather
-than failing the job, because the yank tag cannot be re-cut and a failure would leave the public
-release looking current. Write the reason by role and it is published as written.
+`yank-record.json` rather than from an artifact. If the version was published to GitHub, it renames
+that release `[WITHDRAWN] Robot Dev Team vX.Y.Z`, prepends the reason, and moves GitHub's "latest"
+marker to the highest release left; the public tag, commit, and assets stay as the record of what
+was published. It is a no-op for a version that was never published, and it fails -- pointing back
+at `github_release_publish` -- when the public tag exists without a published release, since that is
+a publication that stopped partway (see "Publish to GitHub"). The reason is the one free-text input
+on this path, so it is held to the outbound host gate differently from everything else: a reason
+that names the canonical instance is **withheld** from the public notice rather than failing the
+job, because the yank tag cannot be re-cut and a failure would leave the public release looking
+current. A reason that cites the private tracker -- an issue or merge-request shorthand, a note
+anchor, or a pipeline or job number -- is withheld the same way, with its own placeholder, because
+on GitHub that shorthand points at an unrelated issue or at nothing. Write the reason by role and in
+full, and it is published as written. The changelog section the notice appends gets the same
+treatment. If it cites the tracker, the notice carries a placeholder instead, and the `changelog.md`
+asset stays as published. Publication already refuses such notes, so this only happens to a release
+published before that check existed. `v0.3.0` is one, and withdrawing it completes normally.
 
 If no compatible durable release exists, disable deployment and publish a corrected higher patch
 release before withdrawing the bad release; do not make a SemVer alias point outside its line.
 
 Deprecation alone does not move or delete image tags. Record it in the changelog and GitLab Release
 notes and name the recommended replacement.
+
+### Docker Hub during a yank
+
+When the yanked release was promoted (its manifest carries `public_references`), the job then
+resolves `X.Y`, `X`, and `latest` on Docker Hub. It applies the same digest-aware fallback rule with
+one restriction: **a Docker Hub alias falls back only to a release that was itself published to
+Docker Hub**, one whose manifest carries a valid `public_references`. Releases from before promotion
+have a private image only, and were never held to the public-surface checks (the license notices,
+the private-tracker cleanup, and the hostname scan of image layers), so a yank never copies one to
+Docker Hub. Repointing is a `crane tag` within the Docker Hub repository, and every alias is
+verified by digest. Only an alias that still names the yanked digest is written, and the bad
+`X.Y.Z` stays, as the immutable-tag rule requires anyway.
+
+`public_aliases` is still validated, and it must agree with `public_references` about whether the
+release was promoted. It no longer decides which tags are checked, though; the live lookup does.
+It only says what a missing tag means:
+- A missing tag the release took, with a public fallback, is recreated at that fallback.
+- One with no fallback counts as removed (see below).
+- One that belongs to a newer live release of the same image stays missing and is recorded as
+  skipped. The yank is not authorized to republish a tag for a release it is not withdrawing.
+- A missing tag the release never took is not this yank's business, stays missing, and is not
+  recorded.
+
+Two orderings are deliberate:
+
+- **The private side goes first, and Docker Hub never holds it back.** Every Docker Hub step,
+  including the credential check, runs after the private aliases are reconciled. A Docker Hub
+  outage, a missing credential, or an unreadable `public_aliases` leaves the private withdrawal
+  done and the job failed.
+- **The yank record is written only once both registries agree.** A failure on the Docker Hub side
+  leaves no `yank-record.json`, so `github_release_withdraw` does not run, and the public release
+  is never marked withdrawn while Docker Hub still serves it. Retry `release_yank` once the cause is
+  fixed. It finds the private aliases already moved and completes.
+
+**When Docker Hub has no fallback but the private registry does, you delete the alias.** The
+private side runs first and refuses before any write when an alias has no compatible release with
+a different image there. So the Docker Hub deletion path is reached only when the private registry
+*has* such a release and Docker Hub does not. Every release since promotion is published to both,
+so in practice that happens in only two situations:
+
+- **The only compatible release with a different image is from before promotion** (`v0.3.x` and
+  earlier), so it exists privately but was never published. This is the promotion boundary. For
+  example, if the first public release is a patch on a line that began privately, yanking it
+  repoints the private aliases to the earlier private-only patch and sends the Docker Hub tags to
+  you for deletion. It stops happening once each line has a public patch behind it.
+- **The private alias already names something else, while the Docker Hub alias still names the
+  yanked digest.** Realistically this is a newer `release_publish` that moved the private aliases
+  and then failed on Docker Hub, leaving no manifest. Retry that publication until it succeeds
+  before yanking: it moves the Docker Hub aliases itself.
+
+Every other case with no fallback, including yanking the first release of a new `X.Y` line or the
+only release that ships a given image, ends in the **private** refusal (`cannot yank while aliases
+lack a compatible non-yanked release with a different image`) before Docker Hub is touched.
+Deleting Docker Hub tags does not let that job finish. Fix forward instead, as described at the end
+of this subsection and of [Yank and emergency rollback](#yank-and-emergency-rollback).
+
+The CI token cannot delete tags, by design: it is account-wide, and destructive registry access
+stays with the repository owner. So in the deletion case the job repoints every alias it can, then
+fails, listing the exact tags:
+
+```text
+Docker Hub aliases still name the yanked digest and no compatible public release with a different
+image exists to repoint them to. The CI token cannot delete tags: delete these in Docker Hub, then
+retry release_yank: docker.io/mcknly/robot-dev-team:0.4, docker.io/mcknly/robot-dev-team:0, ...
+```
+
+Delete exactly those tags under **My Hub > Repositories > robot-dev-team > Tags**. They are moving
+tags, so the immutable-tag rule does not cover them. Never delete a SemVer `X.Y.Z` tag. Then retry
+the job. An alias that is gone counts as removed: the retry verifies the rest, records the removed
+aliases in `public_aliases_removed`, and notes each one in the withdrawn release's notes. With
+`latest` deleted, `docker pull mcknly/robot-dev-team` reports the image as not found. That is
+correct while no good public release exists, and better than serving the bad one.
+
+Fixing forward avoids both the deletion and the refusal. A corrected higher patch release, published
+before the yank, moves the moving aliases in both registries through normal promotion, so the yank
+finds nothing that still names the bad digest.

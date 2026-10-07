@@ -201,7 +201,7 @@ async def notify_agent_termination(
 
     Uses the killed agent's own PAT so the comment appears under the
     agent's identity.  Designed to be reusable across manual kills and
-    timeouts (see issue #62).
+    timeouts.
 
     Args:
         project_path: GitLab project path (e.g. ``namespace/project``)

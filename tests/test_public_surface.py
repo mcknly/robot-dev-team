@@ -16,6 +16,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from scripts import github_publication as gp
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GITHUB_DIR = REPO_ROOT / ".github"
 ISSUE_TEMPLATE_DIR = GITHUB_DIR / "ISSUE_TEMPLATE"
@@ -756,6 +758,122 @@ def test_no_tracked_file_names_the_canonical_instance_by_hostname() -> None:
     assert scanned == len(tracked), (
         f"{scanned} of {len(tracked)} tracked files were scanned"
     )
+
+
+# Paths the private-reference guard does not read. `notices/` is upstream license text installed
+# byte for byte, so it cannot be rewritten; only the files `scripts/third_party_notices.py` writes
+# itself are ours, and those are scanned. `prompts/` is the runtime instruction set for agents
+# working in an operator's own GitLab projects, where citing that project's issues is the point --
+# a different tracker from the one this rule protects.
+PRIVATE_REFERENCE_EXEMPT_PREFIXES = ("notices/", "prompts/")
+GENERATED_NOTICE_FILES = frozenset({"notices.json", "README", "CREDITS"})
+PRIVATE_REFERENCE_ALLOWLIST = "tests/fixtures/private-reference-allowlist.tsv"
+
+
+def private_reference_scope(relative: str) -> bool:
+    if relative.startswith("notices/"):
+        parts = relative.split("/")
+        return len(parts) == 3 and parts[2] in GENERATED_NOTICE_FILES
+    return not relative.startswith(PRIVATE_REFERENCE_EXEMPT_PREFIXES)
+
+
+def load_private_reference_allowlist(tracked: frozenset[str]) -> dict[str, set[str]]:
+    """The reviewed (path, line) entries, refusing any entry that could not be a live exemption."""
+    allowed: dict[str, set[str]] = {}
+    text = (REPO_ROOT / PRIVATE_REFERENCE_ALLOWLIST).read_text(encoding="utf-8")
+    for number, raw in enumerate(text.splitlines(), 1):
+        if not raw.strip() or raw.startswith("#"):
+            continue
+        relative, tab, line = raw.partition("\t")
+        where = f"{PRIVATE_REFERENCE_ALLOWLIST}:{number}"
+        assert tab and line == line.strip() and line, f"{where} is not `path<TAB>line`"
+        assert relative in tracked, f"{where} names an untracked path: {relative}"
+        assert private_reference_scope(relative), f"{where} names an exempt path: {relative}"
+        assert gp.private_references(line), f"{where} exempts a line that matches nothing"
+        allowed.setdefault(relative, set()).add(line)
+    return allowed
+
+
+def tracked_text(relative: str) -> str | None:
+    """A tracked path's text as git records it, or `None` for a binary.
+
+    Raises rather than returning nothing for a path that is missing or does not decode, so the
+    caller can fail on it instead of passing over an unscanned file.
+    """
+    path = REPO_ROOT / relative
+    if path.is_symlink():
+        # Git records a symlink as its target string; the target is scanned on its own.
+        return str(path.readlink())
+    if not path.is_file():
+        raise FileNotFoundError(relative)
+    data = path.read_bytes()
+    if b"\0" in data:
+        return None
+    return data.decode("utf-8")
+
+
+def test_no_tracked_file_cites_the_private_tracker() -> None:
+    """No shorthand pointer into the canonical instance's tracker in the published tree.
+
+    The tree is mirrored to GitHub, where an issue or merge-request shorthand resolves to an
+    unrelated issue of the public repository or to nothing, and a note anchor, pipeline, or job
+    points a reader at a page they cannot open. Where a reference stood in for a reason, the
+    reason is what belongs in the file. The patterns live beside the withdrawal-notice rule that
+    shares them (`scripts/github_publication.py`, `PRIVATE_REFERENCE_PATTERNS`).
+
+    The same fail-closed shape as the hostname guard: no skip when git is unavailable, no silently
+    dropped path, and a text file that does not decode fails instead of being passed over. Binary
+    files (a NUL byte) are skipped; a `#` followed by digits occurs by chance in image data.
+
+    The allowlist fails in both directions. A new match fails unless its exact line is reviewed,
+    and a reviewed line that no longer occurs fails too, so the list cannot rot into a blanket
+    exemption. Its own comment lines are scanned like any other text.
+    """
+    tracked = tracked_files()
+    assert tracked is not None, (
+        "git could not list the tracked files, so the private-reference guard could not run"
+    )
+    allowed = load_private_reference_allowlist(tracked)
+    used: set[tuple[str, str]] = set()
+    offenders: list[str] = []
+    unreadable: list[str] = []
+
+    for relative in sorted(tracked):
+        if not private_reference_scope(relative):
+            continue
+        try:
+            text = tracked_text(relative)
+        except (OSError, UnicodeDecodeError):
+            unreadable.append(relative)
+            continue
+        if text is None:
+            continue
+        for number, line in enumerate(text.splitlines(), 1):
+            if relative == PRIVATE_REFERENCE_ALLOWLIST and not line.startswith("#"):
+                continue
+            found = gp.private_references(line)
+            if not found:
+                continue
+            if line.strip() in allowed.get(relative, set()):
+                used.add((relative, line.strip()))
+                continue
+            offenders.append(f"{relative}:{number}: {', '.join(found)}")
+
+    assert not offenders, (
+        "the published tree cites the private tracker; rewrite each as the reason it stood for, "
+        "or review it into " + PRIVATE_REFERENCE_ALLOWLIST + ":\n" + "\n".join(offenders)
+    )
+    assert not unreadable, (
+        "tracked paths could not be read as text, so they were never checked: "
+        + ", ".join(unreadable)
+    )
+    stale = sorted(
+        f"{relative}: {line}"
+        for relative, lines in allowed.items()
+        for line in lines
+        if (relative, line) not in used
+    )
+    assert not stale, "allowlisted lines no longer occur in their files:\n" + "\n".join(stale)
 
 
 def test_readme_note_agrees_with_the_mirror_policy_on_release_evidence() -> None:

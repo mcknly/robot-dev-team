@@ -10,9 +10,9 @@ Copyright (c) 2025 MCKNLY LLC
 # Release Image License Review
 
 This document classifies the license of every component the release SBOM records for one image
-digest, and states what redistributing that image obliges the project to do. It is the result of
-#82 and the license evidence the #51 pre-publication audit cites. The statements here are no
-stronger than the recorded evidence; where the evidence stops, the document says so.
+digest, and states what redistributing that image obliges the project to do. It is the license
+evidence the pre-publication audit (`docs/SANITIZATION_REPORT.md`) cites. The statements here are
+no stronger than the recorded evidence; where the evidence stops, the document says so.
 
 This is an engineering classification, not legal advice. Where a finding needs a maintainer
 decision rather than a fact, it is marked as one.
@@ -29,7 +29,7 @@ decision rather than a fact, it is marked as one.
 The unit of analysis is the **image**: the Debian base, CPython, the application's Python
 dependency closure, and the two third-party binaries the `Dockerfile` installs (`uv`/`uvx` from
 PyPI and `glab` from GitLab's release `.deb`). The agent CLIs that `docker-entrypoint.sh` installs
-at first boot are not in the image and are out of scope, as `docs/RELEASING.md` and #54 describe;
+at first boot are not in the image and are out of scope, as `docs/RELEASING.md` describes;
 an operator who enables a harness receives it from its vendor under the vendor's terms.
 
 ## 2. Why the SBOM showed `NOASSERTION`
@@ -140,10 +140,11 @@ redistribution carries no obligations. It carries the ones in section 6.
 ## 6. Obligations found
 
 1. **Corresponding source for GPL and LGPL Debian packages.** Redistributing these binaries
-   obliges the distributor to make the corresponding source available. The image installs them
-   from the Debian snapshot archive pinned by `DEBIAN_SNAPSHOT` in the `Dockerfile`, and the exact
-   source for every binary version is available from that same archive. What remains is to *tell*
-   recipients so. **Decided:** a published pointer, not a mirror.
+   obliges the distributor to make the corresponding source available. The image installs or
+   upgrades packages from the Debian snapshot archive pinned by `DEBIAN_SNAPSHOT` in the
+   `Dockerfile`, and inherits the rest from its base image, whose versions can be newer than that
+   snapshot. Either way, the exact source for every binary version is on snapshot.debian.org,
+   looked up by source name and version. What remains is to *tell* recipients so. **Decided:** a published pointer, not a mirror.
    - The public consumer documentation, the Docker Hub description, and an OCI label on the image
      name the pinned snapshot timestamp and where to fetch each package's exact source.
    - Mirroring was declined: it would store hundreds of megabytes of Debian source per snapshot
@@ -151,33 +152,135 @@ redistribution carries no obligations. It carries the ones in section 6.
    - The residual reliance on snapshot.debian.org is accepted for a personal, non-commercial
      project, and revisited if the project becomes organizational or commercial.
 
-   Tracked in #54; it must land before the first image push in #8.
+   **Met in the tree.** "Corresponding source for the image" at the end of this section is the
+   public statement, and the Docker Hub overview block in `docs/RELEASING.md` repeats it for the
+   registry page. The image carries the labels `com.mcknly.robot-dev-team.debian-snapshot` (the
+   timestamp) and `com.mcknly.robot-dev-team.debian-source` (both archive roots). Both are set from
+   `DEBIAN_SNAPSHOT`, so they cannot drift from the build, and `scripts/ci-smoke-image.sh` checks
+   the built label against the `Dockerfile`. The Docker Hub overview is a manual edit by the
+   repository owner and must be in place before the first image push to Docker Hub.
 2. **MPL-2.0 source availability** for the ten MPL components in `uv` and `glab`. Both binaries are
    redistributed unmodified from their publishers. MPL-2.0 requires informing recipients how to
    obtain the source of the covered files, which is published at the exact versions on crates.io
-   and the Go module proxy. The same public statement in #54 covers it.
-3. **Attribution notices for the compiled-in dependencies of `uv` and `glab` are not in the
-   image.** MIT, BSD, Apache-2.0, and the FreeType License all require their notices to accompany
-   copies:
-   - **Debian packages** carry theirs under `/usr/share/doc`.
-   - **Python packages** carry theirs in their `dist-info`.
-   - **`uv`** carries its own license files but not those of its 518 crates. Its shipped SBOM names
-     them without the notice texts.
-   - **`glab`** carries no license text at all, not even its own MIT notice, because GitLab's
-     `.deb` installs none.
+   and the Go module proxy. The same public statement covers it, pointing at section 4 for the
+   component list rather than copying it.
+3. **Attribution notices for the compiled-in dependencies of `uv` and `glab`.** MIT, BSD,
+   Apache-2.0, and the FreeType License all require their notices to accompany copies. Debian
+   packages carry theirs under `/usr/share/doc`, and Python packages carry theirs in their
+   `dist-info`. The two binaries' upstream packages did not. GitLab's `glab` `.deb` installs no
+   license text at all, not even glab's own MIT notice. uv's wheel carries uv's own license files
+   but not those of its 518 crates, and its shipped SBOM names them without the notice texts.
+   The gap was inherited from both upstream distributions, but the image is what the project
+   redistributes.
 
-   This is inherited from both upstream distributions rather than introduced by the build, but
-   the image is what the project redistributes. It is a **finding to remediate**. The fix is to
-   install glab's own license and a third-party notices file for both binaries at build time,
-   collected from their sources at the pinned versions. It changes the image, so it is tracked in
-   **#83**, which gates the first Docker Hub push in #8, rather than fixed in this review.
+   **Closed.** The image now installs:
+   - `/usr/share/doc/glab/copyright`: glab's own `LICENSE` at the pinned tag.
+   - `/usr/share/doc/glab/third-party/`: the license and notice files of every Go module compiled
+     into `glab`, and of the Go standard library it was built with.
+   - `/usr/share/doc/uv/third-party/`: the same for every crate compiled into `uv` and `uvx`, and
+     for the Rust standard library, including the crates it vendors.
+   - `notices.json` beside each tree, recording which files cover which component, where each file
+     was taken from, and its SHA-256.
+
+   The files are the upstream bytes, never text generated from an SPDX identifier.
+   `scripts/third_party_notices.py` collects them from the pinned versions into `notices/`, which
+   is committed and copied into the image. Eight crates publish an archive that omits a file; each
+   has a reviewed, hash-pinned fallback taken from the upstream repository. One of them, `seahash`,
+   has no license text anywhere upstream, so its `Cargo.toml` declaration (`license = "MIT"` and
+   its authors) is what ships. Before the image is pushed, the build checks inside it, as the app
+   user, that every `cargo` and `golang` entry in its SBOM has an installed notice
+   (`docs/CI.md`). `docs/DEPENDENCY_MANAGEMENT.md` covers regeneration.
+
+   **The SBOM's license for some crates understates what they link.** Four crates compile C code
+   whose notices the crate's own identifier does not name:
+   - `tikv-jemalloc-sys` builds jemalloc (BSD-2-Clause).
+   - `zstd-sys` builds zstd (`BSD-3-Clause OR GPL-2.0-only`). The BSD branch is the one taken, and
+     both texts ship.
+   - `aws-lc-sys` builds AWS-LC, with its OpenSSL- and BoringSSL-derived code, fiat-crypto,
+     s2n-bignum, and the Jitter Entropy library (which AWS-LC takes under BSD-3-Clause).
+   - `ring` builds BoringSSL-derived C and assembly.
+
+   All of that code is permissive, so section 4's classification does not change. The notices
+   are installed from the crates' subdirectories. Where `aws-lc-sys` strips a file its
+   `aws-lc/LICENSE` points at, the file comes from AWS-LC at the pinned submodule commit. The
+   evidence file still records the publisher SBOM's answer for the Rust wrapper; this note is
+   where the C code is accounted for.
+
+   **d2 compiles other projects' MIT code into `glab`.** `oss.terrastruct.com/d2` ships its own
+   MPL-2.0 license, which is all the SBOM join asks for, but its `NOTICE.txt` files only *link*
+   to the licenses of code `glab` carries:
+   - `lib/textmeasure` is derived from `faiface/pixel`.
+   - `d2svg` embeds a modified `github-markdown.css` from `sindresorhus/github-markdown-css`.
+   - `d2dagrelayout` embeds a `dagre.js` that d2 bundled from dagre 0.8.5, graphlib 2.1.8, and
+     lodash modules.
+
+   All five are MIT, whose notice has to accompany the copy. Each license file is installed from
+   upstream at a pinned commit, beside the `NOTICE.txt` that names it. The bundled graphlib also
+   keeps the BSD-3-Clause header of its `index.js` (`Copyright (c) 2014, Chris Pettitt`), whose
+   binary condition asks for the notice, conditions, and disclaimer in the documentation. That
+   header is installed whole beside graphlib's MIT `LICENSE`, as
+   `graphlib/LICENSE-index-js-header`: lines 1-29 of `index.js` at the `v2.1.8` tag, pinned by
+   hash, and `collect` checks that the same bytes occur in d2's `dagre.js`. graphlib's code in
+   `glab` is therefore covered by both texts. `d2elklayout` (elk.js, EPL-2.0) is not linked into
+   `glab`.
+
+   One expected change in the next SBOM: Syft reads `/usr/share/doc/glab/copyright`, so it may now
+   declare a license for `deb/glab`. The manual evidence entry for that key then drops out at the
+   next `prune`.
 4. **FreeType License credit clause.** `glab` compiles in `github.com/golang/freetype`, licensed
-   `FTL OR GPL-2.0-or-later`; the FTL branch applies and requires crediting The FreeType Project
-   in documentation. The notices file in #83 covers it.
+   `FTL OR GPL-2.0-or-later`. The FTL branch applies, and it requires the distribution
+   documentation to state that the software is based in part on the work of the FreeType Team.
+   **Closed:** `/usr/share/doc/glab/CREDITS` carries that statement and the credit line the
+   FTL's authors ask for. The FTL text itself is installed with the module's other license files.
 
-None of these obligations gates the first GitHub publication, which carries source only. They
-attach to distributing the **binaries**, which first happens with the Docker Hub push in #8, and
-#54 and #83 are ordered ahead of it for that reason.
+None of these obligations gates the first GitHub publication, which carries source only. They attach
+to distributing the **binaries**, which first happens with the first Docker Hub push. The
+corresponding-source statement and the license notices are ordered ahead of it for that reason.
+
+### Corresponding source for the image
+
+This is the public statement that obligations 1 and 2 require. The project points at the archives
+that already hold this source, rather than mirroring it.
+
+**Debian packages.** A Debian package in the image is one of two kinds, and the exact source of
+both is on [snapshot.debian.org](https://snapshot.debian.org):
+
+- **Installed or upgraded by the build.** These come from the snapshot the image's labels name.
+  `com.mcknly.robot-dev-team.debian-snapshot` is the `DEBIAN_SNAPSHOT` timestamp.
+  `com.mcknly.robot-dev-team.debian-source` gives both archive roots:
+  `http://snapshot.debian.org/archive/debian/<snapshot>/` (`trixie`, `trixie-updates`) and
+  `http://snapshot.debian.org/archive/debian-security/<snapshot>/` (`trixie-security`). A package's
+  `.dsc` and source tarballs are in that snapshot's `pool/`.
+- **Inherited from the Python base image and left alone by the build.** These are **not**
+  guaranteed to be in the labelled snapshot. The build's `apt-get upgrade` replaces an inherited
+  package only when the snapshot has a newer version. A base image is often built after the
+  snapshot, so its version can be newer than anything under the labelled roots
+  (`docs/DEPENDENCY_MANAGEMENT.md`). Those versions came from the Debian archive when the base
+  image was built.
+
+So look a package's source up by **source name and version**, which works for both kinds. List
+them from the image, then fetch each version from snapshot.debian.org:
+
+```bash
+docker inspect --format '{{ index .Config.Labels "com.mcknly.robot-dev-team.debian-source" }}' <image>
+docker run --rm --entrypoint dpkg-query <image> -W -f '${source:Package} ${source:Version}\n' \
+  | sort -u
+# For each "<source> <version>" line:
+#   https://snapshot.debian.org/package/<source>/<version>/                   (browse)
+#   https://snapshot.debian.org/mr/package/<source>/<version>/srcfiles?fileinfo=1   (JSON)
+```
+
+Nothing in CI resolves each of those versions against snapshot.debian.org. The labels are a
+record of the build's APT sources, not a proof that every installed version is under them.
+
+**MPL-2.0 components compiled into `uv` and `glab`.** The image redistributes both binaries
+unmodified, at the versions pinned by `UV_VERSION` and `GLAB_VERSION` in the `Dockerfile`. Their
+MPL-2.0 components (section 4) are published at the exact versions on
+[crates.io](https://crates.io) and the [Go module proxy](https://proxy.golang.org).
+
+**Agent CLIs** are not in the image. The container downloads them from their vendors at start,
+under the vendors' terms (`docs/SYSTEM_DESIGN.md` section 7), so neither this statement nor the
+release SBOM covers them.
 
 ## 7. Reproducing this
 
@@ -247,14 +350,26 @@ python -m scripts.license_review prune --sbom sbom.spdx.json     # keep only wha
 ```
 
 Any entry `resolve` cannot answer, and any Debian or other entry without a declared license, stays
-**unresolved** until a manual evidence entry records its source. A license name the classifier
-does not know shows up as **needs review** and is added to the classifier deliberately. The release
+**unresolved** until a manual evidence entry records its source. A license name the classifier does
+not know shows up as **needs review** and is added to the classifier deliberately. The release
 digest will differ from the one reviewed here once further changes land on `main`, so the final
-#51 report re-runs this against that digest; only new or changed components need new evidence.
+pre-publication audit re-runs this against that digest; only new or changed components need new
+evidence.
+
+The same SBOM also shows whether the committed license notices (section 6, obligation 3) cover
+the digest's compiled-in components. This is offline, like `classify`:
+
+```bash
+python -m scripts.third_party_notices verify --sbom sbom.spdx.json
+```
+
+The build already ran the stronger form of this check inside the image before pushing it, so a
+failure here means the tree changed after that build. It is a cross-check for the release-prep MR,
+not a substitute for the build's check.
 
 ## 8. Decisions on the open questions
 
-#82 left two policy questions to the maintainer. Both were decided on #82 when this review
+The review left two policy questions to the maintainer. Both were decided when this review
 merged.
 
 - **Gate or periodic review: periodic, at release preparation, for now.** Every release runs
@@ -272,4 +387,4 @@ merged.
 
 One follow-up this makes possible: the classification summary contains no hostname, so unlike the
 SBOM it could be attached to each GitHub Release as public license evidence well before sanitized
-SBOM variants exist. That is an option for #81, not a commitment.
+SBOM variants exist. That is an option for the sanitized public evidence work, not a commitment.

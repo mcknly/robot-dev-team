@@ -436,6 +436,48 @@ def test_receipt_binds_both_sides_and_pins_the_deferred_evidence(world: dict[str
     assert REGISTRY_HOST not in raw.decode() and SERVER_HOST not in raw.decode()
 
 
+def with_public_references(world: dict[str, Any], references: Any) -> None:
+    """Rewrite the durable manifest as release_publish writes it once Docker Hub is promoted."""
+    key = (VERSION, gp.MANIFEST_FILENAME)
+    manifest = json.loads(world["gitlab"].files[key])
+    manifest["public_references"] = references
+    world["gitlab"].files[key] = json.dumps(manifest).encode()
+
+
+def test_receipt_carries_the_public_references_the_manifest_verified(world: dict[str, Any]) -> None:
+    reference = {"reference": f"docker.io/mcknly/robot-dev-team:{VERSION}", "digest": DIGEST}
+    with_public_references(world, [reference])
+
+    receipt = publish(world)
+
+    assert receipt["image"] == {"qualified_digest": DIGEST, "public_references": [reference]}
+    raw = world["gitlab"].files[(VERSION, gp.RECEIPT_FILENAME)]
+    assert json.loads(raw)["image"]["public_references"] == [reference]
+
+
+def test_publication_refuses_an_invalid_public_reference_before_any_public_write(
+    world: dict[str, Any],
+) -> None:
+    """The consumer pull check reads this list, so a wrong digest must never reach GitHub."""
+    with_public_references(
+        world,
+        [{"reference": f"docker.io/mcknly/robot-dev-team:{VERSION}", "digest": f"sha256:{'b' * 64}"}],
+    )
+    def public_refs() -> str:
+        return subprocess.run(
+            ["git", "ls-remote", str(world["remote"])], check=True, capture_output=True, text=True
+        ).stdout
+
+    before = public_refs()
+
+    with pytest.raises(release_tools.ReleaseError, match="invalid public reference"):
+        publish(world)
+
+    assert world["github"].calls == []
+    assert public_refs() == before
+    assert (VERSION, gp.RECEIPT_FILENAME) not in world["gitlab"].files
+
+
 def test_release_is_built_as_a_draft_and_published_only_after_assets_verify(world: dict[str, Any]) -> None:
     publish(world)
     calls = world["github"].calls
@@ -530,6 +572,32 @@ def test_host_gate_rejects_release_notes_naming_a_canonical_host(
 
     with pytest.raises(release_tools.ReleaseError, match=r"docs/CHANGELOG.md \(server host\)"):
         publish(world)
+    assert_nothing_public(world, before)
+
+
+def test_release_notes_citing_the_private_tracker_fail_closed(
+    tmp_path: Path, public: dict[str, Any]
+) -> None:
+    """A tag cut before the tree guard existed keeps its old notes; it must never be projected."""
+    notes = f"{NOTES}- Fixed startup. (Closes #{83}; refs team/project!{61})\n"
+    canonical, commit = make_canonical(
+        tmp_path, {"README.md": "Robot Dev Team\n", "docs/CHANGELOG.md": notes}
+    )
+    files = evidence_files(commit)
+    files[(VERSION, "changelog.md")] = notes.encode()
+    world = {
+        **public,
+        "tmp": tmp_path,
+        "canonical": canonical,
+        "commit": commit,
+        "github": FakeGitHub(public["remote"]),
+        "gitlab": FakeGitLab(files),
+    }
+    before = public_refs(world)
+
+    with pytest.raises(release_tools.ReleaseError, match="cites the private tracker") as caught:
+        publish(world)
+    assert f"#{83}" in str(caught.value) and f"team/project!{61}" in str(caught.value)
     assert_nothing_public(world, before)
 
 
@@ -1256,6 +1324,163 @@ def test_a_reason_naming_a_canonical_host_is_withheld_not_blocking(world: dict[s
     assert f"Reason: {gp.WITHHELD_REASON}" in record["body"]
     assert SERVER_HOST not in record["body"].lower()
     assert audit(world) == []
+
+
+def test_a_reason_citing_the_private_tracker_is_withheld_not_blocking(world: dict[str, Any]) -> None:
+    """The tree guard never sees the yank reason, so this rule is its only check.
+
+    The reference is assembled at runtime so this file stays clean under that guard.
+    """
+    publish(world)
+
+    record = withdraw(world, reason=f"auth regression, see #{91}")
+
+    assert record is not None
+    assert f"Reason: {gp.WITHHELD_REFERENCE_REASON}" in record["body"]
+    assert f"#{91}" not in record["body"]
+    assert audit(world) == []
+
+
+def test_a_host_takes_precedence_over_a_tracker_reference_when_withholding() -> None:
+    gate = gp.HostGate((("server", SERVER_HOST), ("registry", REGISTRY_HOST)))
+
+    assert gp.public_withdrawal_reason(gate, f"{SERVER_HOST} pipeline {7}") == gp.WITHHELD_REASON
+    assert gp.public_withdrawal_reason(gate, f"see MR !{58}") == gp.WITHHELD_REFERENCE_REASON
+    assert gp.public_withdrawal_reason(gate, "Broken startup") == "Broken startup"
+
+
+@pytest.mark.parametrize("reason", [f"see team/project#{88}", f"reverted by team/project!{61}"])
+def test_a_project_qualified_reason_is_withheld(world: dict[str, Any], reason: str) -> None:
+    publish(world)
+
+    record = withdraw(world, reason=reason)
+
+    assert record is not None
+    assert f"Reason: {gp.WITHHELD_REFERENCE_REASON}" in record["body"]
+    assert "team/project" not in record["body"]
+    assert audit(world) == []
+
+
+def legacy_world(
+    tmp_path: Path, public: dict[str, Any], monkeypatch: pytest.MonkeyPatch, notes: str
+) -> dict[str, Any]:
+    """A release published, citations and all, before publication checked its notes."""
+    canonical, commit = make_canonical(
+        tmp_path, {"README.md": "Robot Dev Team\n", "docs/CHANGELOG.md": notes}
+    )
+    files = evidence_files(commit)
+    files[(VERSION, "changelog.md")] = notes.encode()
+    world = {
+        **public,
+        "tmp": tmp_path,
+        "canonical": canonical,
+        "commit": commit,
+        "github": FakeGitHub(public["remote"]),
+        "gitlab": FakeGitLab(files),
+    }
+    with monkeypatch.context() as patched:
+        patched.setattr(gp, "refuse_private_references", lambda version, notes: None)
+        publish(world)
+    return world
+
+
+def test_a_legacy_release_citing_the_tracker_is_still_withdrawn(
+    tmp_path: Path, public: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The notice appends the durable changelog, which the reason filter never sees.
+
+    `v0.3.0` is public with such notes. Failing here would leave the citations public and the
+    release looking current, so the notes are withheld from the notice instead. The asset stays as
+    published, and the audit, which rebuilds the notice the same way, agrees with it.
+    """
+    notes = f"{NOTES}- Fixed startup. (Closes #{83}; refs team/project!{61})\n"
+    world = legacy_world(tmp_path, public, monkeypatch, notes)
+    assert world["github"].releases[0]["body"] == notes
+    assert audit(world) == []
+
+    record = withdraw(world)
+
+    assert record is not None
+    assert record["name"].startswith(gp.WITHDRAWN_PREFIX)
+    assert "Reason: Broken startup" in record["body"]
+    assert record["body"].endswith(gp.WITHHELD_NOTES)
+    assert gp.private_references(record["body"]) == []
+    changelog = next(a for a in record["assets"] if a["name"] == "changelog.md")
+    assert world["github"].contents[changelog["id"]] == notes.encode()
+    assert audit(world) == []
+
+
+def test_a_legacy_release_withdrawal_is_idempotent(
+    tmp_path: Path, public: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world = legacy_world(tmp_path, public, monkeypatch, f"{NOTES}- Fixed. (Closes #{83})\n")
+    withdraw(world)
+    calls = len(world["github"].calls)
+
+    withdraw(world)
+
+    assert len(world["github"].calls) == calls
+
+
+def test_withdrawal_keeps_clean_notes_and_withholds_cited_ones() -> None:
+    assert gp.public_withdrawal_notes(NOTES) == NOTES
+    assert gp.public_withdrawal_notes(f"{NOTES}- (Closes #{83})\n") == gp.WITHHELD_NOTES
+    assert gp.public_withdrawal_notes(f"{NOTES}- see team/project!{61}\n") == gp.WITHHELD_NOTES
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"see #{54}",
+        f"(Closes #{83}; refs #{82}.)",
+        f"fixed in !{49}",
+        f"as discussed in note_{11682}",
+        f"protected main pipeline {274} (job {1097})",
+        f"read issue {42} first",
+        f"see MR {58}",
+        f"merge request #{12}",
+        f"observed on feature/issue-{25}-gitlab-ci",
+        f"holding the manifest (`/-/packages/{1}`)",
+        f"https://example.test/group/project/-/work_items/{88}",
+        f"[the MR](../-/merge_requests/{57})",
+        # Project-qualified shorthand into the same tracker, subgroups included.
+        f"see team/project#{88}",
+        f"fixed in team/project!{61}",
+        f"(group/sub/project#{3})",
+    ],
+)
+def test_private_references_are_recognized(text: str) -> None:
+    assert gp.private_references(text), text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Upstream records on gitlab.com are public and are the remediation target a reader needs.
+        f"https://gitlab.com/gitlab-org/cli/-/merge_requests/{3752}",
+        f"https://gitlab.com/gitlab-org/cli/-/issues/{8504}",
+        # Qualified shorthand, colour codes, HTML entities, and shell and Compose syntax.
+        f"gitlab-org/cli#{8504} and gitlab-org/cli!{3752}",
+        # Unqualified `name#N` tokens: upstream shorthand, a glab argument, a hostname token.
+        f"goose#{8021} and llama.cpp#{12601}",
+        f'"project#{1}"',
+        f"<host#{1}>",
+        # A numbered heading anchor and a URL fragment, which name no tracker item.
+        f"docs/LICENSE_REVIEW.md#{7}-procedure",
+        f"https://github.com/owner/repo#{12}",
+        f'<path style="fill:#{333}"/>',
+        f"&#{160};",
+        "case $x in [!0-9]*) ;; esac",
+        "volumes: !reset []",
+        # Not a reference: a bare number, a section sign, a version, a date.
+        f"section 12, {12} entries, v0.3.0, 2026-09-30, sha256:{'0' * 12}",
+        # The `issue-<number>-<slug>` convention itself, which names no issue.
+        "use `issue-<number>-<short-description>`",
+        "etc-issue-0238e2c075ef809c",
+    ],
+)
+def test_public_text_is_not_mistaken_for_a_private_reference(text: str) -> None:
+    assert gp.private_references(text) == []
 
 
 # --- Audit ------------------------------------------------------------------------------------

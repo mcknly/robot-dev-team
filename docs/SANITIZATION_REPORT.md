@@ -11,7 +11,6 @@ Copyright (c) 2025 MCKNLY LLC
 
 _Date:_ 2026-09-24
 _Agent:_ Claude
-_Issue:_ #51 (refs #28)
 
 This replaces the report dated 2025-10-27, which predated the CI and release layers, five agent
 harnesses, and the wrapper credential rework. It was also wrong about the tree: three of the four
@@ -22,7 +21,7 @@ files it named as the sanitization mechanism no longer existed. Nothing from it 
 | | |
 | --- | --- |
 | Commit | `365d1f4c81bc5f6bd50f712727445c9a00f22cc2` on `main` |
-| Pipeline | protected `main` pipeline 268 (build, smoke test, SBOM, vulnerability scan: all passed) |
+| Pipeline | the protected `main` pipeline for that commit (build, smoke test, SBOM, vulnerability scan: all passed) |
 | Image | manifest digest `sha256:4ae482405724e770b7740e22b98cd2f7391daab311a534c61fe87b28fb0a0d74`, `linux/amd64`, 20 layers |
 | Binding | the commit's full-SHA tag resolves to that digest (`crane digest`); full-SHA tags are immutable |
 | SBOM | staged file SHA-256 `d22eaa7f8b994c0262d6fe11b086871f7421ca3f4dadff5379de067759b53ed1`, 1,327 entries |
@@ -80,8 +79,8 @@ A scan that finds nothing is only evidence if it can find something:
   The merged filesystem and the controls are not extractions. They were scanned with an explicit
   `--no-extraction`, so a missing file can never select the lenient mode by accident.
 
-The nine occurrences the tree carried when #51 was opened were removed in !49. That includes the
-two in `gitlab-connect` and `glab-usr`, which ship in the image.
+The nine occurrences the tree carried when this audit began were removed before it was recorded.
+That includes the two in `gitlab-connect` and `glab-usr`, which ship in the image.
 
 This is target-list hygiene, not secrecy. The organisation, image, and namespace names are public,
 and the host is a short guess from any of them; nothing is built on the assumption that it is
@@ -126,6 +125,13 @@ either direction:
 A lost hit means the scan did not read part of the image, or the image changed. Either way, the
 scan is not evidence about the files the audit classified.
 
+The committed baseline is refreshed from later `main` digests as known changes move hits (section
+12), so its `digest` field, not this section, names the image it currently describes. The first
+refresh (from `main` digest `sha256:012125d2…`) dropped the lost
+`root/.cache/uv/CACHEDIR.TAG` entry and added the license notices' 508 hits, leaving 1,059 entries: 478 in the
+two `notices.json` manifests (477 SHA-256 values and one upstream commit id), and 30 on the pinned
+hashes, commit ids and fallback paths in `scripts/third_party_notices.py`, 3 of them base64.
+
 The baseline also records the scanner's version, plugins, and filters. The comparison refuses:
 
 - a scan with a different version, plugin set, or filter set;
@@ -133,9 +139,19 @@ The baseline also records the scanner's version, plugins, and filters. The compa
 - a scan that shares no hit with the baseline.
 
 A retuned or misdirected scanner reports *fewer* hits, and each of these would otherwise read as
-clean. A baseline can only be written from a scan whose one regex filter is the metadata exclusion
-below. An `--exclude-lines` or `--exclude-secrets` filter, or any other file pattern, is refused,
-because every later release would then be held to a profile that suppresses hits.
+clean. For the same reason, a baseline can only be written from a scan with the profile this audit
+used, pinned in `scripts/image_audit.py`:
+
+- detect-secrets 1.5.0;
+- exactly its 27 default plugin records, parameters included;
+- filters drawn only from its 11 default records and the metadata exclusion below.
+
+Records are compared whole, so the tool refuses `--only-verified`, which keeps the verification
+filter but raises its `min_level`. It also refuses a retuned or dropped plugin, an
+`--exclude-lines` or `--exclude-secrets` filter, any other file pattern, a custom `--filter`, and a
+word list. Otherwise every later release would be held to a profile that suppresses hits. Dropping
+a default filter is accepted, because it only adds hits. The committed baseline's profile is
+exactly the pinned one, and a test holds them together.
 
 The secrets scan excludes exactly the three metadata files `extract` writes, with
 `--exclude-files '^(image-manifest|image-config|layers)\.json$'`. The hostname scan already
@@ -162,7 +178,7 @@ comparison. The runbook's scan of a fresh extraction reproduced exactly the 552 
 - **`.env.example`**: every token and secret is blank; the example agent emails use `your-org.tld`.
   `GLAB_HOST=host.docker.internal` is a working, non-placeholder value: it points at a GitLab on the
   Docker host, so an unconfigured setup fails at connection time rather than at the wrappers'
-  placeholder guard. Deliberate, as recorded on #51.
+  placeholder guard. This is deliberate.
 - **`docker-compose.yml`**: mounts are relative (`./prompts`, `./config`, `./projects`) or the
   operator's own `$HOME` agent directories. The optional harness mounts are commented out.
 - **`config/routes.yaml` and `prompts/`**: role-based routes and generic prompts, with no instance
@@ -189,22 +205,27 @@ them:
   third-party and inert, since the agents work on mounted project checkouts, not on the
   environment's `site-packages`.
 - **uv's build cache is left in the image** (`/root/.cache/uv`, 33 MB of public PyPI artifacts).
-  Not a secret; tracked in **#84**.
+  Not a secret. A later change added `--no-cache` to that `uv sync`, so images built after it do
+  not have the cache. This bullet still describes the digest audited here, with one correction
+  found while making that change: the 33 MB is `du` of the directory by itself. The
+  layer stores 600 of its files as hardlinks into `/opt/venv/lib`. Only 46 regular files
+  (0.07 MB) are its own, so it added about 0.1 MB and roughly 800 entries, not 33 MB.
 
 ## 9. Licenses
 
 Classified per `docs/LICENSE_REVIEW.md`, re-run for this digest with the section 7 procedure
-(package 45, recorded hash above, name bound to pipeline 268's commit): **1,327 entries resolved,
+(the digest-keyed SBOM package, recorded hash above, name bound to the audited commit): **1,327 entries resolved,
 0 unresolved, 0 needing review**, `classify` exit 0.
 
 What that supports, and no more: no component's license prohibits distributing the image, and the
 project's own code is MIT. The image is an **aggregate**; it is not MIT-licensed as a whole, and
 distributing it carries obligations. The obligations attach to distributing the binaries, which
-first happens with the Docker Hub push in #8, not with the source-only GitHub publication:
+first happens with the first Docker Hub push, not with the source-only GitHub publication:
 
-- the corresponding-source statement for GPL/LGPL/MPL components: **#54**;
-- license notices for `glab` and `uv`'s compiled-in dependencies, including the FreeType credit:
-  **#83**.
+- a corresponding-source statement for GPL/LGPL/MPL components;
+- license notices for `glab` and `uv`'s compiled-in dependencies, including the FreeType credit.
+
+Both are now in place; see section 10.
 
 `scripts/header_guard.py`: every tracked source, documentation, and configuration file carries
 the license header.
@@ -213,14 +234,14 @@ the license header.
 
 | Finding | Status | Owner |
 | --- | --- | --- |
-| Canonical host in the tree (nine occurrences, two image-borne) | Fixed in !49; guarded tree-wide | done |
+| Canonical host in the tree (nine occurrences, two image-borne) | Fixed; guarded tree-wide | done |
 | Canonical host in the image | None found | done |
 | Secrets in the tree or image | None found; all hits classified | done |
 | Stale, partly false 2025 report | Replaced by this document | done |
-| Release-SBOM license metadata gap | Resolved in #82 (!52) | done |
-| Corresponding-source statement | Open; gates #8 | #54 |
-| License notices for `glab` and `uv`'s compiled-in crates | Open; gates #8 | #83 |
-| uv build cache in the image | Open; not a publication blocker | #84 |
+| Release-SBOM license metadata gap | Resolved by `docs/LICENSE_REVIEW.md` | done |
+| Corresponding-source statement | Resolved in `docs/LICENSE_REVIEW.md` and `docs/RELEASING.md` | done |
+| License notices for `glab` and `uv`'s compiled-in crates | Resolved: installed under `/usr/share/doc/{glab,uv}/` from `notices/` | done |
+| uv build cache in the image | Fixed (`uv sync --no-cache`); absent from every layer of `main` digest `sha256:012125d2…`, and the baseline refreshed from it | done |
 
 Owners for open issues are the maintainer, @cavin, as the project records ownership outside the
 tracker.
@@ -256,10 +277,11 @@ therefore binds the release to itself in two parts:
   copy boundary changes; or when the re-check reports a hit, unclassified or lost, that no known
   change explains. Otherwise at least once a year.
 - **A baseline refresh, not a full audit:** hits, lost or unclassified, confined to a component a
-  merged MR knowingly bumped. Most baseline entries come from uv's own SBOM (491 of 552), and the
-  `TOOL_RELEASES` checksums sit in `scripts/release_tools.py`, so a uv or pin bump moves them
-  routinely. Read the changed hits, refresh `security/image-secrets-baseline.json` from the new `main`
-  digest in a follow-up MR, and name the bump there (`docs/RELEASING.md`).
+  merged MR knowingly bumped. Most baseline entries come from uv's own SBOM (491 of 1,059) and the
+  two `notices.json` manifests (478), and the `TOOL_RELEASES` checksums sit in
+  `scripts/release_tools.py`, so a uv, notices, or pin bump moves them routinely. Read the
+  changed hits, refresh `security/image-secrets-baseline.json` from the new `main` digest in a
+  follow-up MR, and name the bump there (`docs/RELEASING.md`).
 
 Not covered here, by design: vulnerability scanning (the release gate on the exact digest,
 `docs/CI.md`), the agent CLIs installed at runtime (not in the image), and the public GitHub side
